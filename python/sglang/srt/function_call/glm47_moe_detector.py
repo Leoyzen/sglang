@@ -234,7 +234,7 @@ class Glm47MoeDetector(BaseFormatDetector):
             for match_result in match_result_list:
                 # Get function name
                 func_detail = self.func_detail_regex.search(match_result)
-                if func_detail is None:
+                if func_detail is None: 
                     continue
                 func_name = func_detail.group(1) if func_detail.group(1) else ""
                 func_args = func_detail.group(2) if func_detail.group(2) else ""
@@ -269,7 +269,11 @@ class Glm47MoeDetector(BaseFormatDetector):
             return arg_type
 
         # Auto-detect type from value (best effort)
-        first_chars = self._current_value.strip()[:10] if self._current_value else ""
+        first_chars = (
+            self._current_value.strip()[:10]
+            if self._current_value and self._current_value.strip()
+            else ""
+        )
         if first_chars:
             first_char = first_chars[0]
             if first_char.isdigit() or first_char in ["-", "."]:
