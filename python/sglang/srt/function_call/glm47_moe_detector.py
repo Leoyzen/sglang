@@ -31,13 +31,19 @@ def get_argument_type(
 ) -> Optional[str]:
     """Get the expected type of a function argument from tool definitions.
 
+    Handles complex JSON Schema structures like anyOf, oneOf, allOf and OpenAI-style arrays.
+    For example:
+    - {"type": "string"} -> "string"
+    - {"type": ["string", "null"]} -> "string"
+    - {"anyOf": [{"type": "array"}, {"type": "null"}]} -> "array"
+
     Args:
         func_name: Name of the function/tool
         arg_key: Name of the argument
         defined_tools: List of available tools
 
     Returns:
-        The type string (e.g., 'string', 'number', 'object') or None if not found
+        The type string (e.g., 'string', 'number', 'object', 'array', 'boolean', 'integer') or None if not found
     """
     name2tool = {tool.function.name: tool for tool in defined_tools}
     if func_name not in name2tool:
@@ -48,7 +54,78 @@ def get_argument_type(
         properties = {}
     if arg_key not in properties:
         return None
-    return properties[arg_key].get("type", None)
+
+    schema = properties[arg_key]
+
+    # Direct type field (simple case)
+    if "type" in schema:
+        type_value = schema["type"]
+        # Handle OpenAI-style array types: ["string", "null"]
+        if isinstance(type_value, list):
+            for t in type_value:
+                if isinstance(t, str) and t != "null":
+                    return t
+        # Handle simple type string
+        elif isinstance(type_value, str):
+            return type_value
+
+    # Handle complex JSON Schema structures: anyOf, oneOf, allOf
+    for keyword in ["anyOf", "oneOf", "allOf"]:
+        if keyword in schema:
+            variants = schema[keyword]
+            if not isinstance(variants, list):
+                continue
+
+            # Try to find a non-null type from the variants
+            for variant in variants:
+                if isinstance(variant, dict):
+                    # Check for direct type field
+                    if "type" in variant:
+                        variant_type = variant["type"]
+                        # Skip null types in union types
+                        if variant_type != "null":
+                            return variant_type
+                    # Recursively handle nested anyOf/oneOf/allOf
+                    nested_type = _extract_type_from_complex_schema(variant)
+                    if nested_type and nested_type != "null":
+                        return nested_type
+
+    return None
+
+
+def _extract_type_from_complex_schema(schema: dict) -> Optional[str]:
+    """Helper function to extract type from complex schema structures.
+
+    Recursively handles nested anyOf, oneOf, allOf structures.
+
+    Args:
+        schema: JSON Schema object
+
+    Returns:
+        The type string or None if not found
+    """
+    if "type" in schema:
+        type_value = schema["type"]
+        # Handle OpenAI-style array types: ["string", "null"]
+        if isinstance(type_value, list):
+            for t in type_value:
+                if isinstance(t, str) and t != "null":
+                    return t
+        # Handle simple type string
+        elif isinstance(type_value, str):
+            return type_value
+
+    for keyword in ["anyOf", "oneOf", "allOf"]:
+        if keyword in schema:
+            variants = schema[keyword]
+            if isinstance(variants, list):
+                for variant in variants:
+                    if isinstance(variant, dict):
+                        nested = _extract_type_from_complex_schema(variant)
+                        if nested and nested != "null":
+                            return nested
+
+    return None
 
 
 def _convert_to_number(value: str) -> Any:
@@ -112,7 +189,18 @@ def parse_arguments(
     except (ValueError, SyntaxError):
         pass
 
-    # Strategy 4: Treat as string
+    # Strategy 4: For non-string types (object, array), try to parse even if it's in string format
+    if arg_type in ["object", "array"]:
+        try:
+            # If the expected type is object/array but the value is a string representation,
+            # try to parse it as JSON to get the actual object/array
+            if json_value.startswith("[") or json_value.startswith("{"):
+                parsed_value = json.loads(json_value)
+                return parsed_value, True
+        except (json.JSONDecodeError, ValueError):
+            pass
+
+    # Strategy 5: Treat as string
     try:
         quoted_value = json.dumps(str(json_value))
         return json.loads(quoted_value), True
@@ -179,8 +267,10 @@ class Glm47MoeDetector(BaseFormatDetector):
             for match_result in match_result_list:
                 # Get function name
                 func_detail = self.func_detail_regex.search(match_result)
-                func_name = func_detail.group(1)
-                func_args = func_detail.group(2)
+                if func_detail is None:
+                    continue
+                func_name = func_detail.group(1) if func_detail.group(1) else ""
+                func_args = func_detail.group(2) if func_detail.group(2) else ""
                 arguments = {}
                 if func_args:
                     pairs = self.func_arg_regex.findall(func_args)
@@ -227,7 +317,7 @@ class Glm47MoeDetector(BaseFormatDetector):
 
         Args:
             value: Raw value string
-            value_type: Expected type ('string', 'number', 'object')
+            value_type: Expected type ('string', 'number', 'object', 'array')
 
         Returns:
             Properly formatted JSON value string
@@ -237,16 +327,27 @@ class Glm47MoeDetector(BaseFormatDetector):
             return json.dumps(value, ensure_ascii=False)
         elif value_type == "number":
             try:
-                num = _convert_to_number(value.strip())
+                num = _convert_to_number(value.strip() if value else "")
                 return str(num)
             except (ValueError, AttributeError):
                 # Fallback to string if not a valid number
                 logger.warning(
                     f"Failed to parse '{value}' as number, treating as string"
                 )
+                return json.dumps(str(value) if value else "", ensure_ascii=False)
+        elif value_type in ["object", "array"]:
+            # For object/array types, try to parse and return as valid JSON
+            try:
+                parsed_value = json.loads(value)
+                return json.dumps(parsed_value, ensure_ascii=False)
+            except (json.JSONDecodeError, ValueError):
+                # If it's not valid JSON but should be object/array, treat as string
+                logger.warning(
+                    f"Failed to parse '{value}' as {value_type}, treating as string"
+                )
                 return json.dumps(str(value), ensure_ascii=False)
         else:
-            # For object/array types, return as-is (should already be valid JSON)
+            # For other types, return as-is
             return value
 
     def _process_xml_to_json_streaming(
@@ -359,7 +460,7 @@ class Glm47MoeDetector(BaseFormatDetector):
                                 self._current_value += content
                                 self._xml_tag_buffer = ""
                         else:
-                            # For object/array types, output as-is
+                            # For object/array types, output as-is (no quotes)
                             if content:
                                 if not self._value_started:
                                     self._value_started = True
@@ -416,9 +517,14 @@ class Glm47MoeDetector(BaseFormatDetector):
                 string=current_text,
                 flags=re.DOTALL,
             )
-            if partial_match:
-                func_name = partial_match.group(1).strip()
-                func_args_raw = partial_match.group(2).strip()
+            # Only proceed if we have a non-empty function name
+            if partial_match and (func_name := partial_match.group(1)) is not None:
+                # Check if we have a valid function name before proceeding
+                func_name = func_name.strip()
+                func_args_raw = partial_match.group(2)
+                func_args_raw = (
+                    func_args_raw.strip() if func_args_raw is not None else ""
+                )
                 is_tool_end = partial_match.group(3)
 
                 # Initialize state if this is the first tool call
@@ -438,7 +544,12 @@ class Glm47MoeDetector(BaseFormatDetector):
 
                 # Send tool name first if not sent yet
                 if not self.current_tool_name_sent:
-                    assert func_name, "func_name should not be empty"
+                    # Additional safety check for func_name
+                    if not func_name:
+                        logger.warning(
+                            "Empty function name detected, skipping tool call"
+                        )
+                        return StreamingParseResult(normal_text="", calls=[])
                     calls.append(
                         ToolCallItem(
                             tool_index=self.current_tool_id,
@@ -509,14 +620,16 @@ class Glm47MoeDetector(BaseFormatDetector):
                             ] += closing_brace
 
                         try:
-                            pairs = self.func_arg_regex.findall(func_args_raw)
-                            if pairs:
-                                arguments = self._parse_argument_pairs(
-                                    pairs, func_name, tools
-                                )
-                                self.prev_tool_call_arr[self.current_tool_id][
-                                    "arguments"
-                                ] = arguments
+                            # Only try to parse if func_args_raw is not empty
+                            if func_args_raw:
+                                pairs = self.func_arg_regex.findall(func_args_raw)
+                                if pairs:
+                                    arguments = self._parse_argument_pairs(
+                                        pairs, func_name, tools
+                                    )
+                                    self.prev_tool_call_arr[self.current_tool_id][
+                                        "arguments"
+                                    ] = arguments
                         except Exception as e:
                             logger.debug(
                                 f"Failed to parse arguments: {e}", exc_info=True
