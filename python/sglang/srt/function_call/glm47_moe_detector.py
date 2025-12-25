@@ -484,7 +484,18 @@ class Glm47MoeDetector(BaseFormatDetector):
         # Check if we have a tool call
         has_tool_call = self.bot_token in current_text
 
-        if not has_tool_call:
+        # If there is a tool call, check if there's normal text before it
+        if has_tool_call:
+            bot_token_idx = current_text.find(self.bot_token)
+            if bot_token_idx > 0:
+                # There is text before the tool call token, return it as normal text
+                normal_text_before = current_text[:bot_token_idx]
+                # Keep the tool call and everything after it in the buffer
+                remaining_text = current_text[bot_token_idx:]
+                self._buffer = remaining_text
+                return StreamingParseResult(normal_text=normal_text_before, calls=[])
+            # If bot_token is at the beginning (index 0), continue with tool call processing
+        else:
             # Check if buffer could be the start of a tool call
             # Keep buffer if it could be a partial match of bot_token
             is_potential_start = any(
@@ -509,12 +520,23 @@ class Glm47MoeDetector(BaseFormatDetector):
         if not hasattr(self, "_tool_indices"):
             self._tool_indices = self._get_tool_indices(tools)
 
+        # Extract any normal text before the first tool call token
+        bot_token_idx = current_text.find(self.bot_token)
+        normal_text_before = ""
+        remaining_text = current_text  # Keep track of what's left to process
+
+        if bot_token_idx != -1:
+            normal_text_before = current_text[:bot_token_idx]
+            # Keep only the tool call part and after for further processing
+            remaining_text = current_text[bot_token_idx:]
+            self._buffer = remaining_text  # Update the buffer
+
         calls: list[ToolCallItem] = []
         try:
-            # Try to match a partial or complete tool call
+            # Try to match a partial or complete tool call from the remaining text
             partial_match = re.search(
                 pattern=r"<tool_call>(.*?)(<arg_key>.*?)?(</tool_call>|$)",
-                string=current_text,
+                string=remaining_text,  # Use remaining_text which starts with the tool call
                 flags=re.DOTALL,
             )
             # Only proceed if we have a non-empty function name
@@ -636,9 +658,11 @@ class Glm47MoeDetector(BaseFormatDetector):
                             )
 
                         # Remove the completed tool call from buffer
-                        self._buffer = current_text[partial_match.end(3) :]
+                        self._buffer = remaining_text[partial_match.end(3) :]
 
-                        result = StreamingParseResult(normal_text="", calls=calls)
+                        result = StreamingParseResult(
+                            normal_text=normal_text_before, calls=calls
+                        )
                         self.current_tool_id += 1
                         self._last_arguments = ""
                         self.current_tool_name_sent = False
@@ -646,7 +670,7 @@ class Glm47MoeDetector(BaseFormatDetector):
                         self._reset_streaming_state()
                         return result
 
-            return StreamingParseResult(normal_text="", calls=calls)
+            return StreamingParseResult(normal_text=normal_text_before, calls=calls)
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}", exc_info=True)
