@@ -56,41 +56,7 @@ def get_argument_type(
         return None
 
     schema = properties[arg_key]
-
-    # Direct type field (simple case)
-    if "type" in schema:
-        type_value = schema["type"]
-        # Handle OpenAI-style array types: ["string", "null"]
-        if isinstance(type_value, list):
-            for t in type_value:
-                if isinstance(t, str) and t != "null":
-                    return t
-        # Handle simple type string
-        elif isinstance(type_value, str):
-            return type_value
-
-    # Handle complex JSON Schema structures: anyOf, oneOf, allOf
-    for keyword in ["anyOf", "oneOf", "allOf"]:
-        if keyword in schema:
-            variants = schema[keyword]
-            if not isinstance(variants, list):
-                continue
-
-            # Try to find a non-null type from the variants
-            for variant in variants:
-                if isinstance(variant, dict):
-                    # Check for direct type field
-                    if "type" in variant:
-                        variant_type = variant["type"]
-                        # Skip null types in union types
-                        if variant_type != "null":
-                            return variant_type
-                    # Recursively handle nested anyOf/oneOf/allOf
-                    nested_type = _extract_type_from_complex_schema(variant)
-                    if nested_type and nested_type != "null":
-                        return nested_type
-
-    return None
+    return _extract_type_from_complex_schema(schema)
 
 
 def _extract_type_from_complex_schema(schema: dict) -> Optional[str]:
@@ -170,16 +136,17 @@ def parse_arguments(
     except (json.JSONDecodeError, ValueError):
         pass
 
-    # Strategy 2: Unescape and parse
+    # Strategy 2: Unescape and parse (safe version using json.dumps for proper escaping)
     try:
-        wrapped = json.loads('{"tmp": "' + json_value + '"}')
+        escaped_value = json.dumps(json_value, ensure_ascii=False)
+        wrapped = json.loads('{"tmp": ' + escaped_value + "}")
         parsed_value = json.loads(wrapped["tmp"])
 
         if arg_type == "number" and isinstance(parsed_value, str):
             parsed_value = _convert_to_number(parsed_value)
 
         return parsed_value, True
-    except (json.JSONDecodeError, ValueError, KeyError):
+    except (json.JSONDecodeError, ValueError, KeyError, TypeError):
         pass
 
     # Strategy 3: ast.literal_eval
