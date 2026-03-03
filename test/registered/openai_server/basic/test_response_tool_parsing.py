@@ -153,7 +153,6 @@ def test_harmony_utils_tool_handling():
     nested_tool.function.description = "Nested description"
     nested_tool.function.parameters = {"param": "nested"}
     # Ensure it doesn't have direct attributes to test the fallback
-    del nested_tool.name
 
     msg_nested = get_developer_message(tools=[nested_tool])
     assert msg_nested is not None

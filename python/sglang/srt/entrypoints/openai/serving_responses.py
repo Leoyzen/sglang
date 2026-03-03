@@ -128,6 +128,31 @@ class OpenAIServingResponses(OpenAIServingChat):
 
         self.background_tasks: dict[str, asyncio.Task] = {}
 
+    def _convert_response_tools_to_tools(self, tools: Optional[list]) -> list[Tool]:
+        """Convert ResponseTool objects to Tool format for ChatCompletionRequest.
+
+        This is a helper method to avoid code duplication when converting
+        ResponseFunctionTool (flat format) to Tool (nested format).
+        """
+        if not tools:
+            return []
+
+        function_tools = [
+            Tool(
+                type="function",
+                function=Function(
+                    name=tool.name,
+                    description=tool.description,
+                    parameters=tool.parameters,
+                    strict=tool.strict,
+                ),
+            )
+            for tool in tools
+            if tool.type == "function"
+        ]
+
+        return function_tools
+
     # error helpers dedicated for v1/responses
     def create_error_response(
         self,
@@ -380,21 +405,7 @@ class OpenAIServingResponses(OpenAIServingChat):
         messages = self._construct_input_messages(request, prev_response)
 
         # Convert ResponseTool (flat) to Tool (nested) format for ChatCompletionRequest
-        chat_tools: Optional[list[Tool]] = None
-        if request.tools:
-            function_tools = [
-                Tool(
-                    type="function",
-                    function=Function(
-                        name=tool.name,
-                        description=tool.description,
-                        parameters=tool.parameters,
-                        strict=tool.strict,
-                    ),
-                ) for tool in request.tools if tool.type == "function"
-            ]
-            if function_tools:
-                chat_tools = function_tools
+        chat_tools = self._convert_response_tools_to_tools(request.tools)
 
         # Follow SGLang's pattern: create a ChatCompletionRequest and process messages
         try:
@@ -589,20 +600,7 @@ class OpenAIServingResponses(OpenAIServingChat):
             and content
         ):
             # Convert ResponseTool to Tool format for the parser
-            tools_for_parser = []
-            for tool in request.tools:
-                if tool.type == "function":
-                    tools_for_parser.append(
-                        Tool(
-                            type="function",
-                            function=Function(
-                                name=tool.name,
-                                description=tool.description,
-                                parameters=tool.parameters,
-                                strict=tool.strict,
-                            ),
-                        )
-                    )
+            tools_for_parser = self._convert_response_tools_to_tools(request.tools)
 
             if tools_for_parser:
                 parser = FunctionCallParser(tools_for_parser, tool_call_parser)
