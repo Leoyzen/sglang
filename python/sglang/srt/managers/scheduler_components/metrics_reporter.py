@@ -577,9 +577,13 @@ class SchedulerMetricsReporter:
         self.spec_num_block_accept_tokens = 0
         self.spec_num_cap_tokens = 0
         # Reset alongside the prefix cache (this runs on flush_cache), so the
-        # cumulative hit rate reflects only post-flush traffic.
+        # cumulative hit rate reflects only post-flush traffic. Clear the
+        # exported stats too, so idle-time logging doesn't keep publishing the
+        # stale pre-flush rate until the next batch is processed.
         self.total_cache_hit_tokens = 0
         self.total_cache_input_tokens = 0
+        self.stats.cache_hit_rate = 0.0
+        self.stats.cache_hit_rate_cumulative = 0.0
 
     def report_prefill_stats(
         self,
