@@ -78,6 +78,7 @@ class InsertParams:
     chunked: bool = False
     priority: int = 0
     track_adopted_ranges: bool = False
+    is_finished: bool = False
 
 
 @dataclasses.dataclass
