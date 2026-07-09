@@ -2414,6 +2414,7 @@ class HiRadixCache(RadixCache):
         value = params.value
         chunked = params.chunked
         priority = params.priority
+        is_finished = params.is_finished
 
         if priority is None:
             priority = 0
@@ -2451,7 +2452,8 @@ class HiRadixCache(RadixCache):
                     # release candidates, or it stays pinned forever.
                     self._update_redundant_host_status(node)
                 else:
-                    self._inc_hit_count(node, chunked)
+                    if not is_finished:
+                        self._inc_hit_count(node, chunked)
                     total_prefix_length += prefix_len
             else:
                 # partial match, split the node
@@ -2468,7 +2470,8 @@ class HiRadixCache(RadixCache):
                     # see the full-match recomputation branch above
                     self._update_redundant_host_status(new_node)
                 else:
-                    self._inc_hit_count(new_node, chunked)
+                    if not is_finished:
+                        self._inc_hit_count(new_node, chunked)
                     total_prefix_length += prefix_len
                 node = new_node
 
