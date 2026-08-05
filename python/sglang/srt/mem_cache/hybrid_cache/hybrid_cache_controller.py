@@ -33,7 +33,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
     PoolTransferResult,
 )
-from sglang.srt.mem_cache.memory_pool_host import PoolEntry
+from sglang.srt.mem_cache.memory_pool_host import HostPoolGroup, PoolEntry
 from sglang.srt.utils import get_device_module
 
 if TYPE_CHECKING:
@@ -230,6 +230,15 @@ class HybridCacheController(BaseHiCacheController):
         )
 
         for entry in host_pools or []:
+            self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
+
+    def register_host_pool_entry(self, entry: PoolEntry) -> None:
+        if not isinstance(self.mem_pool_host, HostPoolGroup):
+            raise TypeError("Dynamic HiCache sidecars require HostPoolGroup.")
+        self.mem_pool_host.add_entry(entry)
+        if not entry.is_primary_index_anchor:
+            self.extra_host_mem_release_queues.setdefault(entry.name, Queue())
+        if self.enable_storage and self.storage_backend is not None:
             self.storage_backend.register_mem_host_pool_v2(entry.host_pool, entry.name)
 
     @staticmethod
@@ -506,9 +515,10 @@ class HybridCacheController(BaseHiCacheController):
         with device_module.stream(self.load_stream):
             producer_event.start_event.wait(self.load_stream)
             ack_start_event.record()
+            target_device_pool = self.mem_pool_host.anchor_entry.device_pool
             for i in range(self.layer_num):
                 self.mem_pool_host.load_to_device_per_layer(
-                    self.mem_pool_device,
+                    target_device_pool,
                     host_indices,
                     device_indices,
                     i,
@@ -526,6 +536,31 @@ class HybridCacheController(BaseHiCacheController):
                         device_indices,
                         i,
                         self.io_backend,
+                    )
+
+                # HiCache now supports draft caches through two paths:
+                #
+                # - Packed: standard NextN/MTP models (DeepSeek-V3.2, GLM-5.x,
+                #   DeepSeek-V4, MiMo-V2.5) and DeepSeek-V4 DSpark. Draft KV/indexer/SWA
+                #   buffers are appended to the matching target host pools as tail layers
+                #   and share their slot mappings. D2H/H2D therefore moves target and draft
+                #   in the same cache operation; the branch below restores the tail layers.
+                #
+                # - Sidecar: standalone EAGLE/EAGLE3 (for example Llama-2/Llama-3.1),
+                #   DFlash (for example Gemma-4), and non-DeepSeek-V4 DSpark. Draft
+                #   KV/indexer/SWA gets a separate host-pool entry sized to its source target
+                #   pool. Its PoolTransfer follows the target KV or SWA indices and is
+                #   attached to the same cache operation.
+
+                if self.has_mtp_draft and i < len(self.mtp_draft_device_pools):
+                    self.mem_pool_host.load_to_device_per_layer(
+                        self.mtp_draft_device_pools[i],
+                        host_indices,
+                        device_indices,
+                        self.layer_num + i,
+                        self.io_backend,
+                        pool_transfers=resolved_pool_transfers,
+                        is_draft=True,
                     )
                 producer_event.complete(i)
             ack_finish_event.record()
