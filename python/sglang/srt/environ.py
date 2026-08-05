@@ -1158,6 +1158,8 @@ class Envs:
     SGLANG_MOE_COPY_WEIGHT_VIEWS_BEFORE_H2D = EnvBool(False)
     # Default reasoning_effort for dsv4 chat encoder when request doesn't set it.
     # Accepts "", "max", "high" (empty string means unset); other values filtered to None.
+    # "low" is additionally accepted only for checkpoints selected by the bundled
+    # DSpark marker, which use the three-tier low/high/max mapping.
     SGLANG_DSV4_REASONING_EFFORT = EnvStr("")
     # Quantize the SWA fp8 KV cache from bf16-rounded values (matches
     # trainer-side QAT and the DSA-CP path) instead of fp32 registers.
