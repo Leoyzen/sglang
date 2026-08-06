@@ -3883,6 +3883,13 @@ class ServerArgs:
                 "requires --dcp-size / --decode-context-parallel-size > 1, but "
                 f"got dcp_size={self.dcp_size}."
             )
+        if is_cuda() and self.speculative_algorithm is not None and self.dcp_size > 1:
+            logger.warning(
+                "Decode context parallel (--dcp-size > 1) with "
+                "speculative decoding is experimental: validated for DSA "
+                "models (GLM-5.x EAGLE/nextn) on the default kernel "
+                "stack; the dense-MLA draft path is not implemented."
+            )
         if self.dcp_comm_backend == "fi_a2a" and not is_cuda():
             raise ValueError(
                 "--dcp-comm-backend fi_a2a delegates the exchange to FlashInfer's "
