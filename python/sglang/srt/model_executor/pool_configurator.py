@@ -73,6 +73,17 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _get_dsa_indexer_cache_token_multiplier(kvc: KVCacheConfigurator) -> int:
+    """Return indexer-cache slots allocated per allocator-visible token."""
+    if kvc.server_args.enable_hisparse:
+        from sglang.srt.mem_cache.sparsity import parse_hisparse_config
+
+        return parse_hisparse_config(kvc.server_args).host_to_device_ratio
+
+    parallel = get_parallel()
+    return parallel.attn_dcp_size if parallel.dcp_enabled else 1
+
+
 def _get_dsv4_compress_state_dtype_sizes() -> tuple[int, int]:
     dtype_name = envs.SGLANG_DSV4_COMPRESS_STATE_DTYPE.get().strip().lower()
     if dtype_name in ("float32", "fp32"):
@@ -232,18 +243,11 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                 element_size = torch._utils._element_size(
                     DSATokenToKVPool.index_k_with_scale_buffer_dtype
                 )
-                indexer_ratio = 1
-                if kvc.server_args.enable_hisparse:
-                    from sglang.srt.mem_cache.sparsity import parse_hisparse_config
-
-                    indexer_ratio = parse_hisparse_config(
-                        kvc.server_args
-                    ).host_to_device_ratio
                 cell_size += int(
                     indexer_size_per_token
                     * effective_num_layers
                     * element_size
-                    * indexer_ratio
+                    * _get_dsa_indexer_cache_token_multiplier(kvc)
                 )
         elif is_minimax_sparse(model_config.hf_config):
             # Mirrors MiniMaxSparseKVPool: main pool (K+V all layers) + indexer pool
