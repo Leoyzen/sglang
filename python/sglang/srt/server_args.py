@@ -351,6 +351,12 @@ DSA_CHOICES = [
 ]
 NSA_CHOICES = DSA_CHOICES  # deprecated alias
 
+DSV4_PREFILL_BACKEND_CHOICES = [
+    "auto",
+    "flashmla_sparse",
+    "flashmla_sparse_q8",
+]
+
 DSA_TOPK_BACKEND_CHOICES = ["sgl-kernel", "torch", "flashinfer"]
 
 DSA_PAGED_MQA_LOGITS_BACKEND_CHOICES = ["auto", "deepgemm", "cutedsl", "aiter"]
@@ -1043,10 +1049,38 @@ class ServerArgs:
                 "follow_bootstrap_room",
                 "total_requests",
                 "total_tokens",
+                "prefix_affinity",
             ],
         ),
         NS("parallel"),
     ] = "auto"
+    prefix_affinity_fallback: A[
+        str,
+        Arg(
+            help=(
+                "Load-balance method used by 'prefix_affinity' when it cannot honor "
+                "affinity (no routing key and token fallback disabled or unusable, "
+                "or all live ranks over the load-skew threshold)."
+            ),
+            choices=["round_robin", "total_requests", "total_tokens"],
+        ),
+    ] = "total_tokens"
+    prefix_affinity_max_load_skew: A[
+        float,
+        "For 'prefix_affinity': a rank is considered overloaded when its load exceeds "
+        "this multiple of the average load across live ranks, at which point routing "
+        "skips it to keep load balanced. Must be >= 1.0.",
+    ] = 1.5
+    prefix_affinity_hash_tokens: A[
+        int,
+        "For 'prefix_affinity': number of leading input tokens hashed for the "
+        "token-prefix fallback key when a request has no routing key.",
+    ] = 4096
+    prefix_affinity_disable_token_fallback: A[
+        bool,
+        "For 'prefix_affinity': disable the token-prefix fallback key so that requests "
+        "without an explicit routing key go straight to the fallback load-balance method.",
+    ] = False
     attn_cp_size: A[
         int,
         Arg(
@@ -1744,6 +1778,17 @@ class ServerArgs:
         ),
         NS("exec.kernel"),
     ] = None
+    dsv4_prefill_backend: A[
+        str,
+        Arg(
+            help=(
+                "DeepSeek-V4 sparse prefill backend. 'auto' and "
+                "'flashmla_sparse' use the existing BF16 sparse prefill path; "
+                "'flashmla_sparse_q8' enables the Q8KV8 sparse prefill path."
+            ),
+            choices=DSV4_PREFILL_BACKEND_CHOICES,
+        ),
+    ] = "auto"
     dsa_decode_backend: A[
         Optional[str],
         Arg(
@@ -3863,6 +3908,15 @@ class ServerArgs:
                 else "round_robin"
             )
             return
+
+        if (
+            self.load_balance_method == "prefix_affinity"
+            and self.prefix_affinity_max_load_skew < 1.0
+        ):
+            raise ValueError(
+                "--prefix-affinity-max-load-skew must be >= 1.0, got "
+                f"{self.prefix_affinity_max_load_skew}"
+            )
 
     def _handle_ssl_validation(self):
         """Ensure SSL arguments are consistent and referenced files exist."""

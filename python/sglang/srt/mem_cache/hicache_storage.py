@@ -73,6 +73,8 @@ class PoolName(str, Enum):
 
     # Draft KV pool
     DRAFT = "draft"
+    DRAFT_INDEXER = "draft_indexer"
+    DRAFT_SWA = "draft_swa"
 
     def __str__(self) -> str:
         return self.value
@@ -137,12 +139,14 @@ class PoolTransferResult:
         Every extra pool contributes a prefix that must be contiguous from the
         start, so count the leading run of successes
         """
-        self.extra_pool_hit_pages.update(
-            {
-                name: (rs.index(False) if False in rs else len(rs))
-                for name, rs in results.items()
-            }
-        )
+        self.extra_pool_hit_pages.update(count_pool_hits(results))
+
+
+def count_pool_hits(results: dict[str, List[bool]]) -> dict[str, int]:
+    return {
+        name: (rs.index(False) if False in rs else len(rs))
+        for name, rs in results.items()
+    }
 
 
 class HiCacheStorage(ABC):
