@@ -443,7 +443,31 @@ class DeepseekSparseAttnBackend(
                 elif dcp_num_q_heads <= 128:
                     self.flashmla_kv_num_q_heads = 128
                 else:
-                    self.flashmla_kv_num_q_heads = dcp_num_q_heads
+                    # FlashMLA decode kernel only exposes the 64/128-head
+                    # variants (verified in sgl_kernel.flash_mla test suite:
+                    # h_q ∈ {16, 32, 64, 128}). Passing the raw widened count
+                    # to flash_mla_with_kvcache is undefined behavior; reject
+                    # at startup instead.
+                    #
+                    # For a 256-head model (GLM-5.2), this limits usable
+                    # configurations to those keeping dcp_num_q_heads ≤ 128,
+                    # e.g.:
+                    #   - TP8 + DCP2 -> 32*2  = 64  (pad to 64)
+                    #   - TP8 + DCP4 -> 32*4  = 128 (pad to 128)
+                    #   - TP4 + DCP2 -> 64*2  = 128 (pad to 128)
+                    # Combinations like TP4 + DCP4 (256 heads) or TP2 +
+                    # DCP2 (256 heads) must fall back to the trtllm/trtllm
+                    # DSA backend pair instead.
+                    raise ValueError(
+                        "DSA DCP with flashmla_kv on SM90 requires the "
+                        "widened query head count (num_q_heads * dcp_size) "
+                        "to be within 128; the FlashMLA kernel only "
+                        "implements the 64/128-head variants. Got "
+                        f"num_q_heads={self.num_q_heads} * dcp_size="
+                        f"{self.dcp_size} = {dcp_num_q_heads}. Use a smaller "
+                        "--dcp-size, a larger --tp-size, or switch the DSA "
+                        "backend pair to trtllm/trtllm on SM100+."
+                    )
             else:
                 raise ValueError(
                     "Unsupported DSA backend pair for DCP: "
@@ -460,6 +484,33 @@ class DeepseekSparseAttnBackend(
                 "extend rows, and prefill CP splits rows across ranks."
             )
             assert self.hisparse_coordinator is None, "DCP does not support hisparse."
+            # The DCP group must fit inside the attention-TP group (DCP reuses
+            # the TP ranks without expanding the process mesh), so dcp_size
+            # must divide attn_tp_size. The dp-attention branch below enforces
+            # the stronger `attn_tp_size % dcp_size == 0`; here we guard the
+            # common (non-dp-attention) path too.
+            assert parallel.attn_tp_size % self.dcp_size == 0, (
+                f"dcp_size ({self.dcp_size}) must divide attn_tp_size "
+                f"({parallel.attn_tp_size}); DCP reuses the TP ranks and "
+                "cannot exceed the attention-TP group."
+            )
+            if (
+                model_runner.server_args.speculative_algorithm is not None
+                and dsa_backend_pair == ("flashmla_kv", "flashmla_kv")
+            ):
+                # Spec×DCP was validated by #31821 on the trtllm/trtllm pair
+                # (default kernel stack); the flashmla_kv SM90 path added by
+                # the H200 follow-up (#14) has not been exercised under
+                # speculative decoding. Warn loudly so the combination isn't
+                # silently trusted.
+                print_warning_once(
+                    "Speculative decoding (--speculative-algorithm) with "
+                    "DCP and the flashmla_kv SM90 backend pair is "
+                    "unvalidated: correctness of the LSE combine + draft "
+                    "target-verify path on this configuration is not "
+                    "guaranteed. Prefer trtllm/trtllm where available, or "
+                    "verify accuracy against --dcp-size 1."
+                )
             if model_runner.server_args.enable_dp_attention:
                 # Keep each DCP group inside one attention-DP shard so the
                 # replicated indexer sees identical requests group-wide.
