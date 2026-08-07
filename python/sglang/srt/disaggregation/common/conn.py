@@ -36,7 +36,7 @@ from sglang.srt.layers.dp_attention import (
     get_attention_dp_rank,
     get_attention_dp_size,
 )
-from sglang.srt.runtime_context import get_parallel, get_serving
+from sglang.srt.runtime_context import get_model, get_parallel
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.utils.network import (
     NetworkAddress,
@@ -113,6 +113,10 @@ class PrefillServerInfo:
     required_dst_info_num: Optional[int] = None
     required_prefill_response_num: Optional[int] = None
 
+    # DeepSeek V4 IndexCache PD compatibility descriptor (agreed across all P ranks)
+    dsv4_index_cache_layout_signature: Optional[str] = None
+    dsv4_index_cache_producer_layer_ids: Optional[List[int]] = None
+
     def __post_init__(self):
         self.attn_tp_size = int(self.attn_tp_size)
         self.attn_cp_size = int(self.attn_cp_size)
@@ -148,7 +152,6 @@ class CommonKVManager(BaseKVManager):
         is_mla_backend: Optional[bool] = False,
     ):
         self.kv_args = args
-        self.kv_cache_dtype_str = args.kv_cache_dtype_str
         self.kv_item_lens_sum = sum(args.kv_item_lens)
         self.state_item_lens_sum = sum(x for comp in args.state_item_lens for x in comp)
         self.is_mla_backend = is_mla_backend
@@ -164,17 +167,14 @@ class CommonKVManager(BaseKVManager):
         self.bootstrap_host = server_args.host
         self.bootstrap_port = server_args.disaggregation_bootstrap_port
         self.dist_init_addr = server_args.dist_init_addr
-        parallel = get_parallel()
-        self.attn_tp_size = parallel.attn_tp_size
-        self.attn_tp_rank = parallel.attn_tp_rank
-        self.attn_cp_size = parallel.attn_cp_size
-        self.attn_cp_rank = parallel.attn_cp_rank
-        self.dcp_size = server_args.dcp_size
-        self.dcp_rank = parallel.dcp_rank if self.dcp_size > 1 else 0
+        self.attn_tp_size = get_parallel().attn_tp_size
+        self.attn_tp_rank = get_parallel().attn_tp_rank
+        self.attn_cp_size = get_parallel().attn_cp_size
+        self.attn_cp_rank = get_parallel().attn_cp_rank
         self.attn_dp_size = get_attention_dp_size()
         self.attn_dp_rank = get_attention_dp_rank()
         self.system_dp_size = (
-            1 if get_parallel().enable_dp_attention else get_parallel().dp_size
+            1 if server_args.enable_dp_attention else server_args.dp_size
         )
         self.system_dp_rank = (
             self.kv_args.system_dp_rank if self.kv_args.system_dp_rank else 0
@@ -183,7 +183,7 @@ class CommonKVManager(BaseKVManager):
         self.pp_rank = self.kv_args.pp_rank
         self.local_ip = get_local_ip_auto()
         cp_sharded_prefill = self.attn_cp_size > 1 and (
-            self.is_hybrid_mla_backend or get_parallel().enable_dsa_cache_layer_split
+            self.is_hybrid_mla_backend or server_args.enable_dsa_cache_layer_split
         )
 
         hybrid_decode_pulls_all_ranks = (
@@ -206,7 +206,6 @@ class CommonKVManager(BaseKVManager):
         self.request_status: Dict[int, KVPoll] = {}
         self._socket_cache: Dict[str, zmq.Socket] = {}
         self._monitor_cache: Dict[str, zmq.Socket] = {}
-        self._socket_send_locks: Dict[str, threading.Lock] = {}
         self._socket_lock = threading.Lock()
         self.failure_records: Dict[int, str] = {}
         self.failure_lock = threading.Lock()
@@ -272,39 +271,6 @@ class CommonKVManager(BaseKVManager):
             raise ValueError(
                 f"Unsupported DisaggregationMode: {self.disaggregation_mode}"
             )
-
-    def requires_dcp_relayout(self, dst_dcp_size: int, dst_dcp_rank: int) -> bool:
-        if self.dcp_size == dst_dcp_size:
-            if self.dcp_rank != dst_dcp_rank:
-                raise RuntimeError(
-                    "PD peers must connect matching DCP ranks, got "
-                    f"prefill={self.dcp_rank}, decode={dst_dcp_rank}"
-                )
-            return False
-
-        if (
-            self.dcp_size == 1
-            and dst_dcp_size > 1
-            and (self.is_mla_backend or self.is_hybrid_mla_backend)
-        ):
-            return True
-
-        raise RuntimeError(
-            f"Unsupported PD DCP topology: {self.dcp_size} -> {dst_dcp_size}"
-        )
-
-    def prepare_dcp_token_item_lens(self, dst_page_item_lens: List[int]) -> List[int]:
-        page_size = self.kv_args.page_size
-        src_token_lens = [
-            item_len // page_size for item_len in self.kv_args.kv_item_lens
-        ]
-        dst_token_lens = [item_len // page_size for item_len in dst_page_item_lens]
-        if src_token_lens != dst_token_lens:
-            raise RuntimeError(
-                "PD DCP source/destination KV geometry differs: "
-                f"src={src_token_lens}, dst={dst_token_lens}"
-            )
-        return src_token_lens
 
     def check_status(self, bootstrap_room: int) -> KVPoll:
         return self.request_status[bootstrap_room]
@@ -508,9 +474,9 @@ class CommonKVManager(BaseKVManager):
         info: PrefillServerInfo = None
         try:
             url = (
-                f"http://{bootstrap_addr}/route?"
-                f"prefill_dp_rank={-1}&prefill_cp_rank={-1}&"
-                f"target_tp_rank={-1}&target_pp_rank={-1}"
+                f"http://{bootstrap_addr}/route?prefill_dp_rank={-1}"
+                f"&prefill_cp_rank={-1}&target_tp_rank={-1}&target_pp_rank={-1}"
+                f"&dsv4_indexcache_desc=1"
             )
             response = requests.get(url, timeout=5)
             if response.status_code == 200:
@@ -535,24 +501,33 @@ class CommonKVManager(BaseKVManager):
 
         if (
             info.kv_cache_dtype is not None
-            and info.kv_cache_dtype != self.kv_cache_dtype_str
+            and info.kv_cache_dtype != get_model().kv_cache_dtype
         ):
             raise RuntimeError(
                 f"KV cache dtype mismatch: prefill server has kv_cache_dtype={info.kv_cache_dtype}, "
-                f"but decode server has kv_cache_dtype={self.kv_cache_dtype_str}. "
+                f"but decode server has kv_cache_dtype={get_model().kv_cache_dtype}. "
                 f"Both servers must use the same --kv-cache-dtype value."
             )
 
-        if self.dcp_size > 1:
-            if not (self.is_mla_backend or self.is_hybrid_mla_backend):
-                raise RuntimeError(
-                    "PD decode DCP requires an MLA or hybrid-MLA KV pool."
-                )
-            if info.attn_cp_size != 1:
-                raise RuntimeError(
-                    "PD decode DCP currently requires prefill attention CP=1, "
-                    f"got {info.attn_cp_size}."
-                )
+        decode_sig = self.kv_args.dsv4_index_cache_layout_signature
+        if (
+            info.dsv4_index_cache_layout_signature is not None
+            and decode_sig is not None
+        ):
+            from sglang.srt.models.deepseek_common.utils import (
+                validate_dsv4_index_cache_pd_compatibility,
+            )
+
+            validate_dsv4_index_cache_pd_compatibility(
+                prefill_layout_signature=info.dsv4_index_cache_layout_signature,
+                prefill_producer_layer_ids=(
+                    info.dsv4_index_cache_producer_layer_ids or []
+                ),
+                decode_layout_signature=decode_sig,
+                decode_producer_layer_ids=(
+                    self.kv_args.dsv4_index_cache_producer_layer_ids or []
+                ),
+            )
 
         self._resolve_rank_mapping(info)
         self.prefill_info_table[bootstrap_addr] = info
@@ -652,7 +627,7 @@ class CommonKVManager(BaseKVManager):
         `Connection refused`, and the leader's `prefill_port_table` ends
         up missing rows.
         """
-        if not self.dist_init_addr or get_parallel().nnodes == 1:
+        if not self.dist_init_addr or self.server_args.nnodes == 1:
             return local_port
 
         if not (dist.is_available() and dist.is_initialized()):
@@ -703,13 +678,21 @@ class CommonKVManager(BaseKVManager):
             "rank_ip": self.local_ip,
             "rank_port": self.rank_port,
             "page_size": self.kv_args.page_size,
-            "kv_cache_dtype": self.kv_cache_dtype_str,
-            "load_balance_method": get_parallel().load_balance_method,
-            "enable_dsa_cache_layer_split": get_parallel().enable_dsa_cache_layer_split,
+            "kv_cache_dtype": get_model().kv_cache_dtype,
+            "load_balance_method": self.server_args.load_balance_method,
+            "enable_dsa_cache_layer_split": getattr(
+                self.server_args, "enable_dsa_cache_layer_split", False
+            ),
             # Self-register the HTTP API port so the decode can derive the PD
             # retract rebootstrap /generate URL from bootstrap info instead of a
             # router-injected pd_rebootstrap_prefill_url.
-            "prefill_http_port": get_serving().port,
+            "prefill_http_port": self.server_args.port,
+            "dsv4_index_cache_layout_signature": (
+                self.kv_args.dsv4_index_cache_layout_signature
+            ),
+            "dsv4_index_cache_producer_layer_ids": (
+                self.kv_args.dsv4_index_cache_producer_layer_ids
+            ),
         }
 
         max_retries, initial_delay, max_delay = 5, 1.0, 30.0
@@ -719,10 +702,18 @@ class CommonKVManager(BaseKVManager):
                 if response.status_code == 200:
                     logger.debug("Prefill successfully registered to bootstrap server.")
                     return
+                # A 4xx is a permanent config error (e.g. a DSV4 IndexCache
+                # descriptor mismatch across prefill ranks); retrying cannot
+                # help and would degrade to a silent never-ready hang.
+                if 400 <= response.status_code < 500:
+                    raise RuntimeError(
+                        "Prefill failed to register to bootstrap server "
+                        f"(status {response.status_code}): {response.text}"
+                    )
                 logger.warning(
                     f"Prefill register attempt {attempt + 1}/{max_retries} failed: status {response.status_code}"
                 )
-            except Exception as e:
+            except requests.RequestException as e:
                 # Walk to root cause to skip misleading urllib3 wrapper messages
                 cause = e
                 while cause.__cause__ is not None:
@@ -777,17 +768,7 @@ class CommonKVManager(BaseKVManager):
             self._monitor_cache[endpoint] = sock.get_monitor_socket(
                 zmq.EVENT_DISCONNECTED
             )
-            self._socket_send_locks.setdefault(endpoint, threading.Lock())
             return sock
-
-    def _send_multipart_locked(
-        self, endpoint: str, parts: List[bytes], is_ipv6: bool = False
-    ):
-        # Cached sockets are shared across sender threads and zmq sockets are
-        # not thread-safe; serialize sends per endpoint.
-        sock = self._connect(endpoint, is_ipv6=is_ipv6)
-        with self._socket_send_locks[endpoint]:
-            sock.send_multipart(parts)
 
     def get_mha_kv_ptrs_with_pp(
         self, src_kv_ptrs: List[int], dst_kv_ptrs: List[int]
@@ -1087,11 +1068,12 @@ class CommonKVSender(BaseKVSender):
             return
 
         self.kv_mgr.update_status(self.bootstrap_room, KVPoll.Bootstrapping)
-        if get_parallel().dp_size > 1 and not req_has_disagg_prefill_dp_rank:
-            if get_parallel().load_balance_method != "follow_bootstrap_room":
+        if self.kv_mgr.server_args.dp_size > 1 and not req_has_disagg_prefill_dp_rank:
+            if self.kv_mgr.server_args.load_balance_method != "follow_bootstrap_room":
                 self._register_prefill_dp_rank()
             elif (
-                self.kv_mgr.attn_dp_rank != self.bootstrap_room % get_parallel().dp_size
+                self.kv_mgr.attn_dp_rank
+                != self.bootstrap_room % self.kv_mgr.server_args.dp_size
             ):
                 # follow_bootstrap_room was overridden by external routed_dp_rank
                 if envs.SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK.get():
@@ -1102,7 +1084,7 @@ class CommonKVSender(BaseKVSender):
                         f"follow_bootstrap_room conflict: dispatched to dp_rank "
                         f"{self.kv_mgr.attn_dp_rank} but bootstrap_room "
                         f"{self.bootstrap_room} implies dp_rank "
-                        f"{self.bootstrap_room % get_parallel().dp_size}. "
+                        f"{self.bootstrap_room % self.kv_mgr.server_args.dp_size}. "
                         f"Set SGLANG_DISAGGREGATION_FORCE_QUERY_PREFILL_DP_RANK=1 "
                         f"to allow mixed routing.",
                     )
@@ -1176,7 +1158,7 @@ class CommonKVSender(BaseKVSender):
 
         if (
             self.kv_mgr.enable_all_cp_ranks_for_transfer
-            and not get_parallel().enable_dsa_cache_layer_split
+            and not self.kv_mgr.server_args.enable_dsa_cache_layer_split
         ):
             kv_indices, index_slice = filter_kv_indices_for_cp_rank(
                 self.kv_mgr,
@@ -1197,7 +1179,6 @@ class CommonKVSender(BaseKVSender):
         self,
         kv_indices: npt.NDArray[np.int32],
         state_indices: Optional[List] = None,
-        num_kv_tokens: Optional[int] = None,
     ):
         pass
 
@@ -1540,6 +1521,9 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         self.page_size = None
         self.kv_cache_dtype: Optional[str] = None
         self.follow_bootstrap_room: Optional[bool] = None
+        self.dsv4_index_cache_layout_signature: Optional[str] = None
+        self.dsv4_index_cache_producer_layer_ids: Optional[List[int]] = None
+        self._dsv4_descriptor_seen: bool = False
         self.enable_dsa_cache_layer_split: Optional[bool] = None
         self.prefill_http_port: Optional[int] = None
         self.prefill_port_table: Dict[
@@ -1609,6 +1593,8 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         page_size = int(data["page_size"])
         kv_cache_dtype = data["kv_cache_dtype"]
         prefill_http_port = data.get("prefill_http_port")
+        dsv4_sig = data.get("dsv4_index_cache_layout_signature")
+        dsv4_producers = data.get("dsv4_index_cache_producer_layer_ids")
 
         if self.attn_tp_size is None:
             self.attn_tp_size = attn_tp_size
@@ -1630,6 +1616,49 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
 
         if self.prefill_http_port is None and prefill_http_port is not None:
             self.prefill_http_port = int(prefill_http_port)
+
+        if self._dsv4_descriptor_seen and dsv4_sig is None:
+            return web.Response(
+                text=(
+                    "DSV4 IndexCache descriptor missing on a prefill rank while "
+                    "other ranks reported one; all prefill ranks must run the "
+                    "same code/config."
+                ),
+                status=400,
+            )
+        if dsv4_sig is not None:
+            if not self._dsv4_descriptor_seen:
+                if self._registered_count > 0:
+                    return web.Response(
+                        text=(
+                            "DSV4 IndexCache descriptor reported by a prefill "
+                            "rank after other ranks registered without one; all "
+                            "prefill ranks must run the same code/config."
+                        ),
+                        status=400,
+                    )
+                self._dsv4_descriptor_seen = True
+                self.dsv4_index_cache_layout_signature = dsv4_sig
+                self.dsv4_index_cache_producer_layer_ids = dsv4_producers
+            elif dsv4_sig != self.dsv4_index_cache_layout_signature:
+                return web.Response(
+                    text=(
+                        "DSV4 IndexCache layout_signature mismatch across "
+                        f"prefill ranks: stored="
+                        f"{self.dsv4_index_cache_layout_signature}, got={dsv4_sig}"
+                    ),
+                    status=400,
+                )
+            elif dsv4_producers != self.dsv4_index_cache_producer_layer_ids:
+                return web.Response(
+                    text=(
+                        "DSV4 IndexCache producer_layer_ids mismatch across "
+                        f"prefill ranks: stored="
+                        f"{self.dsv4_index_cache_producer_layer_ids}, "
+                        f"got={dsv4_producers}"
+                    ),
+                    status=400,
+                )
 
         if self.follow_bootstrap_room is None:
             load_balance_method = data.get(
@@ -1673,6 +1702,7 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
         prefill_cp_rank = request.query.get("prefill_cp_rank")
         target_tp_rank = request.query.get("target_tp_rank")
         target_pp_rank = request.query.get("target_pp_rank")
+        wants_dsv4_descriptor = request.query.get("dsv4_indexcache_desc") == "1"
         if (
             not prefill_dp_rank
             or not prefill_cp_rank
@@ -1707,8 +1737,18 @@ class CommonKVBootstrapServer(BaseKVBootstrapServer):
                 ),
                 enable_dsa_cache_layer_split=bool(self.enable_dsa_cache_layer_split),
                 prefill_http_port=self.prefill_http_port,
+                dsv4_index_cache_layout_signature=(
+                    self.dsv4_index_cache_layout_signature
+                ),
+                dsv4_index_cache_producer_layer_ids=(
+                    self.dsv4_index_cache_producer_layer_ids
+                ),
             )
-            return web.json_response(dataclasses.asdict(info), status=200)
+            payload = dataclasses.asdict(info)
+            if not wants_dsv4_descriptor:
+                payload.pop("dsv4_index_cache_layout_signature", None)
+                payload.pop("dsv4_index_cache_producer_layer_ids", None)
+            return web.json_response(payload, status=200)
 
         if not self._is_ready():
             return web.Response(
