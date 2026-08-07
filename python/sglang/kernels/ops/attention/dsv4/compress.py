@@ -246,8 +246,8 @@ class CompressorPrefillPlan(NamedTuple):
         swa_page_size: int,
         ring_size: int,
         num_q_tokens: int,
+        num_draft_tokens: int = 0,
         use_cuda_graph: bool = False,
-        verify_width: int = 0,
     ) -> CompressorPrefillPlan:
         is_gpu_input = seq_lens.device.type in ["cuda", "xpu"]
         pin_buffer = torch.empty(
@@ -275,7 +275,7 @@ class CompressorPrefillPlan(NamedTuple):
             module = _jit_compress_plan_module()
             fn = module.plan_prefill
 
-        plan_args = (
+        plan_c, plan_w = fn(
             req_pool_indices,
             req_to_token,
             full_to_state,
@@ -286,10 +286,9 @@ class CompressorPrefillPlan(NamedTuple):
             int(compress_ratio),
             int(swa_page_size),
             int(ring_size),
+            int(num_draft_tokens),
+            bool(use_cuda_graph),
         )
-        if not _is_xpu:
-            plan_args += (int(verify_width),)
-        plan_c, plan_w = fn(*plan_args, bool(use_cuda_graph))
         return CompressorPrefillPlan(
             compress_ratio,
             torch.from_dlpack(plan_c) if not _is_xpu else plan_c,

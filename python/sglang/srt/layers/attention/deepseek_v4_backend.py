@@ -571,6 +571,7 @@ class DeepseekV4AttnBackend(
 
         self.is_dspark_draft = model_runner.is_draft_worker and self.is_dspark
         self.is_draft_runner = model_runner.is_draft_worker
+        self.compress_verify_write_pad: int = self.speculative_num_draft_tokens or 0
         self._verify_mask = None
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
@@ -722,7 +723,7 @@ class DeepseekV4AttnBackend(
         use_prefill_cuda_graph: bool = False,
         online_c128_state_slot_offset: int = 0,
         dspark_block_size: Optional[int] = None,
-        verify_width: int = 0,
+        num_draft_tokens: int = 0,
     ) -> DSV4Metadata:
         seq_lens_casual, req_pool_indices_repeated = self.expand_prefill_casually(
             num_tokens=num_tokens,
@@ -776,7 +777,7 @@ class DeepseekV4AttnBackend(
                         extend_lens_cpu=None,
                         use_prefill_cuda_graph=True,
                         num_q_tokens=out_cache_loc.shape[0],
-                        verify_width=verify_width,
+                        num_draft_tokens=num_draft_tokens,
                         online_state_slot_offset=online_c128_state_slot_offset,
                     )
                 return create_paged_compressor_data(
@@ -790,7 +791,7 @@ class DeepseekV4AttnBackend(
                     extend_lens=extend_seq_lens,
                     extend_lens_cpu=extend_seq_lens_cpu,
                     use_prefill_cuda_graph=use_graph_plan,
-                    verify_width=verify_width,
+                    num_draft_tokens=num_draft_tokens,
                     online_state_slot_offset=online_c128_state_slot_offset,
                 )
 
@@ -916,7 +917,7 @@ class DeepseekV4AttnBackend(
             need_compress=True,
             use_prefill_cuda_graph=use_prefill_cuda_graph,
             online_c128_state_slot_offset=online_c128_state_slot_offset,
-            verify_width=(self.speculative_num_draft_tokens if self.is_dspark else 0),
+            num_draft_tokens=self.compress_verify_write_pad,
         )
 
     def init_forward_metadata_dspark_draft_block(
@@ -1013,7 +1014,7 @@ class DeepseekV4AttnBackend(
             extend_lens_cpu=None,
             use_prefill_cuda_graph=True,
             num_q_tokens=num_q_tokens,
-            verify_width=(self.speculative_num_draft_tokens if self.is_dspark else 0),
+            num_draft_tokens=self.compress_verify_write_pad,
             online_state_slot_offset=online_c128_state_slot_offset,
         )
         c128_compress_metadata = raw_metadata.c128_compress_metadata
