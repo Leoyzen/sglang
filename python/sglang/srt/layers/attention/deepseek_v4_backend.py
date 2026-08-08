@@ -1971,7 +1971,7 @@ class DeepseekV4AttnBackend(
         flashmla_sparse_q8``; ``SGLANG_DSV4_Q8KV8_PREFILL`` remains as a debug
         override for focused runtime validation.
         """
-        from sglang.jit_kernel.sparse_mla_q8kv8_prefill_sm90 import (
+        from sglang.kernels.ops.attention.sparse_mla_q8kv8_prefill_sm90 import (
             sparse_mla_q8kv8_prefill_fwd,
         )
 
