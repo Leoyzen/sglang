@@ -65,7 +65,6 @@ from sglang.srt.speculative.spec_utils import (
     build_grammar_vocab_mask,
     draft_tp_context,
     prepare_mamba_track_for_verify,
-    record_stream_each,
 )
 from sglang.srt.utils import get_available_gpu_memory, is_cuda
 
@@ -539,10 +538,8 @@ class DSparkWorkerV2(BaseSpecWorker):
                 )
             return self._decode_idle_result(on_publish=on_publish)
 
-        fwd_stream = torch.get_device_module(self.device).current_stream()
-        record_stream_each(
-            (batch.seq_lens, batch.req_pool_indices),
-            fwd_stream,
+        batch.seq_lens.record_stream(
+            torch.get_device_module(self.device).current_stream()
         )
         bs = len(batch.seq_lens)
         device = self.device
