@@ -194,7 +194,6 @@ class BaseReasoningFormatDetector:
         # Strip `<think>` token if present
         if not self.stripped_think_start and think_start_text in current_text:
             current_text = current_text.replace(think_start_text, "", 1)
-            self._buffer = current_text
             self.stripped_think_start = True
             self._in_reasoning = True
 
@@ -206,7 +205,6 @@ class BaseReasoningFormatDetector:
 
             self._buffer = ""
             self._in_reasoning = False
-            self.stripped_think_start = False
             normal_text = current_text[end_idx + len(self.think_end_token) :]
 
             return StreamingParseResult(
@@ -223,30 +221,13 @@ class BaseReasoningFormatDetector:
                 normal_text = current_text[tool_idx:]
                 self._buffer = ""
                 self._in_reasoning = False
-                self.stripped_think_start = False
                 return StreamingParseResult(
                     normal_text=normal_text, reasoning_text=reasoning_text
                 )
             if self.stream_reasoning:
-                # Stream the content immediately, but hold back any trailing
-                # suffix that could be a partial token (think_end or tool_start)
-                # to avoid losing it across chunk boundaries (BUG #2).
-                tokens_to_check = [self.think_end_token]
-                if self.tool_start_token:
-                    tokens_to_check.append(self.tool_start_token)
-                holdback = 0
-                for token in tokens_to_check:
-                    for i in range(1, min(len(current_text) + 1, len(token))):
-                        if token.startswith(current_text[-i:]):
-                            holdback = max(holdback, i)
-                            break
-                if holdback:
-                    emit_text = current_text[:-holdback]
-                    self._buffer = current_text[-holdback:]
-                else:
-                    emit_text = current_text
-                    self._buffer = ""
-                return StreamingParseResult(reasoning_text=emit_text)
+                # Stream the content immediately
+                self._buffer = ""
+                return StreamingParseResult(reasoning_text=current_text)
             else:
                 return StreamingParseResult()
 
@@ -1135,7 +1116,6 @@ class DeepSeekV4Detector(BaseReasoningFormatDetector):
             dsv4_thinking_start_token,
             dsv4_thinking_end_token,
             think_excluded_tokens=[dsv4_eos_token, dsv4_dsml_token],
-            tool_start_token=f"<{dsv4_dsml_token}",
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
             continue_final_message=continue_final_message,
