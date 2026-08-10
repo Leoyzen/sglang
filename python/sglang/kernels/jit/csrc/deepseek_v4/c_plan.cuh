@@ -583,10 +583,11 @@ inline PrefillPlan plan_compress_prefill(
   for (const auto i : irange(batch_size)) {
     const int32_t seq_len = seq_ptr[i];
     const int32_t extend_len = ext_ptr[i];
+    if (extend_len == 0) continue;  // idle/padded request in compact ragged verify
     const int32_t prefix_len = seq_len - extend_len;
     const int32_t last_c_pos = seq_len / compress_ratio * compress_ratio;
     const int32_t first_w_pos = std::min(last_c_pos - (is_overlap ? compress_ratio : 0), seq_len - mtp_pad);
-    RuntimeCheck(0 < extend_len && extend_len <= seq_len);
+    RuntimeCheck(extend_len <= seq_len);  // extend_len==0 idle/padded reqs skipped above
     const auto should_write = [=](int32_t position) {
       if (position >= first_w_pos) return true;
       return is_overlap && position % swa_page_size >= (swa_page_size - compress_ratio);
