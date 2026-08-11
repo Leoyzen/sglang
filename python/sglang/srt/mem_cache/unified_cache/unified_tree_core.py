@@ -738,8 +738,14 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             comp.refresh_lru(LRURefreshPhase.MATCH_END, node_update, self.root_node)
 
         cur_time = get_and_increase_time_counter()
+        # Increment hit_count on read access so SLRU can distinguish
+        # actively-read nodes from stale ones. See the matching change in
+        # hiradix_cache.py _match_prefix_helper for rationale.
+        increment_hit_count = not self.is_write_back
         while node_update:
             node_update.last_access_time = cur_time
+            if increment_hit_count:
+                node_update.hit_count += 1
             cur_time -= 0.00001
             node_update = node_update.parent
 
