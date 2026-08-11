@@ -760,9 +760,7 @@ class HiRadixCache(RadixCache):
                     # per-op value, not the local one.  operation.hash_value
                     # is the list captured at write_storage() time, so
                     # marking by hash also covers nodes split mid-backup.
-                    if acked_completed is not None and ack_index < len(
-                        acked_completed
-                    ):
+                    if acked_completed is not None and ack_index < len(acked_completed):
                         completed = acked_completed[ack_index]
                     else:
                         completed = operation.completed_tokens
@@ -788,6 +786,15 @@ class HiRadixCache(RadixCache):
                     self.storage_metrics_collector.log_backuped_tokens(
                         operation.completed_tokens
                     )
+                    # Log failed tokens: the difference between what was
+                    # expected and what actually completed. Non-zero values
+                    # indicate L3 storage backend failures.
+                    total_expected = len(operation.hash_value or []) * self.page_size
+                    failed_tokens = total_expected - operation.completed_tokens
+                    if failed_tokens > 0:
+                        self.storage_metrics_collector.log_backuped_failed_tokens(
+                            failed_tokens
+                        )
 
         def _drain_release():
             host_indices_list = []
@@ -971,8 +978,7 @@ class HiRadixCache(RadixCache):
             node.parent != self.root_node
             and not node.parent.backuped
             and not (
-                self.mirror_release_enabled
-                and self._node_fully_durable(node.parent)
+                self.mirror_release_enabled and self._node_fully_durable(node.parent)
             )
         ):
             return 0
@@ -1359,8 +1365,7 @@ class HiRadixCache(RadixCache):
 
     def _mirror_release_active(self) -> bool:
         return (
-            self.mirror_release_enabled
-            and self._mirror_release_disabled_reason is None
+            self.mirror_release_enabled and self._mirror_release_disabled_reason is None
         )
 
     def _mirror_release_local_deficit(self) -> int:
@@ -1402,9 +1407,7 @@ class HiRadixCache(RadixCache):
                 self.redundant_host_nodes.discard(node)
         if not candidates:
             return None
-        candidates.sort(
-            key=lambda n: (self.eviction_strategy.get_priority(n), n.id)
-        )
+        candidates.sort(key=lambda n: (self.eviction_strategy.get_priority(n), n.id))
         plan = MirrorReleasePlan()
         digest = _FNV64_OFFSET
         for node in candidates:
@@ -1471,9 +1474,7 @@ class HiRadixCache(RadixCache):
                 local_valid = plan is not None and all(
                     self._mirror_node_releasable(n) for n in plan.nodes
                 )
-                valid = torch.tensor(
-                    [1 if local_valid else 0], dtype=torch.int64
-                )
+                valid = torch.tensor([1 if local_valid else 0], dtype=torch.int64)
                 self._all_reduce_attn_groups(valid, torch.distributed.ReduceOp.MIN)
                 if int(valid.item()) == 1:
                     self._execute_mirror_release_plan(plan)
@@ -1490,9 +1491,11 @@ class HiRadixCache(RadixCache):
                     "mirror-release plan mismatch: my_plan=%s candidates=%d "
                     "durable_hashes=%d deficit=%d clock=%d "
                     "(count %d/%d tokens %d/%d digest %x/%x)",
-                    f"{len(plan.nodes)}n/{plan.tokens}t/{plan.digest:x}"
-                    if plan
-                    else "none",
+                    (
+                        f"{len(plan.nodes)}n/{plan.tokens}t/{plan.digest:x}"
+                        if plan
+                        else "none"
+                    ),
                     len(self.redundant_host_nodes),
                     len(self.storage_backed_hashes),
                     global_deficit,
