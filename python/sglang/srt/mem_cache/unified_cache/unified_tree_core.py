@@ -115,6 +115,7 @@ class UnifiedTreeNode:
             ComponentData() for _ in range(_NUM_COMPONENT_TYPES)
         ]
         self.last_access_time = get_and_increase_time_counter()
+        self.last_accessed_timestamp = self.last_access_time
         self.creation_time = get_and_increase_time_counter()
         self.hash_value = None
         self.hit_count = 0
@@ -1042,6 +1043,7 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         new_node.key = child.key[:split_len]
         new_node.hit_count = child.hit_count
         new_node.creation_time = child.creation_time
+        new_node.last_accessed_timestamp = child.last_accessed_timestamp
         # Split fragments stay on the anchor's root path for the ack's walk.
         new_node.load_back_pending_id = child.load_back_pending_id
 
