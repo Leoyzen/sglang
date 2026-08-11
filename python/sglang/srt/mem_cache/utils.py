@@ -63,10 +63,10 @@ _EVICTION_POLICY_FACTORIES: dict[str, Callable[[], EvictionStrategy]] = {
 }
 
 
-def get_eviction_strategy(eviction_policy: str) -> EvictionStrategy:
+def get_eviction_strategy(eviction_policy: str, **kwargs: Any) -> EvictionStrategy:
     policy = eviction_policy.lower()
     try:
-        return _EVICTION_POLICY_FACTORIES[policy]()
+        return _EVICTION_POLICY_FACTORIES[policy](**kwargs)
     except KeyError:
         supported = "', '".join(_EVICTION_POLICY_FACTORIES)
         raise ValueError(

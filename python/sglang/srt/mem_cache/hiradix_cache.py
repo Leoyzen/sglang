@@ -1116,7 +1116,7 @@ class HiRadixCache(RadixCache):
         # skip the hit count update for chunked requests
         if self.cache_controller.write_policy == "write_back" or chunked:
             return
-        node.hit_count += 1
+        self.eviction_strategy.on_hit(node)
 
         if not node.backuped:
             if node.hit_count >= self.write_through_threshold:
@@ -1412,7 +1412,9 @@ class HiRadixCache(RadixCache):
                 self.redundant_host_nodes.discard(node)
         if not candidates:
             return None
-        candidates.sort(key=lambda n: (self.eviction_strategy.get_priority(n), n.id))
+        candidates.sort(
+            key=lambda n: (self.eviction_strategy.get_priority(n, None), n.id)
+        )
         plan = MirrorReleasePlan()
         digest = _FNV64_OFFSET
         for node in candidates:
@@ -1544,26 +1546,29 @@ class HiRadixCache(RadixCache):
         self.update_eviction_metrics(num_evicted, start_time)
         return EvictResult(num_tokens_evicted=num_evicted)
 
-    def _make_eviction_heap(self):
+    def _make_eviction_heap(self, now: Optional[float] = None):
         heap = [
-            (self.eviction_strategy.get_priority(node), node)
+            (self.eviction_strategy.get_priority(node, now), node)
             for node in self.evictable_leaves
         ]
         heapq.heapify(heap)
         return heap
 
-    def _promote_parent(self, node: TreeNode, heap) -> None:
+    def _promote_parent(
+        self, node: TreeNode, heap, now: Optional[float] = None
+    ) -> None:
         # Once all of a node's children are evicted, it becomes a device leaf.
         p = node.parent
         if p is not self.root_node and all(c.evicted for c in p.children.values()):
-            heapq.heappush(heap, (self.eviction_strategy.get_priority(p), p))
+            heapq.heappush(heap, (self.eviction_strategy.get_priority(p, now), p))
 
     def _evict_write_through(self, num_tokens: int) -> int:
         """write_through / write_through_selective: drop non-backuped leaves,
         demote already-backuped ones. Nothing is staged to host during eviction,
         so this is a plain on-the-fly pass.
         """
-        heap = self._make_eviction_heap()
+        now = time.monotonic()
+        heap = self._make_eviction_heap(now)
         num_evicted = 0
         while num_evicted < num_tokens and heap:
             _, x = heapq.heappop(heap)
@@ -1595,14 +1600,15 @@ class HiRadixCache(RadixCache):
                 num_evicted += freed
             else:
                 num_evicted += self._evict_regular(x)
-            self._promote_parent(x, heap)
+            self._promote_parent(x, heap, now)
         return num_evicted
 
     def _evict_write_back(self, num_tokens: int) -> int:
         """eviction for write_back mode: demote already-backuped leaves, stage non-backuped ones to host if possible, otherwise drop them.
         note this path will be deprecated in the future.
         """
-        heap = self._make_eviction_heap()
+        now = time.monotonic()
+        heap = self._make_eviction_heap(now)
         num_evicted = 0
         staged: List[Tuple[TreeNode, torch.Tensor]] = []
 
@@ -1628,7 +1634,7 @@ class HiRadixCache(RadixCache):
             else:
                 flush_staged()
                 num_evicted += self._drop_subtree_no_host(x)
-            self._promote_parent(x, heap)
+            self._promote_parent(x, heap, now)
         flush_staged()
         return num_evicted
 
@@ -1738,8 +1744,9 @@ class HiRadixCache(RadixCache):
 
     def evict_host(self, num_tokens: int):
         leaves = list(self.evictable_host_leaves)
+        now = time.monotonic()
         eviction_heap = [
-            (self.eviction_strategy.get_priority(node), node) for node in leaves
+            (self.eviction_strategy.get_priority(node, now), node) for node in leaves
         ]
         heapq.heapify(eviction_heap)
 
@@ -1769,7 +1776,7 @@ class HiRadixCache(RadixCache):
             self._update_host_leaf_status(x.parent)
 
             if len(x.parent.children) == 0 and x.parent.evicted:
-                new_priority = self.eviction_strategy.get_priority(x.parent)
+                new_priority = self.eviction_strategy.get_priority(x.parent, now)
                 heapq.heappush(eviction_heap, (new_priority, x.parent))
 
     def load_back(
@@ -2307,8 +2314,12 @@ class HiRadixCache(RadixCache):
         # that would trigger write_backup when hit_count reaches the
         # write_through_threshold. Backup triggers should only fire on
         # insert(), not on read-only match_prefix access.
+        # NOTE: We use eviction_strategy.on_hit() instead of directly
+        # incrementing hit_count so that SLRU debounce/decay optimization
+        # (PR #24075) applies to match_prefix hits too. When the SLRU
+        # optimization is disabled, on_hit() is equivalent to hit_count += 1.
         if self.cache_controller.write_policy != "write_back":
-            node.hit_count += 1
+            self.eviction_strategy.on_hit(node)
         child_key = key.child_key(self.page_size)
         value = []
 
@@ -2316,7 +2327,7 @@ class HiRadixCache(RadixCache):
             child = node.children[child_key]
             child.last_access_time = time.monotonic()
             if self.cache_controller.write_policy != "write_back":
-                child.hit_count += 1
+                self.eviction_strategy.on_hit(child)
             prefix_len = child.key.match(key, page_size=self.page_size)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
@@ -2343,6 +2354,8 @@ class HiRadixCache(RadixCache):
         new_node.lock_ref = child.lock_ref
         new_node.key = child.key[:split_len]
         new_node.hit_count = child.hit_count
+        new_node.last_access_time = child.last_access_time
+        new_node.last_accessed_timestamp = child.last_accessed_timestamp
 
         # split value and host value if exists
         if child.evicted:

@@ -51,6 +51,7 @@ from sglang.srt.distributed.device_communicators.mooncake_transfer_engine import
 from sglang.srt.environ import envs
 from sglang.srt.function_call.function_call_parser import FunctionCallParser
 from sglang.srt.lora.lora_registry import LoRARef
+from sglang.srt.mem_cache.cache_init_params import EvictionConfig
 from sglang.srt.model_executor.cuda_graph_config import (
     ALLOWED_BACKENDS_PER_PHASE,
     Backend,
@@ -976,6 +977,21 @@ class ServerArgs:
         "Enabling mixing prefill and decode in a batch when using chunked prefill.",
         NS("schedule"),
     ] = False
+    slru_protected_threshold: A[
+        int,
+        "SLRU protected threshold: nodes with hit_count >= threshold are protected from eviction.",
+        NS("memory"),
+    ] = 2
+    slru_debounce_sec: A[
+        float,
+        "SLRU debounce: hits within this window don't increment hit_count to prevent burst promotion.",
+        NS("memory"),
+    ] = 0.1
+    slru_decay_sec: A[
+        float,
+        "SLRU lazy decay: effective hit_count halves every decay_sec seconds.",
+        NS("memory"),
+    ] = 60.0
 
     # -------------------------------------------------------------------------
     # Distributed topology and parallelism (TP, PP, DP, CP)
@@ -8717,6 +8733,19 @@ class ServerArgs:
         # TODO: adaptive spec currently requires topk=1, so each runtime state
         # needs steps + 1 draft-token slots. Revisit this if topk>1 is supported.
         return max(candidate_steps) + 1
+
+    def radix_eviction_config(self) -> EvictionConfig:
+        params = {}
+        if self.radix_eviction_policy.lower() == "slru":
+            params = {
+                "protected_threshold": self.slru_protected_threshold,
+                "debounce_sec": self.slru_debounce_sec,
+                "decay_sec": self.slru_decay_sec,
+            }
+        return EvictionConfig(
+            policy=self.radix_eviction_policy,
+            params=params,
+        )
 
     @property
     def mamba_cache_chunk_size(self) -> int:

@@ -398,7 +398,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self.is_write_back = False
         self.has_swa_host_pool = False
         self.enable_session_radix_cache = params.enable_session_radix_cache
-        self.eviction_strategy = get_eviction_strategy(params.eviction_policy.lower())
+        self.eviction_strategy = get_eviction_strategy(
+            params.eviction_config.policy.lower(),
+            **params.eviction_config.params,
+        )
 
         # ``device`` is derived from the construction-time allocator; the
         # allocator/pool themselves are owned by the cache, not the tree.
@@ -741,11 +744,15 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # Increment hit_count on read access so SLRU can distinguish
         # actively-read nodes from stale ones. See the matching change in
         # hiradix_cache.py _match_prefix_helper for rationale.
+        # We use eviction_strategy.on_hit() instead of directly incrementing
+        # hit_count so that SLRU debounce/decay optimization (PR #24075)
+        # applies to match_prefix hits too. When the SLRU optimization is
+        # disabled, on_hit() is equivalent to hit_count += 1.
         increment_hit_count = not self.is_write_back
         while node_update:
             node_update.last_access_time = cur_time
             if increment_hit_count:
-                node_update.hit_count += 1
+                self.eviction_strategy.on_hit(node_update)
             cur_time -= 0.00001
             node_update = node_update.parent
 

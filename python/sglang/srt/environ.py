@@ -982,6 +982,12 @@ class Envs:
     # Registered TreeCore backend serving the unified radix cache.
     SGLANG_UNIFIED_RADIX_TREE_CORE_BACKEND = EnvStr("python")
 
+    # Radix Cache: SLRU hit-count optimization (debounce + cap + lazy decay).
+    # When False, ``SLRUStrategy`` preserves the legacy two-tier behavior
+    # (hit_count bumped unconditionally, no decay) so existing users see
+    # zero change. When True, SLRU activates the optimized code path.
+    SGLANG_ENABLE_SLRU_OPTIMIZATION = EnvBool(False)
+
     # CUDA Graph
     SGLANG_USE_BREAKABLE_CUDA_GRAPH = EnvBool(False)
     # Guards CUDA graph executable dedup via cudaGraphExecUpdate.

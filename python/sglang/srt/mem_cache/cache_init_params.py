@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import dataclasses
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 
@@ -12,6 +12,12 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.unified_cache.components.tree_component import (
         TreeComponent,
     )
+
+
+@dataclasses.dataclass
+class EvictionConfig:
+    policy: str = "lru"
+    params: dict[str, Any] = dataclasses.field(default_factory=dict)
 
 
 @dataclasses.dataclass
@@ -26,7 +32,7 @@ class CacheInitParams:
     attn_cp_cache_group: Optional[torch.distributed.ProcessGroup] = None
     attn_tp_cache_group: Optional[torch.distributed.ProcessGroup] = None
     pp_cache_group: Optional[torch.distributed.ProcessGroup] = None
-    eviction_policy: str = "lru"
+    eviction_config: EvictionConfig = dataclasses.field(default_factory=EvictionConfig)
     disable_finished_insert: bool = False
 
     enable_metrics: bool = False
