@@ -1302,7 +1302,12 @@ class HiRadixCache(RadixCache):
             return
 
         for child in node.children.values():
-            if child.backuped:
+            # A child with active GPU value (not evicted) protects the
+            # parent from host-leaf eviction, even if it is not backuped.
+            # Previously, only child.backuped was checked, which allowed
+            # evict_host to remove a parent whose child had active GPU
+            # value but no host backup — orphaning the active GPU child.
+            if child.backuped or not child.evicted:
                 if node in self.evictable_host_leaves:
                     self.evictable_host_leaves.remove(node)
                 return
