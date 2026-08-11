@@ -2,6 +2,7 @@ import json
 import logging
 import re
 
+from partial_json_parser.core.exceptions import MalformedJSON
 from partial_json_parser.core.options import Allow
 
 from sglang.srt.entrypoints.openai.protocol import Tool
@@ -179,7 +180,7 @@ class DeepSeekV32Detector(BaseFormatDetector):
                         parameters[param_name] = _partial_json_loads(
                             param_value, Allow.ALL
                         )[0]
-                    except json.JSONDecodeError:
+                    except (json.JSONDecodeError, MalformedJSON):
                         parameters[param_name] = param_value.strip()
 
         return json.dumps(parameters, ensure_ascii=False)
@@ -259,10 +260,10 @@ class DeepSeekV32Detector(BaseFormatDetector):
             return StreamingParseResult(normal_text=current_text)
 
         all_calls: list[ToolCallItem] = []
+        preamble = ""
+
         try:
-            # Loop to handle multiple consecutive invoke blocks
             while True:
-                # Try to match an invoke block (may be partial)
                 invoke_match = re.search(
                     pattern=self.invoke_regex,
                     string=current_text,
@@ -275,19 +276,21 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     invoke_match
                 )
 
-                # Initialize state if this is the first tool call
                 if self.current_tool_id == -1:
                     self.current_tool_id = 0
                     self.prev_tool_call_arr = []
                     self.streamed_args_for_tool = [""]
+                    dsml_start = invoke_match.start()
+                    bot_pos = current_text.rfind(self.bot_token, 0, dsml_start)
+                    if bot_pos != -1:
+                        dsml_start = bot_pos
+                    preamble = current_text[:dsml_start]
 
-                # Ensure arrays are large enough for current tool
                 while len(self.prev_tool_call_arr) <= self.current_tool_id:
                     self.prev_tool_call_arr.append({})
                 while len(self.streamed_args_for_tool) <= self.current_tool_id:
                     self.streamed_args_for_tool.append("")
 
-                # 1. Send tool name if not sent yet
                 if not self.current_tool_name_sent:
                     all_calls.append(
                         ToolCallItem(
@@ -298,12 +301,10 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     )
                     self.current_tool_name_sent = True
 
-                # 2. Parse current parameters (partial or complete)
                 current_params = self._parse_parameters_from_xml(
                     invoke_content, allow_partial=not is_tool_end
                 )
 
-                # 3. Calculate and send incremental arguments
                 sent_len = len(self.streamed_args_for_tool[self.current_tool_id])
                 prev_params = self.prev_tool_call_arr[self.current_tool_id].get(
                     "arguments"
@@ -312,10 +313,8 @@ class DeepSeekV32Detector(BaseFormatDetector):
                 argument_diff = None
 
                 if is_tool_end:
-                    # If complete, send everything remaining
                     argument_diff = current_params[sent_len:]
                 elif prev_params is not None:
-                    # If partial, send stable prefix diff
                     if current_params != prev_params:
                         prefix = _find_common_prefix(current_params, prev_params)
                         if len(prefix) > sent_len:
@@ -331,35 +330,26 @@ class DeepSeekV32Detector(BaseFormatDetector):
                     )
                     self.streamed_args_for_tool[self.current_tool_id] += argument_diff
 
-                # Update the stored arguments
                 self.prev_tool_call_arr[self.current_tool_id] = {
                     "name": func_name,
                     "arguments": current_params,
                 }
 
-                # Check if tool call is complete (has closing tag)
                 if is_tool_end:
-                    # Remove the completed tool call from buffer
                     self._buffer = current_text[invoke_match.end() :]
-                    current_text = self._buffer  # Update for next iteration
+                    current_text = self._buffer
 
-                    # Move to next tool call
                     self.current_tool_id += 1
                     self.current_tool_name_sent = False
-
-                    # Continue loop to check for more invoke blocks
                     continue
-                else:
-                    # Tool call not complete yet, don't return anything
-                    # Wait for more chunks until we see </｜DSML｜invoke>
-                    break
+                break
 
-            # No more invoke blocks found
-            return StreamingParseResult(normal_text="", calls=all_calls)
+            return StreamingParseResult(normal_text=preamble, calls=all_calls)
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
-            return StreamingParseResult(normal_text=current_text)
+            self._buffer = ""
+            return StreamingParseResult(normal_text=preamble)
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(
