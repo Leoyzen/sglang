@@ -191,12 +191,13 @@ class BaseReasoningFormatDetector:
         ):
             return StreamingParseResult()
 
+        # Strip `<think>` token if present
         if not self.stripped_think_start and think_start_text in current_text:
             current_text = current_text.replace(think_start_text, "", 1)
-            self._buffer = current_text
             self.stripped_think_start = True
             self._in_reasoning = True
 
+        # Handle end of reasoning block
         if self._in_reasoning and self.think_end_token in current_text:
             end_idx = current_text.find(self.think_end_token)
 
@@ -210,10 +211,13 @@ class BaseReasoningFormatDetector:
                 normal_text=normal_text, reasoning_text=reasoning_text
             )
 
+        # Continue with reasoning content
         if self._in_reasoning:
+            # Check for tool_start_token interruption
             if self.tool_start_token and self.tool_start_token in current_text:
                 tool_idx = current_text.find(self.tool_start_token)
                 reasoning_text = current_text[:tool_idx]
+                # Preserve tool_start_token in normal text
                 normal_text = current_text[tool_idx:]
                 self._buffer = ""
                 self._in_reasoning = False
@@ -221,27 +225,18 @@ class BaseReasoningFormatDetector:
                     normal_text=normal_text, reasoning_text=reasoning_text
                 )
             if self.stream_reasoning:
-                tokens_to_check = [self.think_end_token]
-                if self.tool_start_token:
-                    tokens_to_check.append(self.tool_start_token)
-                holdback = 0
-                for token in tokens_to_check:
-                    max_prefix_len = min(len(current_text), len(token) - 1)
-                    for prefix_len in range(max_prefix_len, 0, -1):
-                        if current_text.endswith(token[:prefix_len]):
-                            holdback = max(holdback, prefix_len)
-                            break
-                if holdback:
-                    emit_text = current_text[:-holdback]
-                    self._buffer = current_text[-holdback:]
-                else:
-                    emit_text = current_text
-                    self._buffer = ""
-                return StreamingParseResult(reasoning_text=emit_text)
-            return StreamingParseResult()
+                # Stream the content immediately
+                self._buffer = ""
+                return StreamingParseResult(reasoning_text=current_text)
+            else:
+                return StreamingParseResult()
 
-        self._buffer = ""
-        return StreamingParseResult(normal_text=current_text)
+        # If we're not in a reasoning block return as normal text
+        if not self._in_reasoning:
+            self._buffer = ""
+            return StreamingParseResult(normal_text=current_text)
+
+        return StreamingParseResult()
 
     def _strip_leading_think_start(self, text: str) -> str:
         think_start_text = self.think_start_token + self.think_start_self_label
@@ -1121,7 +1116,6 @@ class DeepSeekV4Detector(BaseReasoningFormatDetector):
             dsv4_thinking_start_token,
             dsv4_thinking_end_token,
             think_excluded_tokens=[dsv4_eos_token, dsv4_dsml_token],
-            tool_start_token=f"<{dsv4_dsml_token}",
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
             continue_final_message=continue_final_message,
