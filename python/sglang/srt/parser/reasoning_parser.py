@@ -202,9 +202,26 @@ class BaseReasoningFormatDetector:
 
             reasoning_text = current_text[:end_idx]
 
-            self._buffer = ""
             self._in_reasoning = False
             normal_text = current_text[end_idx + len(self.think_end_token) :]
+
+            # Hold back a partial tool_start_token suffix (e.g. "<" or
+            # "<｜DSML｜tool_c") so the tag doesn't split across chunks
+            # and leak into content via the tool parser's early return.
+            if self.tool_start_token and normal_text:
+                holdback = 0
+                max_prefix_len = min(len(normal_text), len(self.tool_start_token) - 1)
+                for prefix_len in range(max_prefix_len, 0, -1):
+                    if normal_text.endswith(self.tool_start_token[:prefix_len]):
+                        holdback = prefix_len
+                        break
+                if holdback:
+                    self._buffer = normal_text[-holdback:]
+                    normal_text = normal_text[:-holdback]
+                else:
+                    self._buffer = ""
+            else:
+                self._buffer = ""
 
             return StreamingParseResult(
                 normal_text=normal_text, reasoning_text=reasoning_text
@@ -239,6 +256,23 @@ class BaseReasoningFormatDetector:
                     self._buffer = ""
                 return StreamingParseResult(reasoning_text=emit_text)
             return StreamingParseResult()
+
+        # Not in reasoning — emit as normal_text, but hold back a partial
+        # tool_start_token suffix (e.g. "<" or "<｜DSML｜tool_c") so the
+        # tag doesn't get split across chunks and leak into content.
+        # tool_start_token excludes ">" so the closing bracket always
+        # stays in normal_text and reaches the tool parser intact.
+        if self.tool_start_token:
+            holdback = 0
+            max_prefix_len = min(len(current_text), len(self.tool_start_token) - 1)
+            for prefix_len in range(max_prefix_len, 0, -1):
+                if current_text.endswith(self.tool_start_token[:prefix_len]):
+                    holdback = prefix_len
+                    break
+            if holdback:
+                emit_text = current_text[:-holdback]
+                self._buffer = current_text[-holdback:]
+                return StreamingParseResult(normal_text=emit_text)
 
         self._buffer = ""
         return StreamingParseResult(normal_text=current_text)
@@ -1121,7 +1155,7 @@ class DeepSeekV4Detector(BaseReasoningFormatDetector):
             dsv4_thinking_start_token,
             dsv4_thinking_end_token,
             think_excluded_tokens=[dsv4_eos_token, dsv4_dsml_token],
-            tool_start_token=f"<{dsv4_dsml_token}",
+            tool_start_token=f"<{dsv4_dsml_token}tool_calls",
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
             continue_final_message=continue_final_message,

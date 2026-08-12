@@ -175,6 +175,20 @@ class FunctionCallParser:
 
         return final_normal_text, final_calls
 
+    def parse_stream_end(self) -> Tuple[str, list[ToolCallItem]]:
+        """Flush any text trapped in the detector buffer when the stream ends.
+
+        Returns any buffered normal_text that was not flushed during streaming
+        (e.g. when DSML markers without a matching invoke trapped text in the
+        buffer).  Should be called once after the last chunk.
+        """
+        if not self.tools:
+            return "", []
+        if not hasattr(self.detector, "finish"):
+            return "", []
+        result = self.detector.finish()
+        return result.normal_text or "", result.calls
+
     def get_legacy_structural_tag(
         self, at_least_one: bool = False
     ) -> StructuralTagResponseFormat:
