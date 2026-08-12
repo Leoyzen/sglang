@@ -127,11 +127,8 @@ class DeepSeekV32Detector(BaseFormatDetector):
         if invoke_content_stripped.startswith("{"):
             if allow_partial:
                 # Remove incomplete invoke end call prefix in case they are captured by param
-                # Use removesuffix (not rstrip) — see parameter path for rationale.
                 for token in reversed(self.prefix_invoke_end_call):
-                    invoke_content_stripped = invoke_content_stripped.removesuffix(
-                        token
-                    )
+                    invoke_content_stripped = invoke_content_stripped.rstrip(token)
                 return invoke_content_stripped
             elif invoke_content_stripped.endswith("}"):
                 return invoke_content_stripped
@@ -165,11 +162,8 @@ class DeepSeekV32Detector(BaseFormatDetector):
             remaining_content = invoke_content[last_match_end:]
 
             # Remove incomplete parameter_end_call prefix in case they are captured by param
-            # Use removesuffix (not rstrip) — rstrip treats the argument as a character
-            # set, which truncates values ending with chars in the token (e.g. "find /tmp"
-            # stripped to "find /" by rstrip("parameter")).
             for token in reversed(self.prefix_parameter_end_call):
-                remaining_content = remaining_content.removesuffix(token)
+                remaining_content = remaining_content.rstrip(token)
 
             # Match start of a parameter tag + value (potentially incomplete)
             # Regex: <tag name="..." string="...">VALUE... (no end tag)
@@ -244,33 +238,15 @@ class DeepSeekV32Detector(BaseFormatDetector):
         current_text = self._buffer
 
         # Check if buffer contains any DSML markers or ends with potential tag prefix
-        # This handles partial/streaming DSML content.
-        # Use specific tool-call tag prefixes instead of bare "｜DSML｜" to avoid
-        # trapping response text that merely mentions DSML sub-tags (e.g.
-        # <｜DSML｜parameter> in explanatory text) — see "potentially_dsml trap".
-        dsml_tool_tags = [
-            "<｜DSML｜invoke",
-            "<｜DSML｜tool_calls",
-            "<｜DSML｜function_calls",
-            "</｜DSML｜invoke",
-            "</｜DSML｜tool_calls",
-            "</｜DSML｜function_calls",
-        ]
-        potentially_dsml = any(tag in current_text for tag in dsml_tool_tags)
+        # This handles partial/streaming DSML content
+        dsml_markers = ["｜DSML｜", "<｜", "</｜"]
+        potentially_dsml = any(marker in current_text for marker in dsml_markers)
 
-        # Check if text ends with a partial prefix of any DSML tool-call tag.
-        # Find the last "<" in the text; everything from there to the end is a
-        # candidate partial tag.  If any complete tag starts with this tail,
-        # we buffer and wait for more data.  This covers every possible split
-        # point (e.g. "<｜DSML｜tool_c" → tail "<｜DSML｜tool_c" → matches
-        # "<｜DSML｜tool_calls>".startswith(tail)) without enumerating prefixes.
-        stripped = current_text.rstrip()
-        last_lt = stripped.rfind("<")
-        if last_lt != -1:
-            tail = stripped[last_lt:]
-            ends_with_prefix = any(tag.startswith(tail) for tag in dsml_tool_tags)
-        else:
-            ends_with_prefix = False
+        # Also check if text ends with start of a tag (to handle "<" arriving separately)
+        dsml_prefixes = ["<", "<｜", "</", "</｜"]
+        ends_with_prefix = any(
+            current_text.rstrip().endswith(prefix) for prefix in dsml_prefixes
+        )
 
         if (
             not self.has_tool_call(current_text)
@@ -372,42 +348,8 @@ class DeepSeekV32Detector(BaseFormatDetector):
 
         except Exception as e:
             logger.error(f"Error in parse_streaming_increment: {e}")
-            # Do NOT clear self._buffer — retaining it lets the next chunk
-            # retry parsing with more data.  Reset transient tool state so
-            # a partial parse doesn't corrupt the next attempt.
-            self.current_tool_id = -1
-            self.current_tool_name_sent = False
+            self._buffer = ""
             return StreamingParseResult(normal_text=preamble)
-
-    def finish(self) -> StreamingParseResult:
-        """Flush any text trapped in the buffer when the stream ends.
-
-        If the buffer contains DSML markers but no invoke was ever matched
-        (e.g. a DSML sub-tag appeared in response text), the text was never
-        flushed as normal_text.  This method returns it so the client
-        receives the content instead of silently losing it.
-
-        DSML tool-call tags (e.g. <｜DSML｜tool_calls>) are delimiters, not
-        content — they are stripped from the flushed text to prevent leaking
-        raw markup into the response.
-        """
-        if not self._buffer:
-            return StreamingParseResult()
-        buffered = self._buffer
-        self._buffer = ""
-        # If we successfully parsed tool calls, the buffer holds only
-        # trailing whitespace or closing tags — don't emit those.
-        if self.current_tool_id != -1 and self.prev_tool_call_arr:
-            return StreamingParseResult()
-        # No tool calls were parsed — the buffer is trapped text.
-        # Strip everything from the first DSML tool-call tag onward:
-        # the tag is a delimiter, not content.
-        for tag in (self.bot_token, "<｜DSML｜invoke"):
-            if tag and tag in buffered:
-                idx = buffered.find(tag)
-                buffered = buffered[:idx]
-                break
-        return StreamingParseResult(normal_text=buffered)
 
     def structure_info(self) -> _GetInfoFunc:
         return lambda name: StructureInfo(

@@ -747,22 +747,6 @@ class OpenAIServingChat(OpenAIServingBase):
             # Send any remaining tool call arguments when generation finishes
             if finish_reason_type is not None and index in parser_dict:
                 parser = parser_dict[index]
-
-                # Flush any text trapped in the tool parser buffer (e.g. DSML
-                # markers without a matching invoke that blocked normal_text
-                # from being emitted during streaming).
-                flushed_text, flushed_calls = parser.parse_stream_end()
-                if flushed_text:
-                    remaining_chunk = build_sse_content(
-                        chunk_id=content["meta_info"]["id"],
-                        created=int(time.time()),
-                        model=request.model,
-                        index=index,
-                        content=flushed_text,
-                        finish_reason=None,
-                    )
-                    yield remaining_chunk
-
                 remaining_chunk = self._check_for_unstreamed_tool_args(
                     parser, content, request, index
                 )
