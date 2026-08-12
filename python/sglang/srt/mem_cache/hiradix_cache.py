@@ -2300,6 +2300,13 @@ class HiRadixCache(RadixCache):
             # Publish the newly materialized host suffix immediately so downstream
             # cache indexers can resolve descendants that extend this L2-only prefix.
             self._record_store_event(new_node, medium=StorageMedium.CPU)
+            # TEMP-DEBUG: fingerprint the prefetched key so we can verify whether
+            # the same key is repeatedly fetched (eviction-reinsertion loop) or
+            # every request fetches a unique tail chunk. Remove after diagnosis.
+            logger.info(
+                f"PREFETCH_KEY fingerprint={new_node.hash_value[-1] if new_node.hash_value else 'none'} "
+                f"node_id={new_node.id} len={len(new_node.key)}"
+            )
 
         return matched_length
 
