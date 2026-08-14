@@ -152,6 +152,8 @@ __global__ __launch_bounds__(1024, 1)  //
     counter_c = 0;
     counter_w = 0;
   }
+  // #32467: Removed the warp_max/warp_min init + barrier that raced with the
+  // reduction below. each warp then writes its own slot atomically; no init needed.
   // === Stage B: min/max(extend_len) for MTP-uniform detection ===
   // For min, treat threads outside `batch_size` as +inf so they don't pull the min down.
   const uint32_t e_for_max = static_cast<uint32_t>(extend_len);
