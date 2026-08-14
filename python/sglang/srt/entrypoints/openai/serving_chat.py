@@ -740,6 +740,7 @@ class OpenAIServingChat(OpenAIServingBase):
                 request,
                 has_tool_calls,
                 continuous_usage_stats,
+                flush=finish_reason_type is not None and finish_reason_type != "abort",
             ):
                 if chunk:
                     yield chunk
@@ -2353,8 +2354,13 @@ class OpenAIServingChat(OpenAIServingBase):
         request: ChatCompletionRequest,
         has_tool_calls: Dict[int, bool],
         continuous_usage_stats: bool = False,
+        flush: bool = False,
     ):
-        """Process tool calls in streaming response"""
+        """Process tool calls in streaming response.
+
+        With flush=True (the terminal delta), the parser also drains text it
+        held back waiting for a marker that can no longer arrive.
+        """
         effective_tools = self._effective_tools(request)
         if index not in parser_dict:
             is_required = request.tool_choice == "required" or isinstance(
@@ -2396,6 +2402,10 @@ class OpenAIServingChat(OpenAIServingBase):
             normal_text, calls = result.normal_text, result.calls
         else:
             normal_text, calls = parser.parse_stream_chunk(delta)
+            if flush:
+                end_text, end_calls = parser.parse_stream_end()
+                normal_text = (normal_text or "") + end_text
+                calls = list(calls) + end_calls
 
         # Yield normal text
         if normal_text:
