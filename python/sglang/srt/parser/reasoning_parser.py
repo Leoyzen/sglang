@@ -212,6 +212,22 @@ class BaseReasoningFormatDetector:
 
         # Handle end of reasoning block
         if self._in_reasoning and self.think_end_token in current_text:
+            # When tool_start_token appears BEFORE think_end_token in the
+            # same buffer, the </thinking> is inside a tool call (e.g. in a
+            # parameter value).  Split at tool_start_token first to avoid
+            # leaking DSML tags into reasoning_text.
+            if self.tool_start_token and self.tool_start_token in current_text:
+                tool_idx = current_text.find(self.tool_start_token)
+                think_end_idx = current_text.find(self.think_end_token)
+                if tool_idx < think_end_idx:
+                    reasoning_text = current_text[:tool_idx]
+                    normal_text = current_text[tool_idx:]
+                    self._buffer = ""
+                    self._in_reasoning = False
+                    return StreamingParseResult(
+                        normal_text=normal_text, reasoning_text=reasoning_text
+                    )
+
             end_idx = current_text.find(self.think_end_token)
 
             reasoning_text = current_text[:end_idx]

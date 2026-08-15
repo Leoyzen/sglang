@@ -1074,10 +1074,11 @@ class TestStreamingChunkSizeInvariance(CustomTestCase):
             (one_shot.reasoning_text, one_shot.normal_text), ("lead<think>r", "tail")
         )
 
-    def test_dsv4_reasoning_quoting_dsml_is_chunk_dependent(self):
-        """Accepted divergence: streaming ends the block at the DSML marker, while
-        one-shot waits to see whether a `</think>` follows. Reachable because the
-        DSV4 system prompt shows that marker to the model."""
+    def test_dsv4_reasoning_quoting_dsml_is_chunk_invariant(self):
+        """With the tool_start priority fix, streaming always cuts at the DSML
+        marker (even when </thinking> follows in the same buffer), while one-shot
+        waits to see the closing think token. Reachable because the DSV4 system
+        prompt shows that marker to the model."""
         text = f"<think>format is <{self.DSML}tool_calls></think>answer"
         by_output = {}
         for chunk_size in self.CHUNK_SIZES:
@@ -1085,13 +1086,13 @@ class TestStreamingChunkSizeInvariance(CustomTestCase):
                 self._feed(DeepSeekV4Detector(), text, chunk_size), []
             ).append(chunk_size)
 
-        self.assertEqual(len(by_output), 2, f"expected two variants, got {by_output}")
+        # Streaming is now chunk-invariant: all chunk sizes produce the same cut.
         early_cut = ("format is ", f"<{self.DSML}tool_calls></think>answer")
-        whole_buffer = (f"format is <{self.DSML}tool_calls>", "answer")
+        self.assertEqual(len(by_output), 1, f"expected one variant, got {by_output}")
         self.assertIn(early_cut, by_output)
-        self.assertIn(whole_buffer, by_output)
 
         one_shot = DeepSeekV4Detector().detect_and_parse(text)
+        whole_buffer = (f"format is <{self.DSML}tool_calls>", "answer")
         self.assertEqual((one_shot.reasoning_text, one_shot.normal_text), whole_buffer)
 
     def test_dsv4_tool_block_after_think_end(self):
@@ -1124,6 +1125,98 @@ class TestStreamingChunkSizeInvariance(CustomTestCase):
                     ),
                     ("my reasoning", tool_call),
                 )
+
+
+class TestDeepSeekV4ThinkEndInsideToolCall(CustomTestCase):
+    """Bug regression: when the think_end token appears INSIDE a tool call
+    (e.g. the model generates the think_end token while composing a prompt
+    that discusses reasoning tags, or DSPARK draft model emits it at a
+    wrong position), the reasoning parser's think_end_token check fires
+    BEFORE the tool_start_token check, splitting the tool call in half.
+
+    Text before think_end (including opening DSML tags) goes to
+    reasoning_text; text after (closing DSML tags) goes to normal_text.
+    The tool call is destroyed and DSML tags leak into reasoning_content.
+
+    Root cause: _parse_streaming_increment_impl checks think_end_token
+    (step 3) before tool_start_token (step 4). When both are present and
+    tool_start appears first, the split should happen at tool_start, not
+    at think_end.
+    """
+
+    DSML = "｜DSML｜"
+
+    def _make_tool_call(self, prompt_value: str) -> str:
+        return (
+            f"<{self.DSML}tool_calls>"
+            f'<{self.DSML}invoke name="task">'
+            f'<{self.DSML}parameter name="prompt" string="true">{prompt_value}'
+            f"</{self.DSML}parameter>"
+            f"</{self.DSML}invoke>"
+            f"</{self.DSML}tool_calls>"
+        )
+
+    def test_tool_start_before_think_end_same_chunk(self):
+        """When tool_start_token appears BEFORE think_end_token in the same
+        buffer, the parser must split at tool_start, not at think_end."""
+        detector = DeepSeekV4Detector(force_reasoning=True)
+        think_end = detector.think_end_token
+        tool_start = detector.tool_start_token
+        tool_call = self._make_tool_call(f"discuss {think_end} token")
+        text = f"my reasoning{tool_call}"
+        result = detector.parse_streaming_increment(text)
+
+        self.assertNotIn(
+            self.DSML,
+            result.reasoning_text,
+            "Opening DSML tags leaked into reasoning_text because "
+            "think_end_token check fired before tool_start_token check",
+        )
+        self.assertTrue(
+            result.normal_text.startswith(tool_start),
+            f"Expected normal_text to start with tool_start_token, "
+            f"got: {result.normal_text[:80]!r}",
+        )
+
+    def test_tool_start_before_think_end_chunk_invariance(self):
+        """The fix must hold across all chunk sizes."""
+        detector0 = DeepSeekV4Detector(force_reasoning=True)
+        think_end = detector0.think_end_token
+        tool_call = self._make_tool_call(f"discuss {think_end} token")
+        text = f"my reasoning{tool_call}"
+        for chunk_size in [1, 2, 3, 5, 7, 11, 23, 1000]:
+            with self.subTest(chunk_size=chunk_size):
+                detector = DeepSeekV4Detector(force_reasoning=True)
+                reasoning = normal = ""
+                for i in range(0, len(text), chunk_size):
+                    result = detector.parse_streaming_increment(
+                        text[i : i + chunk_size]
+                    )
+                    reasoning += result.reasoning_text
+                    normal += result.normal_text
+                result = detector.finish()
+                reasoning += result.reasoning_text
+                normal += result.normal_text
+
+                self.assertNotIn(
+                    self.DSML,
+                    reasoning,
+                    f"DSML leaked into reasoning at chunk_size={chunk_size}",
+                )
+
+    def test_parameter_content_not_truncated_by_think_end(self):
+        """When think_end appears inside a parameter value, the full
+        parameter content must be preserved."""
+        detector = DeepSeekV4Detector(force_reasoning=True)
+        think_end = detector.think_end_token
+        prompt_value = f"Find how {think_end} is handled"
+        tool_call = self._make_tool_call(prompt_value)
+        result = detector.parse_streaming_increment(f"reasoning{tool_call}")
+        self.assertIn(
+            prompt_value,
+            result.normal_text,
+            f"Parameter value was truncated. normal_text: {result.normal_text[:200]!r}",
+        )
 
 
 class TestGptOssDetector(CustomTestCase):

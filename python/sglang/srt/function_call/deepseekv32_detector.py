@@ -77,9 +77,11 @@ class DeepSeekV32Detector(BaseFormatDetector):
         "<｜DSML｜invoke",
         "<｜DSML｜tool_calls",
         "<｜DSML｜function_calls",
+        "<｜DSML｜parameter",
         "</｜DSML｜invoke",
         "</｜DSML｜tool_calls",
         "</｜DSML｜function_calls",
+        "</｜DSML｜parameter",
     ]
 
     def __init__(self):
