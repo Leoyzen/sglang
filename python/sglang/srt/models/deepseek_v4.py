@@ -637,9 +637,21 @@ class MqaAttentionBase(nn.Module):
         if self._attn_sink_local is None:
             rank = self.attn_tp_rank
             num_heads = self.n_local_heads
-            padded_num_heads = 64 if num_heads <= 64 else self.n_heads
+            parallel = get_parallel()
+            dcp_heads_mult = parallel.attn_dcp_size if parallel.dcp_enabled else 1
+            ls_heads = num_heads * dcp_heads_mult
+            padded_num_heads = 64 if ls_heads <= 64 else self.n_heads
             sink = self.attn_sink.new_zeros(padded_num_heads)
-            sink[:num_heads] = self.attn_sink[rank * num_heads : (rank + 1) * num_heads]
+            if dcp_heads_mult > 1:
+                # DCP: the computed head set is the union of this rank's TP
+                # head-slice and its dcp peers within the same TP group
+                # (contiguous pairing, see parallel_state dcp_group).
+                union_start = (rank // dcp_heads_mult) * ls_heads
+                sink[:ls_heads] = self.attn_sink[union_start : union_start + ls_heads]
+            else:
+                sink[:num_heads] = self.attn_sink[
+                    rank * num_heads : (rank + 1) * num_heads
+                ]
             self._attn_sink_local = sink
         return self._attn_sink_local
 
@@ -1275,12 +1287,19 @@ class MQALayer(MqaAttentionBase):
         )
 
         tp_slice, q_padded, q_out = slice(None), None, None
+        parallel0 = get_parallel()
+        dcp_decode = parallel0.dcp_enabled and (
+            forward_batch.forward_mode.is_decode()
+            or forward_batch.forward_mode.is_target_verify()
+        )
+        dcp_heads_mult = parallel0.attn_dcp_size if dcp_decode else 1
+        ls_heads = self.n_local_heads * dcp_heads_mult
         if self.attn_tp_size > 1:
             # FlashMLA's fp8 sparse decode kernel only specializes h_q for {64, 128}.
             # Pad the per-rank heads to 64 (not the full n_heads) when they fit, to
             # dispatch the cheaper decode::head64 variant; attn_sink is sliced to
             # this rank and padded to match.
-            padded_num_heads = 64 if self.n_local_heads <= 64 else self.n_heads
+            padded_num_heads = 64 if ls_heads <= 64 else self.n_heads
             # Only [0:n_local_heads] is written below. Uninitialized padded TP
             # heads inject NaN into attention on gfx942 (fnuz), so zero-init
             # there; other archs tolerate new_empty and skip the per-forward
@@ -1289,8 +1308,12 @@ class MQALayer(MqaAttentionBase):
                 q_padded = x.new_zeros(x.shape[0], padded_num_heads, self.head_dim)
             else:
                 q_padded = x.new_empty(x.shape[0], padded_num_heads, self.head_dim)
+            # q_out targets the LOCAL head set only: each rank projects its own
+            # TP heads. Under DCP the norm+RoPE'd Q is all-gathered to the full
+            # ls_heads set before attention (see below).
             tp_slice = slice(0, self.n_local_heads)
             q_out = q_padded[:, tp_slice, :]
+        out_slice = slice(0, ls_heads)
         attn_sink = self._local_attn_sink()
 
         if enable_multi_stream:
@@ -1334,16 +1357,24 @@ class MQALayer(MqaAttentionBase):
             is_unified_kv_triton,
         )
 
+        # DCP decode: all-gather the norm+RoPE'd Q activations across the DCP
+        # group so every rank holds the full n_local_heads * dcp_size head set
+        # and computes partial attention over its own KV shard. The all-gather
+        # runs on activations (quantization-transparent), not weights.
+        if dcp_decode:
+            q_gathered = parallel0.dcp_group.all_gather(q.contiguous(), dim=1)
+            if q_padded is not None:
+                q_padded[:, : q_gathered.shape[1]].copy_(q_gathered)
+                q = q_padded[:, :ls_heads]
+            else:
+                q = q_gathered
+
         parallel = get_parallel()
-        dcp_decode = parallel.dcp_enabled and (
-            forward_batch.forward_mode.is_decode()
-            or forward_batch.forward_mode.is_target_verify()
-        )
         lse = None
 
         if is_unified_kv_triton():
             o = attn_backend.forward(
-                q=q_out if q_out is not None else q,
+                q=q if dcp_decode else (q_out if q_out is not None else q),
                 k=attn_k,
                 v=attn_k,
                 layer=self.attn_mqa,
@@ -1385,7 +1416,7 @@ class MQALayer(MqaAttentionBase):
                 )
                 if dcp_decode:
                     o, lse = o
-            o = o[:, tp_slice, :]
+            o = o[:, out_slice, :]
 
         # DCP LSE merge — combine partial attention outputs across DCP ranks.
         # FlashMLA returns natural-log (base-e) LSE.
@@ -1394,12 +1425,19 @@ class MQALayer(MqaAttentionBase):
 
             if lse.ndim > 2:
                 lse = lse.view(lse.shape[0], -1)
+            if lse.shape[1] > ls_heads:
+                # head64-padded variant returns [B, 64]; keep only the real
+                # ls_heads set that attention computed.
+                lse = lse[:, :ls_heads]
             o = cp_lse_ag_out_rs_mla(
                 o,
                 lse,
                 parallel.dcp_group,
                 is_lse_base_on_e=True,
             )
+            # cp_lse_ag_out_rs_mla returns [H_local, B, D] (head-first,
+            # reduce-scattered over the DCP group); restore [B, H, D].
+            o = o.transpose(0, 1)
         if _is_npu:
             cos4, sin4 = self._get_npu_rope_position_cache(
                 positions, o.dtype, inverse=True
@@ -1420,7 +1458,7 @@ class MQALayer(MqaAttentionBase):
                 inverse=True,
             )
 
-        o = o.view(o.shape[0], self.n_local_groups, -1)
+        o = o.reshape(o.shape[0], self.n_local_groups, -1)
 
         if _FP8_WO_A_GEMM:
             import deep_gemm

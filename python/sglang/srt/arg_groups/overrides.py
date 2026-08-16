@@ -1116,6 +1116,10 @@ def _deepseek_v4_overrides(server_args: Any, hf_config: Any) -> dict:
             "Use flashinfer_trtllm_routed as MoE runner backend for "
             f"{model_arch} hybrid FP8+NVFP4 checkpoint."
         )
+    # DSV4's Q path is fused (wq_b -> fused_qk_norm_rope_swa_store) and wq_b is
+    # FP8 block-quantized. Q replication of packed weights is unsupported, so
+    # the MLALayer all-gathers the norm+RoPE'd Q activations per layer under
+    # DCP (see deepseek_v4.MQALayer.forward). Nothing to force here.
     return overrides
 
 

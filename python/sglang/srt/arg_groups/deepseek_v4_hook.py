@@ -200,11 +200,12 @@ def validate_deepseek_v4_dcp(server_args: ServerArgs) -> None:
 
     DCP shards the KV cache across DCP ranks during decode. Unlike prefill CP,
     DCP does NOT force enable_dp_attention and operates within the TP group.
-    """
-    from sglang.srt.parallel_state import get_parallel
 
-    parallel = get_parallel()
-    if not parallel.dcp_enabled:
+    NOTE: this validator runs from ServerArgs.__post_init__, before the
+    parallel state exists, so it must only read server_args fields (mirroring
+    validate_deepseek_v4_cp) and must not import get_parallel.
+    """
+    if not server_args.dcp_size or server_args.dcp_size < 2:
         return
 
     # DCP + prefill CP is rejected in the initial release — the prefill CP
@@ -223,23 +224,24 @@ def validate_deepseek_v4_dcp(server_args: ServerArgs) -> None:
     # DCP + speculative is rejected in the initial release.
     # (Already checked above — covers ragged verify too.)
 
-    # DCP + HiCache is rejected in the initial release.
-    if server_args.hicache_ratio > 0 or server_args.hicache_size is not None:
+    # DCP + HiCache is rejected in the initial release. Note: hicache_ratio
+    # DEFAULTS to a positive value even when HiCache is disabled, so gate on
+    # the enable flag.
+    if getattr(server_args, "enable_hierarchical_cache", False):
         raise ValueError(
             "DeepSeekV4 DCP + HiCache is not supported in the initial release."
         )
 
-    # DCP is a subgroup of TP.
-    tp_size = parallel.attn_tp_size
-    dcp_size = parallel.attn_dcp_size
-    if tp_size % dcp_size != 0:
+    # DCP is a subgroup of TP: attn_tp = tp_size // dp_size.
+    attn_tp_size = server_args.tp_size // max(server_args.dp_size, 1)
+    if attn_tp_size % server_args.dcp_size != 0:
         raise ValueError(
-            f"DeepSeekV4 DCP requires tp_size ({tp_size}) to be divisible by "
-            f"dcp_size ({dcp_size})."
+            f"DeepSeekV4 DCP requires attn_tp_size ({attn_tp_size}) to be "
+            f"divisible by dcp_size ({server_args.dcp_size})."
         )
 
     logger.info(
-        f"DeepSeekV4 DCP enabled: dcp_size={dcp_size}, tp_size={tp_size}, "
-        f"dp_size={parallel.dp_size}. DCP operates within the TP group "
-        f"and does not force DP-attention."
+        f"DeepSeekV4 DCP enabled: dcp_size={server_args.dcp_size}, "
+        f"tp_size={server_args.tp_size}, dp_size={server_args.dp_size}. "
+        f"DCP operates within the TP group and does not force DP-attention."
     )

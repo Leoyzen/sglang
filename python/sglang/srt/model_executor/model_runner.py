@@ -905,6 +905,9 @@ class ModelRunner:
         # --dcp-replicate-q-proj: gather each rank's attn_tp head-shard of
         # q_b_proj / w_kc into full-head buffers once here (pre-capture) so the
         # MLA decode path can skip the per-layer Q all-gather. bf16/fp16 only.
+        # DSV4's custom MQALayer is deliberately NOT handled here: its wq_b is
+        # FP8 block-quantized (no valid replication path), so the DSV4 model
+        # all-gathers the norm+RoPE'd Q activations per layer instead.
         from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
         from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 
