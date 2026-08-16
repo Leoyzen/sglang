@@ -1710,6 +1710,14 @@ class DeepseekV4AttnBackend(
                 extra_k_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
                 extra_indices = core_attn_metadata.c4_sparse_page_indices
                 extra_topk_lengths = core_attn_metadata.c4_sparse_topk_lengths
+                # Under DCP, the indexer's owner filter sets unowned slots to
+                # -1 and sorts valid entries first. Recalculate the effective
+                # topk lengths from the filtered indices so FlashMLA only
+                # reads owned slots.
+                if get_parallel().dcp_enabled:
+                    extra_topk_lengths = (extra_indices >= 0).sum(
+                        dim=-1, dtype=torch.int32
+                    )
             elif compress_ratio == 128:
                 extra_k_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
                 extra_indices = core_attn_metadata.c128_page_indices

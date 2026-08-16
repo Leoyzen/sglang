@@ -875,6 +875,34 @@ class C4IndexerBackendMixin:
                 del logits_chunk
                 q_offset = q_end
 
+    @staticmethod
+    def _apply_dcp_owner_filter(
+        c4_sparse_page_indices: torch.Tensor,
+    ) -> None:
+        """Apply DCP owner filter to C4 sparse page indices in-place.
+
+        Under DCP, each rank only owns KV slots where ``slot % dcp_size == dcp_rank``.
+        This filters unowned slots to -1, remaps owned slots to local indices,
+        and sorts descending so valid entries come first (matching the DSA
+        backend pattern from PR #31821).
+        """
+        parallel = get_parallel()
+        if not parallel.dcp_enabled:
+            return
+
+        dcp_size = parallel.attn_dcp_size
+        dcp_rank = parallel.dcp_rank
+
+        # Owner filter: keep only slots owned by this rank, remap to local.
+        valid = c4_sparse_page_indices >= 0
+        owned = valid & (c4_sparse_page_indices % dcp_size == dcp_rank)
+        c4_sparse_page_indices[owned] //= dcp_size
+        c4_sparse_page_indices[~owned] = -1
+
+        # Sort descending so valid entries come first, -1 at the end.
+        sorted_idx, _ = c4_sparse_page_indices.sort(dim=-1, descending=True)
+        c4_sparse_page_indices.copy_(sorted_idx)
+
     def _run_topk_transform(
         self,
         logits: torch.Tensor,
@@ -1140,6 +1168,8 @@ class C4IndexerBackendMixin:
                 query_rows=query_rows,
             )
 
+            self._apply_dcp_owner_filter(c4_sparse_page_indices)
+
             if hisparse_coordinator is not None:
                 if hisparse_decode:
                     compress_layer_id = token_to_kv_pool.layer_mapping[
@@ -1234,6 +1264,7 @@ class C4IndexerBackendMixin:
             indexer_metadata,
             raw_indices,
         )
+        self._apply_dcp_owner_filter(c4_sparse_page_indices)
         if hisparse_coordinator is not None:
             if hisparse_decode:
                 compress_layer_id = token_to_kv_pool.layer_mapping[
