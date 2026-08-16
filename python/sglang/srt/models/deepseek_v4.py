@@ -141,7 +141,13 @@ from sglang.srt.models.deepseek_v2 import (
     _is_npu,
     _is_xpu,
 )
-from sglang.srt.runtime_context import get_device, get_exec, get_forward, get_parallel
+from sglang.srt.runtime_context import (
+    get_device,
+    get_exec,
+    get_forward,
+    get_parallel,
+    get_server_args,
+)
 
 if not _is_hip:
     from sglang.srt.layers.utils.cp_utils import (
@@ -1288,9 +1294,12 @@ class MQALayer(MqaAttentionBase):
 
         tp_slice, q_padded, q_out = slice(None), None, None
         parallel0 = get_parallel()
+        # DCP combines partial attention across DCP ranks for decode,
+        # target_verify AND extend (prefill).  Draft modes are excluded —
+        # the draft KV pool is replicated, not sharded.
         dcp_decode = parallel0.dcp_enabled and (
             forward_batch.forward_mode.is_decode()
-            or forward_batch.forward_mode.is_target_verify()
+            or forward_batch.forward_mode.is_extend()
         )
         dcp_heads_mult = parallel0.attn_dcp_size if dcp_decode else 1
         ls_heads = self.n_local_heads * dcp_heads_mult
@@ -1389,7 +1398,11 @@ class MQALayer(MqaAttentionBase):
         else:
             attn_q = q_padded if q_padded is not None else q
             save_kv_cache = False
-            if forward_batch.forward_mode.is_extend() and is_in_breakable_cuda_graph():
+            if (
+                forward_batch.forward_mode.is_extend()
+                and is_in_breakable_cuda_graph()
+                and not dcp_decode
+            ):
                 o = attn_q.new_empty(
                     (*attn_q.shape[:-1], self.attn_mqa.v_head_dim),
                 )
@@ -1419,9 +1432,15 @@ class MQALayer(MqaAttentionBase):
             o = o[:, out_slice, :]
 
         # DCP LSE merge — combine partial attention outputs across DCP ranks.
-        # FlashMLA returns natural-log (base-e) LSE.
+        # FlashMLA decode kernels return natural-log (base-e) LSE, while the
+        # sparse prefill kernels (flash_mla_sparse_fwd / q8kv8) return base-2
+        # LSE.  Select the base dynamically based on the forward mode.
         if dcp_decode and lse is not None:
-            from sglang.srt.layers.dcp.comm import cp_lse_ag_out_rs_mla
+            from sglang.srt.layers.dcp.comm import (
+                cp_lse_ag_out_rs_mla,
+                dcp_a2a_lse_reduce,
+            )
+            from sglang.srt.layers.logits_processor import get_in_autotune_dummy_run
 
             if lse.ndim > 2:
                 lse = lse.view(lse.shape[0], -1)
@@ -1429,15 +1448,41 @@ class MQALayer(MqaAttentionBase):
                 # head64-padded variant returns [B, 64]; keep only the real
                 # ls_heads set that attention computed.
                 lse = lse[:, :ls_heads]
-            o = cp_lse_ag_out_rs_mla(
-                o,
-                lse,
-                parallel.dcp_group,
-                is_lse_base_on_e=True,
-            )
-            # cp_lse_ag_out_rs_mla returns [H_local, B, D] (head-first,
-            # reduce-scattered over the DCP group); restore [B, H, D].
-            o = o.transpose(0, 1)
+
+            if get_in_autotune_dummy_run():
+                # The synthetic FlashInfer MoE autotune pass discards model
+                # outputs. Avoid a cross-rank exchange of zero partials:
+                # select this rank's own head shard directly.
+                o = o.narrow(
+                    1, parallel.attn_dcp_rank * self.n_local_heads, self.n_local_heads
+                )
+            else:
+                # FlashMLA decode/target_verify → base-e LSE;
+                # sparse prefill (extend/mixed/split_prefill) → base-2 LSE.
+                is_lse_base_on_e = (
+                    forward_batch.forward_mode.is_decode()
+                    or forward_batch.forward_mode.is_target_verify()
+                )
+                dcp_comm_backend = get_server_args().dcp_comm_backend
+                if dcp_comm_backend in ("a2a", "fi_a2a"):
+                    o = dcp_a2a_lse_reduce(
+                        o.contiguous(),
+                        lse.contiguous(),
+                        parallel.dcp_group,
+                        is_lse_base_on_e=is_lse_base_on_e,
+                        comm_backend=dcp_comm_backend,
+                    )
+                    # dcp_a2a_lse_reduce returns [B, H_local, D] directly.
+                else:
+                    o = cp_lse_ag_out_rs_mla(
+                        o,
+                        lse,
+                        parallel.dcp_group,
+                        is_lse_base_on_e=is_lse_base_on_e,
+                    )
+                    # cp_lse_ag_out_rs_mla returns [H_local, B, D] (head-first,
+                    # reduce-scattered over the DCP group); restore [B, H, D].
+                    o = o.transpose(0, 1)
         if _is_npu:
             cos4, sin4 = self._get_npu_rope_position_cache(
                 positions, o.dtype, inverse=True

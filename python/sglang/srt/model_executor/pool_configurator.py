@@ -685,7 +685,12 @@ class DSV4PoolConfigurator(MemoryPoolConfigurator):
             # per-token bytes by (target+draft)/target. Equivalent to dflash's
             # scale_kv_cell_size_per_token_for_dflash but applied to
             # bytes_per_full_token: tokens = avail / (bpft * (T+D)/T).
-            draft_layers = 1
+            #
+            # DSpark draft KV pool is REPLICATED across DCP ranks (see
+            # kv_cache_configurator.py:282-290), so the draft cost must
+            # scale by dcp_size — mirrors DefaultPoolConfigurator's
+            # draft_num_layers * dcp_size at L194.
+            draft_layers = kvc.server_args.dcp_size
             target_layers = self.num_layers_total
             self.bytes_per_full_token *= (target_layers + draft_layers) / target_layers
 

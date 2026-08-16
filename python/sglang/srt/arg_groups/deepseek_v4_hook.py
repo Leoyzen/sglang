@@ -208,6 +208,15 @@ def validate_deepseek_v4_dcp(server_args: ServerArgs) -> None:
     if not server_args.dcp_size or server_args.dcp_size < 2:
         return
 
+    # DSV4's DCP implementation only supports the replicated indexer
+    # (owner-filter pattern); owner_sharded is DSA-only and is already
+    # rejected globally via is_deepseek_dsa, but guard defensively here.
+    if getattr(server_args, "dcp_indexer_backend", "replicated") != "replicated":
+        raise ValueError(
+            "DeepSeekV4 DCP requires --dcp-indexer-backend replicated "
+            "(owner_sharded is DSA-only)"
+        )
+
     # DCP + prefill CP is rejected in the initial release — the prefill CP
     # hook (validate_deepseek_v4_cp) forces enable_dp_attention=True and
     # asserts dp_size==1, which conflicts with DCP.
@@ -217,12 +226,11 @@ def validate_deepseek_v4_dcp(server_args: ServerArgs) -> None:
             "Please disable --enable-prefill-cp when using --dcp-size > 1."
         )
 
-    # DCP + ragged verify is rejected — DSV4 already rejects ragged verify + prefill CP.
-    # Ragged verify is part of DSPARK speculative, so the speculative check above
-    # covers it. No separate attribute to check here.
-
-    # DCP + speculative is rejected in the initial release.
-    # (Already checked above — covers ragged verify too.)
+    # Speculative + DCP: DSV4 DCP handles is_target_verify() in the attention
+    # path (LSE merge), but the DRAFT phase is not DCP-aware. Speculative+DCP
+    # is warned-not-rejected globally (server_args.py), and DSV4 DCP +
+    # speculative draft support is a planned follow-up (DSpark support is
+    # being implemented), so we do not reject it here.
 
     # DCP + HiCache is rejected in the initial release. Note: hicache_ratio
     # DEFAULTS to a positive value even when HiCache is disabled, so gate on
@@ -232,8 +240,14 @@ def validate_deepseek_v4_dcp(server_args: ServerArgs) -> None:
             "DeepSeekV4 DCP + HiCache is not supported in the initial release."
         )
 
-    # DCP is a subgroup of TP: attn_tp = tp_size // dp_size.
-    attn_tp_size = server_args.tp_size // max(server_args.dp_size, 1)
+    # DCP is a subgroup of TP: under DP-attention the effective attention TP is
+    # tp_size // attn_dp_size // attn_cp_size (same formula as server_args.py).
+    attn_dp_size = (
+        server_args.dp_size if getattr(server_args, "enable_dp_attention", False) else 1
+    )
+    attn_tp_size = (
+        server_args.tp_size // attn_dp_size // (server_args.attn_cp_size or 1)
+    )
     if attn_tp_size % server_args.dcp_size != 0:
         raise ValueError(
             f"DeepSeekV4 DCP requires attn_tp_size ({attn_tp_size}) to be "

@@ -1667,13 +1667,17 @@ class DeepseekV4AttnBackend(
         parallel = get_parallel()
         if parallel.dcp_enabled:
             dcp_kv_mask = forward_batch.dcp_kv_mask
-            if dcp_kv_mask is not None:
-                swa_loc = (swa_loc[dcp_kv_mask] // parallel.attn_dcp_size).to(
-                    torch.int32
-                )
-                swa_k = swa_k[dcp_kv_mask]
-            else:
-                swa_loc = (swa_loc // parallel.attn_dcp_size).to(torch.int32)
+            # dcp_kv_mask is always present when DCP is enabled and store_cache
+            # is reachable: forward_batch_info.py computes it whenever
+            # dcp_size > 1 AND out_cache_loc is not None.  store_cache calls
+            # get_swa_out_cache_loc which requires out_cache_loc to be non-None
+            # (would crash on None).  Idle batches have zero-padded
+            # out_cache_loc (not None), so the mask is still computed.
+            assert (
+                dcp_kv_mask is not None
+            ), "DSV4 DCP requires dcp_kv_mask for store_cache"
+            swa_loc = (swa_loc[dcp_kv_mask] // parallel.attn_dcp_size).to(torch.int32)
+            swa_k = swa_k[dcp_kv_mask]
 
         if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
             self.token_to_kv_pool.set_swa_key_buffer_radix_fused(
@@ -1736,6 +1740,14 @@ class DeepseekV4AttnBackend(
                 extra_k_cache = token_to_kv_pool.get_extra_key_buffer(layer_id)
                 extra_indices = core_attn_metadata.c128_page_indices
                 extra_topk_lengths = core_attn_metadata.c128_topk_lengths_clamp1
+                # Under DCP, the indexer's owner filter sets unowned slots to
+                # -1 and sorts valid entries first. Recalculate the effective
+                # topk lengths from the filtered indices so FlashMLA only
+                # reads owned slots.
+                if get_parallel().dcp_enabled:
+                    extra_topk_lengths = (extra_indices >= 0).sum(
+                        dim=-1, dtype=torch.int32
+                    )
 
             swa_window_size = token_to_kv_pool.swa_window_size
             assert swa_k_cache.ndim == 2
@@ -1809,6 +1821,7 @@ class DeepseekV4AttnBackend(
                         token_to_kv_pool=token_to_kv_pool,
                         core_attn_metadata=core_attn_metadata,
                         attn_sink=attn_sink,
+                        return_lse=return_lse,
                     )
                 return self._forward_prefill_sparse(
                     q=q,
@@ -1818,6 +1831,7 @@ class DeepseekV4AttnBackend(
                     token_to_kv_pool=token_to_kv_pool,
                     core_attn_metadata=core_attn_metadata,
                     attn_sink=attn_sink,
+                    return_lse=return_lse,
                 )
 
             if _is_sm120:
@@ -1878,6 +1892,7 @@ class DeepseekV4AttnBackend(
         token_to_kv_pool: DeepSeekV4TokenToKVPool,
         core_attn_metadata: DSV4AttnMetadata,
         attn_sink: torch.Tensor,
+        return_lse: bool = False,
     ) -> torch.Tensor:
         """Unified prefill via flash_mla_sparse_fwd. Replaces the
         flash_mla_with_kvcache call on the extend path. Per request,
@@ -1965,7 +1980,7 @@ class DeepseekV4AttnBackend(
         )
         kv = workspace
 
-        o, _, _ = flash_mla_sparse_fwd(
+        o, lse, _ = flash_mla_sparse_fwd(
             q=q_flat,
             kv=kv,
             indices=combined_indices.unsqueeze(1),
@@ -1974,6 +1989,8 @@ class DeepseekV4AttnBackend(
             attn_sink=attn_sink,
             topk_length=combined_lens,
         )
+        if return_lse:
+            return o, lse
         return o
 
     def _prepare_q8kv8_q_and_sink(
@@ -2037,6 +2054,7 @@ class DeepseekV4AttnBackend(
         token_to_kv_pool: DeepSeekV4TokenToKVPool,
         core_attn_metadata: DSV4AttnMetadata,
         attn_sink: torch.Tensor,
+        return_lse: bool = False,
     ) -> torch.Tensor:
         """Experimental DeepSeek-V4 sparse prefill path using Q8KV8 kernels.
 
@@ -2162,7 +2180,7 @@ class DeepseekV4AttnBackend(
             combined_indices,
         )
 
-        o, _, _ = sparse_mla_q8kv8_prefill_fwd(
+        o, lse, _ = sparse_mla_q8kv8_prefill_fwd(
             q=q_fp8,
             kv=workspace,
             indices=q8_indices.unsqueeze(1),
@@ -2174,7 +2192,11 @@ class DeepseekV4AttnBackend(
             topk_length=combined_lens,
         )
 
-        return o[:, :active_heads]
+        o = o[:, :active_heads]
+        if return_lse:
+            # lse has padded_heads; slice to match the returned o head count.
+            return o, lse[:, :active_heads]
+        return o
 
     def expand_prefill_casually(
         self,
