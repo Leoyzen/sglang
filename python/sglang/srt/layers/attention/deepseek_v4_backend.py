@@ -1661,6 +1661,20 @@ class DeepseekV4AttnBackend(
         self, layer_id: int, swa_k: torch.Tensor, forward_batch: ForwardBatch
     ) -> None:
         swa_loc = self.get_swa_out_cache_loc(forward_batch)
+
+        # DCP: only write owned tokens to the local physical shard.
+        # loc = out_cache_loc // dcp_size maps global slots to local pool.
+        parallel = get_parallel()
+        if parallel.dcp_enabled:
+            dcp_kv_mask = forward_batch.dcp_kv_mask
+            if dcp_kv_mask is not None:
+                swa_loc = (swa_loc[dcp_kv_mask] // parallel.attn_dcp_size).to(
+                    torch.int32
+                )
+                swa_k = swa_k[dcp_kv_mask]
+            else:
+                swa_loc = (swa_loc // parallel.attn_dcp_size).to(torch.int32)
+
         if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
             self.token_to_kv_pool.set_swa_key_buffer_radix_fused(
                 layer_id=layer_id,
