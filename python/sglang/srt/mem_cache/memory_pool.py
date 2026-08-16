@@ -38,6 +38,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.kernels.ops.attention.dsa import index_buf_accessor
 from sglang.kernels.ops.attention.dsa.quant_k_cache import (
     quantize_k_cache,
     quantize_k_cache_separate,
@@ -74,7 +75,7 @@ from sglang.srt.mem_cache.utils import (
     set_mla_kv_scale_buffer_triton,
 )
 from sglang.srt.platforms import current_platform
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_parallel, get_server_args
 from sglang.srt.utils import (
     cpu_has_amx_support,
     is_cpu,
@@ -4361,10 +4362,20 @@ class DSATokenToKVPool(MLATokenToKVPool):
         # self.index_k_dtype = torch.float8_e4m3fn
         # self.index_k_scale_dtype = torch.float32
         self.index_head_dim = index_head_dim
+        parallel = get_parallel()
+        self.index_dcp_owner_sharded = (
+            parallel.dcp_enabled
+            and get_server_args().dcp_indexer_backend == "owner_sharded"
+        )
+        self.index_dcp_size = (
+            parallel.attn_dcp_size if self.index_dcp_owner_sharded else 1
+        )
+        self.index_dcp_rank = (
+            parallel.attn_dcp_rank if self.index_dcp_owner_sharded else 0
+        )
         if index_buf_size is None:
             index_buf_size = size
-            parallel = get_parallel()
-            if parallel.dcp_enabled:
+            if parallel.dcp_enabled and not self.index_dcp_owner_sharded:
                 # The indexer K cache is not sharded under DCP: every rank
                 # keeps index_k for every token (global-slot addressed) so
                 # all ranks compute identical top-k.
@@ -4402,7 +4413,41 @@ class DSATokenToKVPool(MLATokenToKVPool):
     def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
         """Move latent KV and the DSA indexer cache (key + scale) in lockstep."""
         super().move_kv_cache(tgt_loc, src_loc)
-        self.index_key_cache.move(tgt_loc, src_loc)
+
+        if tgt_loc.numel() == 0:
+            return
+
+        tgt_loc_flat = tgt_loc.view(-1).long()
+        src_loc_flat = src_loc.view(-1).long()
+        if self.index_dcp_owner_sharded:
+            if not torch.equal(
+                src_loc_flat % self.index_dcp_size,
+                tgt_loc_flat % self.index_dcp_size,
+            ):
+                raise RuntimeError(
+                    "owner-sharded DCP Indexer move changed token ownership"
+                )
+            owned = tgt_loc_flat % self.index_dcp_size == self.index_dcp_rank
+            tgt_loc_flat = tgt_loc_flat[owned] // self.index_dcp_size
+            src_loc_flat = src_loc_flat[owned] // self.index_dcp_size
+        for index_k in self.index_k_with_scale_buffer:
+            index_buf_accessor.MoveKAndS.execute(
+                self,
+                index_k,
+                tgt_loc_flat,
+                src_loc_flat,
+            )
+
+    def _index_page_indices_for_slots(self, indices: torch.Tensor) -> torch.Tensor:
+        slots = indices.view(-1).long()
+        if self.index_dcp_owner_sharded:
+            slots = (
+                slots[slots % self.index_dcp_size == self.index_dcp_rank]
+                // self.index_dcp_size
+            )
+        if slots.numel() == 0:
+            return slots
+        return torch.unique_consecutive(slots // self.page_size)
 
     def get_index_k_with_scale_buffer(self, layer_id: int) -> torch.Tensor:
         return self.index_key_cache.get_local_buffer(layer_id)
@@ -4448,13 +4493,44 @@ class DSATokenToKVPool(MLATokenToKVPool):
 
     def get_cpu_copy(self, indices, mamba_indices=None):
         kv_cache_cpu = super().get_cpu_copy(indices, mamba_indices=mamba_indices)
-        return {"kv": kv_cache_cpu, "index_k": self.index_key_cache.cpu_copy(indices)}
+
+        page_indices = self._index_page_indices_for_slots(indices)
+        torch.cuda.synchronize()
+        index_k_cpu = []
+        chunk_size = self.cpu_offloading_chunk_size
+        page_chunk_size = max(1, chunk_size // self.page_size)
+        for layer_id in range(self.layer_num):
+            index_k_cpu.append([])
+            for i in range(0, len(page_indices), page_chunk_size):
+                chunk_page_indices = page_indices[i : i + page_chunk_size]
+                idx_cpu = self.index_k_with_scale_buffer[layer_id][
+                    chunk_page_indices
+                ].to("cpu", non_blocking=True)
+                index_k_cpu[-1].append(idx_cpu)
+        torch.cuda.synchronize()
+
+        return {"kv": kv_cache_cpu, "index_k": index_k_cpu}
 
     def load_cpu_copy(self, kv_cache_cpu_dict, indices, mamba_indices=None):
         super().load_cpu_copy(
             kv_cache_cpu_dict["kv"], indices, mamba_indices=mamba_indices
         )
-        self.index_key_cache.load_cpu_copy(kv_cache_cpu_dict["index_k"], indices)
+
+        page_indices = self._index_page_indices_for_slots(indices)
+        index_k_cpu = kv_cache_cpu_dict["index_k"]
+        torch.cuda.synchronize()
+        chunk_size = self.cpu_offloading_chunk_size
+        page_chunk_size = max(1, chunk_size // self.page_size)
+        for layer_id in range(self.layer_num):
+            for i in range(0, len(page_indices), page_chunk_size):
+                chunk_page_indices = page_indices[i : i + page_chunk_size]
+                idx_cpu = index_k_cpu[layer_id][i // page_chunk_size]
+                assert idx_cpu.shape[0] == len(chunk_page_indices)
+                idx_chunk = idx_cpu.to(
+                    self.index_k_with_scale_buffer[0].device, non_blocking=True
+                )
+                self.index_k_with_scale_buffer[layer_id][chunk_page_indices] = idx_chunk
+        torch.cuda.synchronize()
 
     def get_state_buf_infos(self):
         return self.index_key_cache.state_buf_infos()
