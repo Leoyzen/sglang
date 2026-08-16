@@ -193,3 +193,53 @@ def validate_deepseek_v4_cp(server_args: ServerArgs) -> None:
         f"dp_size={server_args.dp_size}, moe_dense_tp_size={server_args.moe_dense_tp_size}, "
         f"attn_cp_size={server_args.attn_cp_size}, ep_size={server_args.ep_size}, tp_size={server_args.tp_size}"
     )
+
+
+def validate_deepseek_v4_dcp(server_args: ServerArgs) -> None:
+    """Validate DeepSeek V4 DCP (Decode Context Parallel) configuration.
+
+    DCP shards the KV cache across DCP ranks during decode. Unlike prefill CP,
+    DCP does NOT force enable_dp_attention and operates within the TP group.
+    """
+    from sglang.srt.parallel_state import get_parallel
+
+    parallel = get_parallel()
+    if not parallel.dcp_enabled:
+        return
+
+    # DCP + prefill CP is rejected in the initial release — the prefill CP
+    # hook (validate_deepseek_v4_cp) forces enable_dp_attention=True and
+    # asserts dp_size==1, which conflicts with DCP.
+    if server_args.enable_prefill_cp:
+        raise ValueError(
+            "DeepSeekV4 DCP + prefill CP is not supported in the initial release. "
+            "Please disable --enable-prefill-cp when using --dcp-size > 1."
+        )
+
+    # DCP + ragged verify is rejected — DSV4 already rejects ragged verify + prefill CP.
+    # Ragged verify is part of DSPARK speculative, so the speculative check above
+    # covers it. No separate attribute to check here.
+
+    # DCP + speculative is rejected in the initial release.
+    # (Already checked above — covers ragged verify too.)
+
+    # DCP + HiCache is rejected in the initial release.
+    if server_args.hicache_ratio > 0 or server_args.hicache_size is not None:
+        raise ValueError(
+            "DeepSeekV4 DCP + HiCache is not supported in the initial release."
+        )
+
+    # DCP is a subgroup of TP.
+    tp_size = parallel.attn_tp_size
+    dcp_size = parallel.attn_dcp_size
+    if tp_size % dcp_size != 0:
+        raise ValueError(
+            f"DeepSeekV4 DCP requires tp_size ({tp_size}) to be divisible by "
+            f"dcp_size ({dcp_size})."
+        )
+
+    logger.info(
+        f"DeepSeekV4 DCP enabled: dcp_size={dcp_size}, tp_size={tp_size}, "
+        f"dp_size={parallel.dp_size}. DCP operates within the TP group "
+        f"and does not force DP-attention."
+    )

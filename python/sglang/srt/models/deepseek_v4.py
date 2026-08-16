@@ -1334,6 +1334,13 @@ class MQALayer(MqaAttentionBase):
             is_unified_kv_triton,
         )
 
+        parallel = get_parallel()
+        dcp_decode = parallel.dcp_enabled and (
+            forward_batch.forward_mode.is_decode()
+            or forward_batch.forward_mode.is_target_verify()
+        )
+        lse = None
+
         if is_unified_kv_triton():
             o = attn_backend.forward(
                 q=q_out if q_out is not None else q,
@@ -1344,7 +1351,10 @@ class MQALayer(MqaAttentionBase):
                 compress_ratio=self.compress_ratio,
                 attn_sink=self.attn_sink,
                 save_kv_cache=kv is not None,
+                return_lse=dcp_decode,
             )
+            if dcp_decode:
+                o, lse = o
         else:
             attn_q = q_padded if q_padded is not None else q
             save_kv_cache = False
@@ -1371,8 +1381,25 @@ class MQALayer(MqaAttentionBase):
                     compress_ratio=self.compress_ratio,
                     attn_sink=attn_sink,
                     save_kv_cache=save_kv_cache,
+                    return_lse=dcp_decode,
                 )
+                if dcp_decode:
+                    o, lse = o
             o = o[:, tp_slice, :]
+
+        # DCP LSE merge — combine partial attention outputs across DCP ranks.
+        # FlashMLA returns natural-log (base-e) LSE.
+        if dcp_decode and lse is not None:
+            from sglang.srt.layers.dcp.comm import cp_lse_ag_out_rs_mla
+
+            if lse.ndim > 2:
+                lse = lse.view(lse.shape[0], -1)
+            o = cp_lse_ag_out_rs_mla(
+                o,
+                lse,
+                parallel.dcp_group,
+                is_lse_base_on_e=True,
+            )
         if _is_npu:
             cos4, sin4 = self._get_npu_rope_position_cache(
                 positions, o.dtype, inverse=True
@@ -2742,6 +2769,26 @@ class DeepseekV4ForCausalLM(nn.Module):
                 None if aux_hidden_states is not None else pre_hc_head
             ),
         )
+
+    def prepare_context_parallel_metadata_for_dcp(
+        self,
+        seq_lens: torch.Tensor,
+        extend_prefix_lens: torch.Tensor,
+        extend_prefix_lens_cpu: torch.Tensor,
+        extend_seq_lens: torch.Tensor,
+        req_pool_indices: torch.Tensor,
+        req_to_token: torch.Tensor,
+        seq_lens_sum: int,
+        kv_buffer_shape: torch.Size,
+        kv_cache_dtype,
+        kv_cache_device,
+        create_chunked_prefix_cache_kv_indices_fn,
+    ):
+        # DSV4 sparse attention (C4 indexer) under DCP uses the decode-style
+        # recipe (gathered-q + LSE combine) for extend too; the dense-MLA
+        # gather buffers built by prepare_decode_context_parallel_metadata
+        # would go unused.
+        return None
 
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:
         from sglang.srt.layers import deep_gemm_wrapper

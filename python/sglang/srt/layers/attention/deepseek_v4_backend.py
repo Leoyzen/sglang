@@ -1685,6 +1685,7 @@ class DeepseekV4AttnBackend(
         compress_ratio: Literal[0, 4, 128],
         save_kv_cache: bool = True,
         attn_sink: Optional[torch.Tensor] = None,
+        return_lse: bool = False,
         **_,
     ) -> torch.Tensor:
         if self.mtp_enabled and forward_batch.forward_mode.is_idle():
@@ -1813,7 +1814,8 @@ class DeepseekV4AttnBackend(
                     extra_k_cache=extra_k_cache,
                     extra_indices_in_kvcache=extra_indices,
                     extra_topk_length=extra_topk_lengths,
-                )[0]
+                )
+                o, lse = o[0], o[1]
             else:
                 if _is_xpu:
                     from sgl_kernel import flash_mla_with_kvcache
@@ -1835,9 +1837,12 @@ class DeepseekV4AttnBackend(
                     extra_k_cache=extra_k_cache,
                     extra_indices_in_kvcache=extra_indices,
                     extra_topk_length=extra_topk_lengths,
-                )[0]
+                )
+                o, lse = o[0], o[1]
 
             o = o.squeeze(1)
+            if return_lse:
+                return o, lse
             return o
 
         raise NotImplementedError("ragged attention")
