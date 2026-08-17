@@ -179,5 +179,80 @@ class TestDsv4DcpDecodeParity(CustomTestCase):
         )
 
 
+@unittest.skipUnless(_has_two_gpus(), "DSV4 DCP smoke test requires ≥2 GPUs")
+class TestDsv4DcpDecodeSmoke(CustomTestCase):
+    """Standalone DCP decode smoke test.
+
+    Launches a single DSV4 server with ``--tp 2 --dcp-size 2`` and verifies
+    a factual prompt returns a coherent answer.  Unlike the parity test,
+    this does not compare against a baseline — it only checks that the DCP
+    server produces a correct response.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.port = 27119
+        cls.url = f"http://127.0.0.1:{cls.port}"
+
+        args = [
+            "--tp-size",
+            "2",
+            "--dcp-size",
+            "2",
+            "--attention-backend",
+            "deepseek_v4",
+            "--trust-remote-code",
+            "--random-seed",
+            "0",
+            "--dtype",
+            "bfloat16",
+            "--cuda-graph-backend-prefill",
+            "disabled",
+            "--mem-fraction-static",
+            "0.75",
+            "--moe-runner-backend",
+            "flashinfer_mxfp4",
+        ]
+
+        cls.proc = popen_launch_server(
+            DSV4_MODEL,
+            base_url=cls.url,
+            timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 3,
+            other_args=args,
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        proc = getattr(cls, "proc", None)
+        if proc:
+            kill_process_tree(proc.pid, wait_timeout=60)
+
+    def test_paris_in_response(self):
+        """Send 'What is the capital of France?' and assert 'Paris' in output."""
+        resp = requests.post(
+            self.url + "/v1/chat/completions",
+            json={
+                "model": "default",
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": "What is the capital of France?",
+                    }
+                ],
+                "temperature": 0,
+                "max_tokens": 32,
+            },
+            timeout=120,
+        )
+        resp.raise_for_status()
+        text = resp.json()["choices"][0]["message"]["content"].strip()
+        self.assertTrue(text, "DCP decode smoke returned empty response")
+        self.assertIn(
+            "Paris",
+            text,
+            f"DCP decode smoke response did not contain 'Paris': {text!r}",
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

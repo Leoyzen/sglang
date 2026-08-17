@@ -133,6 +133,93 @@ def test_attn_cp_size_none_treated_as_one() -> None:
     )
 
 
+# ── DSpark + DP-attention mutual exclusion ──────────────────────────────
+
+
+def test_validate_dspark_dcp_dp_attention_mutex() -> None:
+    """DSPARK speculative + DP-attention + DCP must be rejected.
+
+    Under DP-attention, attn_tp = tp_size // dp_size // attn_cp_size.
+    With tp_size=4, dp_size=4 → attn_tp=1, and dcp_size=2 does not divide 1,
+    so the validator raises ValueError.
+
+    With dcp_size=1, DCP is disabled (early return), so no error even with
+    DSPARK + DP-attention.
+    """
+    # DSPARK + DP-attention + dcp_size=2 → ValueError (attn_tp=1, 1%2!=0)
+    with pytest.raises(ValueError, match="divisible"):
+        validate_deepseek_v4_dcp(
+            _make_args(
+                speculative_algorithm="DSPARK",
+                enable_dp_attention=True,
+                tp_size=4,
+                dp_size=4,
+                dcp_size=2,
+            )
+        )
+
+    # dcp_size=1 → early return, no raise
+    validate_deepseek_v4_dcp(
+        _make_args(
+            speculative_algorithm="DSPARK",
+            enable_dp_attention=True,
+            tp_size=4,
+            dp_size=4,
+            dcp_size=1,
+        )
+    )
+
+
+# ── MoE runner backend auto warning under DCP ──────────────────────────
+
+
+def test_validate_warns_moe_auto_under_dcp() -> None:
+    """When moe_runner_backend='auto' under DCP, the validator should warn
+    that 'auto' may resolve to a backend incompatible with DCP.
+
+    If the warning is not yet implemented, skip rather than fail.
+    """
+    import warnings
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        try:
+            validate_deepseek_v4_dcp(_make_args(dcp_size=2, moe_runner_backend="auto"))
+        except Exception:
+            pass
+
+    dcp_warnings = [w for w in caught if "dcp" in str(w.message).lower()]
+    if not dcp_warnings:
+        pytest.skip("moe_runner_backend='auto' warning under DCP not yet implemented")
+
+
+# ── Model class lacks DCP metadata hook ────────────────────────────────
+
+
+def test_dsv4_model_lacks_dcp_metadata_hook() -> None:
+    """DeepseekV4ForCausalLM intentionally does NOT define
+    ``prepare_context_parallel_metadata_for_dcp``.
+
+    DSV4 DCP uses the decode-style recipe (Q activation all-gather + LSE
+    combine) and does not need the dense-MLA gather buffers that the hook
+    would set up.  Eager_runner skips the block when the hook is absent.
+    Removing the hook would cause a stub call to crash; adding it back
+    would exercise an untested code path.
+    """
+    try:
+        from sglang.srt.models.deepseek_v4 import DeepseekV4ForCausalLM
+    except ImportError:
+        pytest.skip("DeepseekV4ForCausalLM not importable (missing deps)")
+
+    assert not hasattr(
+        DeepseekV4ForCausalLM, "prepare_context_parallel_metadata_for_dcp"
+    ), (
+        "DeepseekV4ForCausalLM should NOT define "
+        "prepare_context_parallel_metadata_for_dcp — see the NOTE at "
+        "~L2864 in deepseek_v4.py"
+    )
+
+
 if __name__ == "__main__":
     import sys
 

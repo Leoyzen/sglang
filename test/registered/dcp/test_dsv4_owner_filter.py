@@ -123,6 +123,75 @@ def test_filter_matches_c4_and_c128_payloads() -> None:
     ), f"got {page_indices}, expected {expected}"
 
 
+def test_filter_is_capture_safe() -> None:
+    """The owner filter must be CUDA-graph capture safe: it must operate
+    in-place (no new tensor allocation for the output) so that the data_ptr
+    of the input tensor is preserved after the call.
+
+    This patches ``get_is_capture_mode`` → True to simulate graph-capture
+    mode, then verifies:
+    1. ``page_indices.data_ptr()`` is unchanged (in-place via ``copy_``).
+    2. The filtered values are correct (rank 0, dcp_size=2).
+    """
+
+    apply_filter = _import_filter()
+
+    page_indices = torch.tensor([0, 1, 2, 3, 4, 5, -1, -1], dtype=torch.int32)
+    original_ptr = page_indices.data_ptr()
+
+    import unittest.mock as mock
+
+    with mock.patch(
+        "sglang.srt.models.deepseek_v4.get_is_capture_mode", return_value=True
+    ):
+        with get_parallel().override(dcp_enabled=True, attn_dcp_size=2, dcp_rank=0):
+            apply_filter(page_indices)
+
+    # In-place: same underlying storage.
+    assert (
+        page_indices.data_ptr() == original_ptr
+    ), f"data_ptr changed: {page_indices.data_ptr()} != {original_ptr}"
+
+    # Rank 0 owns even slots: 0,2,4 → local 0,1,2; sorted desc: [2,1,0,-1,...]
+    expected = torch.tensor([2, 1, 0, -1, -1, -1, -1, -1], dtype=torch.int32)
+    assert torch.equal(
+        page_indices, expected
+    ), f"got {page_indices}, expected {expected}"
+
+
+def test_lse_slice_is_non_contiguous() -> None:
+    """LSE tensors from FlashMLA kernels can have shape [B, 128, 1] (head64-padded).
+    Slicing ``[:, :32]`` produces a non-contiguous view; ``.contiguous()`` fixes it.
+
+    This mirrors the slicing in ``deepseek_v4.py`` at ``lse[:, :ls_heads]``.
+    Similarly, the ``o`` tensor has shape [B, 128, 512] and the slice
+    ``o[:, out_slice, :]`` is non-contiguous.
+
+    Guard: if PyTorch ever changes slicing to return contiguous views for
+    these shapes, this test would need updating — that's the point.
+    """
+    # LSE: [4, 128, 1] → view [4, 128] → slice [:, :32]
+    lse = torch.randn(4, 128, 1)
+    lse_flat = lse.view(lse.shape[0], -1)  # [4, 128]
+    lse_sliced = lse_flat[:, :32]
+    assert (
+        not lse_sliced.is_contiguous()
+    ), "lse[:, :32] should be non-contiguous for [4,128,1] base tensor"
+    assert (
+        lse_sliced.contiguous().is_contiguous()
+    ), ".contiguous() must produce a contiguous tensor"
+
+    # O tensor: [4, 128, 512] → slice [:, :32, :]
+    o = torch.randn(4, 128, 512)
+    o_sliced = o[:, :32, :]
+    assert (
+        not o_sliced.is_contiguous()
+    ), "o[:, :32, :] should be non-contiguous for [4,128,512] base tensor"
+    assert (
+        o_sliced.contiguous().is_contiguous()
+    ), ".contiguous() must produce a contiguous tensor"
+
+
 if __name__ == "__main__":
     import sys
 
