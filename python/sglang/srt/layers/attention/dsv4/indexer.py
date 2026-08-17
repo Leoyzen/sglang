@@ -896,13 +896,16 @@ class C4IndexerBackendMixin:
         dcp_rank = parallel.dcp_rank
 
         # Owner filter: keep only slots owned by this rank, remap to local.
+        # Use torch.where instead of boolean indexing — CUDA graph capture
+        # forbids the dynamic allocation behind tensor[mask] operations.
         valid = page_indices >= 0
         owned = valid & (page_indices % dcp_size == dcp_rank)
-        page_indices[owned] //= dcp_size
-        page_indices[~owned] = -1
+        remapped = page_indices // dcp_size
+        neg_one = torch.full_like(page_indices, -1)
+        result = torch.where(owned, remapped, torch.where(valid, neg_one, page_indices))
 
         # Sort descending so valid entries come first, -1 at the end.
-        sorted_idx, _ = page_indices.sort(dim=-1, descending=True)
+        sorted_idx, _ = result.sort(dim=-1, descending=True)
         page_indices.copy_(sorted_idx)
 
     def _run_topk_transform(

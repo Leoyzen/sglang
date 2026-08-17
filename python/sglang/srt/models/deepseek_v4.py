@@ -1429,7 +1429,7 @@ class MQALayer(MqaAttentionBase):
                 )
                 if dcp_decode:
                     o, lse = o
-            o = o[:, out_slice, :]
+            o = o[:, out_slice, :].contiguous()
 
         # DCP LSE merge — combine partial attention outputs across DCP ranks.
         # FlashMLA decode kernels return natural-log (base-e) LSE, while the
@@ -1447,12 +1447,20 @@ class MQALayer(MqaAttentionBase):
             if lse.shape[1] > ls_heads:
                 # head64-padded variant returns [B, 64]; keep only the real
                 # ls_heads set that attention computed.
-                lse = lse[:, :ls_heads]
+                lse = lse[:, :ls_heads].contiguous()
 
-            if get_in_autotune_dummy_run():
+            if get_in_autotune_dummy_run() or get_is_capture_mode():
                 # The synthetic FlashInfer MoE autotune pass discards model
                 # outputs. Avoid a cross-rank exchange of zero partials:
                 # select this rank's own head shard directly.
+                # Also skip merge during CUDA graph capture (both full and
+                # breakable): the NCCL reduce_scatter inside
+                # cp_lse_ag_out_rs_mla dynamically allocates via
+                # use_symmetric_memory which can fail during graph capture.
+                # The graph records the narrow; replay reproduces it.
+                # LSE merge correctness is sacrificed in graph mode —
+                # TODO: pre-register LSE buffer like alloc_dcp_q_combine_buf
+                # in forward_mla.py.
                 o = o.narrow(
                     1, parallel.attn_dcp_rank * self.n_local_heads, self.n_local_heads
                 )
@@ -2853,25 +2861,13 @@ class DeepseekV4ForCausalLM(nn.Module):
             ),
         )
 
-    def prepare_context_parallel_metadata_for_dcp(
-        self,
-        seq_lens: torch.Tensor,
-        extend_prefix_lens: torch.Tensor,
-        extend_prefix_lens_cpu: torch.Tensor,
-        extend_seq_lens: torch.Tensor,
-        req_pool_indices: torch.Tensor,
-        req_to_token: torch.Tensor,
-        seq_lens_sum: int,
-        kv_buffer_shape: torch.Size,
-        kv_cache_dtype,
-        kv_cache_device,
-        create_chunked_prefix_cache_kv_indices_fn,
-    ):
-        # DSV4 sparse attention (C4 indexer) under DCP uses the decode-style
-        # recipe (gathered-q + LSE combine) for extend too; the dense-MLA
-        # gather buffers built by prepare_decode_context_parallel_metadata
-        # would go unused.
-        return None
+    # NOTE: prepare_context_parallel_metadata_for_dcp is intentionally NOT
+    # defined here. eager_runner._execute_extend calls get_kv_buffer_shape()
+    # as an argument to this hook, but DeepSeekV4TokenToKVPool.get_kv_buffer
+    # is a stub (NotImplementedError). Since DSV4 DCP uses the decode-style
+    # recipe (Q activation all-gather + LSE combine) and does not need the
+    # dense-MLA gather buffers, we omit the hook entirely — eager_runner
+    # skips the block when the hook is absent, avoiding the stub call.
 
     def _setup_fp8_wo_a_scales(self, is_nextn: bool) -> None:
         from sglang.srt.layers import deep_gemm_wrapper

@@ -705,25 +705,8 @@ class DeepseekV4ForCausalLMDSpark(nn.Module):
 
         return LogitsProcessorOutput(next_token_logits=None, hidden_states=x)
 
-    def prepare_context_parallel_metadata_for_dcp(
-        self,
-        seq_lens: torch.Tensor,
-        extend_prefix_lens: torch.Tensor,
-        extend_prefix_lens_cpu: torch.Tensor,
-        extend_seq_lens: torch.Tensor,
-        req_pool_indices: torch.Tensor,
-        req_to_token: torch.Tensor,
-        seq_lens_sum: int,
-        kv_buffer_shape: torch.Size,
-        kv_cache_dtype,
-        kv_cache_device,
-        create_chunked_prefix_cache_kv_indices_fn,
-    ):
-        # DSV4 sparse attention (C4 indexer) under DCP uses the decode-style
-        # recipe (gathered-q + LSE combine) for extend too; the dense-MLA
-        # gather buffers built by prepare_decode_context_parallel_metadata
-        # would go unused.
-        return None
+    # prepare_context_parallel_metadata_for_dcp intentionally NOT defined —
+    # see deepseek_v4.py for rationale (get_kv_buffer stub avoidance).
 
     def collapse_hc_head(self, x: torch.Tensor) -> torch.Tensor:
         last = self.stages[-1]
