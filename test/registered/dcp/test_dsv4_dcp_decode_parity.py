@@ -45,8 +45,8 @@ PROMPTS = [
 ]
 
 
-def _has_two_gpus() -> bool:
-    return torch.cuda.is_available() and torch.cuda.device_count() >= 2
+def _has_four_gpus() -> bool:
+    return torch.cuda.is_available() and torch.cuda.device_count() >= 4
 
 
 def _launch(model: str, base_url: str, dcp_size: int, port: int):
@@ -56,7 +56,7 @@ def _launch(model: str, base_url: str, dcp_size: int, port: int):
         timeout=DEFAULT_TIMEOUT_FOR_SERVER_LAUNCH * 3,
         other_args=[
             "--tp-size",
-            "2",
+            "4",
             "--dcp-size",
             str(dcp_size),
             "--attention-backend",
@@ -66,14 +66,16 @@ def _launch(model: str, base_url: str, dcp_size: int, port: int):
             "0",
             "--cuda-graph-backend-prefill",
             "disabled",
-            "--mem-fraction-static",
-            "0.80",
             "--kv-cache-dtype",
             "fp8_e4m3",
             "--dsv4-prefill-backend",
             "flashmla_sparse_q8",
             "--moe-runner-backend",
             "flashinfer_mxfp4",
+            "--cuda-graph-max-bs",
+            "32",
+            "--max-running-requests",
+            "32",
         ],
     )
 
@@ -103,7 +105,7 @@ def _get_logprobs(base_url: str, prompt: str) -> list[float]:
     return logprobs
 
 
-@unittest.skipUnless(_has_two_gpus(), "DSV4 DCP parity test requires ≥2 GPUs")
+@unittest.skipUnless(_has_four_gpus(), "DSV4 DCP parity test requires ≥2 GPUs")
 class TestDsv4DcpDecodeParity(CustomTestCase):
     """Compare decode logprobs between dcp_size=1 and dcp_size=2."""
 
@@ -183,7 +185,7 @@ class TestDsv4DcpDecodeParity(CustomTestCase):
         )
 
 
-@unittest.skipUnless(_has_two_gpus(), "DSV4 DCP smoke test requires ≥2 GPUs")
+@unittest.skipUnless(_has_four_gpus(), "DSV4 DCP smoke test requires ≥2 GPUs")
 class TestDsv4DcpDecodeSmoke(CustomTestCase):
     """Standalone DCP decode smoke test.
 
@@ -200,7 +202,7 @@ class TestDsv4DcpDecodeSmoke(CustomTestCase):
 
         args = [
             "--tp-size",
-            "2",
+            "4",
             "--dcp-size",
             "2",
             "--attention-backend",
@@ -210,14 +212,16 @@ class TestDsv4DcpDecodeSmoke(CustomTestCase):
             "0",
             "--cuda-graph-backend-prefill",
             "disabled",
-            "--mem-fraction-static",
-            "0.75",
             "--kv-cache-dtype",
             "fp8_e4m3",
             "--dsv4-prefill-backend",
             "flashmla_sparse_q8",
             "--moe-runner-backend",
             "flashinfer_mxfp4",
+            "--cuda-graph-max-bs",
+            "32",
+            "--max-running-requests",
+            "32",
         ]
 
         cls.proc = popen_launch_server(
