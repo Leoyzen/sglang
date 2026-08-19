@@ -906,7 +906,7 @@ class C4IndexerBackendMixin:
                 indexer_metadata.c4_page_size,
                 raw_indices,
             )
-        elif envs.SGLANG_OPT_USE_TOPK_V2.get() and raw_indices is None:
+        elif envs.SGLANG_OPT_USE_TOPK_V2.get():
             # topk_metadata is pre-computed for the full batch c4_seq_lens.
             # In the chunked path, c4_seq_lens is a slice (shape M < N),
             # so the metadata shape (N+1, 2) won't match. Regenerate for
@@ -921,6 +921,7 @@ class C4IndexerBackendMixin:
                 c4_sparse_page_indices,
                 indexer_metadata.c4_page_size,
                 topk_meta,
+                raw_indices,
             )
         else:
             topk_transform_512(
@@ -1114,14 +1115,14 @@ class C4IndexerBackendMixin:
             )
 
             raw_indices = None
-            if capture_enabled:
+            if core_metadata.c4_sparse_raw_indices is not None:
+                raw_indices = core_metadata.c4_sparse_raw_indices
+            elif capture_enabled:
                 raw_indices = torch.empty_like(c4_sparse_page_indices)
             elif hisparse_decode:
                 raw_indices = hisparse_coordinator.raw_indices_buffer[
                     : c4_sparse_page_indices.size(0)
                 ]
-            elif core_metadata.c4_sparse_raw_indices is not None:
-                raw_indices = core_metadata.c4_sparse_raw_indices
 
             self._forward_oversize_varlen_chunked(
                 q_indexer=q_indexer,
@@ -1217,14 +1218,14 @@ class C4IndexerBackendMixin:
         )
 
         raw_indices = None
-        if capture_enabled:
+        if core_metadata.c4_sparse_raw_indices is not None:
+            raw_indices = core_metadata.c4_sparse_raw_indices
+        elif capture_enabled:
             raw_indices = torch.empty_like(c4_sparse_page_indices)
         elif hisparse_decode:
             raw_indices = hisparse_coordinator.raw_indices_buffer[
                 : c4_sparse_page_indices.size(0)
             ]
-        elif core_metadata.c4_sparse_raw_indices is not None:
-            raw_indices = core_metadata.c4_sparse_raw_indices
 
         self._run_topk_transform(
             logits,
