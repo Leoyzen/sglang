@@ -1288,9 +1288,23 @@ class HiCacheController:
                 if operation is None:
                     continue
 
-                if not self.backup_skip:
-                    self._page_backup(operation)
-                self.ack_backup_queue.put(operation)
+                try:
+                    if not self.backup_skip:
+                        self._page_backup(operation)
+                except Exception as e:
+                    logger.error(
+                        f"Backup thread encountered error for operation "
+                        f"{operation.id}: {e}. Host locks will be released "
+                        f"via ack. Completed tokens: "
+                        f"{operation.completed_tokens}",
+                        exc_info=True,
+                    )
+                finally:
+                    # Always ack the operation so that _drain_backup can
+                    # release host resources. If this is skipped (e.g. due
+                    # to an exception in _page_backup), host pages stay
+                    # pinned forever, locking the entire L2 cache.
+                    self.ack_backup_queue.put(operation)
 
             except Empty:
                 continue

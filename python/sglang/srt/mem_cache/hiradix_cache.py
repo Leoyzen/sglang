@@ -686,6 +686,15 @@ class HiRadixCache(RadixCache):
                     self.storage_metrics_collector.log_backuped_tokens(
                         operation.completed_tokens
                     )
+                    # Log failed tokens: the difference between what was
+                    # expected and what actually completed. Non-zero values
+                    # indicate L3 storage backend failures.
+                    total_expected = len(operation.hash_value or []) * self.page_size
+                    failed_tokens = total_expected - operation.completed_tokens
+                    if failed_tokens > 0:
+                        self.storage_metrics_collector.log_backuped_failed_tokens(
+                            failed_tokens
+                        )
 
         def _drain_release():
             host_indices_list = []
@@ -1197,7 +1206,12 @@ class HiRadixCache(RadixCache):
             return
 
         for child in node.children.values():
-            if child.backuped:
+            # A child with active GPU value (not evicted) protects the
+            # parent from host-leaf eviction, even if it is not backuped.
+            # Previously, only child.backuped was checked, which allowed
+            # evict_host to remove a parent whose child had active GPU
+            # value but no host backup — orphaning the active GPU child.
+            if child.backuped or not child.evicted:
                 if node in self.evictable_host_leaves:
                     self.evictable_host_leaves.remove(node)
                 return
@@ -1860,12 +1874,25 @@ class HiRadixCache(RadixCache):
 
     def _match_prefix_helper(self, node: TreeNode, key: RadixKey):
         node.last_access_time = time.monotonic()
+        # Increment hit_count on read access so that SLRU can distinguish
+        # actively-read nodes from stale ones. Without this, nodes read via
+        # match_prefix (e.g. multi-turn conversations between turns) never
+        # improve their eviction priority, causing active conversation
+        # prefixes to be evicted before cold data.
+        # NOTE: We deliberately do NOT call _inc_hit_count() here because
+        # that would trigger write_backup when hit_count reaches the
+        # write_through_threshold. Backup triggers should only fire on
+        # insert(), not on read-only match_prefix access.
+        if self.cache_controller.write_policy != "write_back":
+            node.hit_count += 1
         child_key = key.child_key(self.page_size)
         value = []
 
         while len(key) > 0 and child_key in node.children.keys():
             child = node.children[child_key]
             child.last_access_time = time.monotonic()
+            if self.cache_controller.write_policy != "write_back":
+                child.hit_count += 1
             prefix_len = child.key.match(key, page_size=self.page_size)
             if prefix_len < len(child.key):
                 new_node = self._split_node(child.key, child, prefix_len)
