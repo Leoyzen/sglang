@@ -1,5 +1,5 @@
 import logging
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import replace
 from typing import Optional
 
@@ -12,6 +12,10 @@ from sglang.srt.configs.hybrid_arch import mambaish_config
 from sglang.srt.distributed.parallel_state_wrapper import ParallelState
 from sglang.srt.environ import envs
 from sglang.srt.layers.logprob_processor import compute_spec_logprobs
+from sglang.srt.layers.moe.utils import (
+    speculative_moe_a2a_backend_context,
+    speculative_moe_backend_context,
+)
 from sglang.srt.managers.schedule_batch import ScheduleBatch
 from sglang.srt.managers.scheduler import GenerationBatchResult
 from sglang.srt.managers.tp_worker import TpModelWorker
@@ -320,10 +324,18 @@ class DSparkWorkerV2(BaseSpecWorker):
             raise AttributeError(name)
         return getattr(self.target_worker, name)
 
+    @contextmanager
     def _draft_context(self):
-        if self._draft_dp_context_enabled:
-            return draft_tp_context(get_parallel().attn_tp_group)
-        return nullcontext()
+        with (
+            (
+                draft_tp_context(get_parallel().attn_tp_group)
+                if self._draft_dp_context_enabled
+                else nullcontext()
+            ),
+            speculative_moe_backend_context(),
+            speculative_moe_a2a_backend_context(),
+        ):
+            yield
 
     def alloc_memory_pool(
         self,
@@ -725,6 +737,12 @@ class DSparkWorkerV2(BaseSpecWorker):
                 chain_stride=self.verify_num_draft_tokens,
             )
 
+        online_c128 = getattr(self.model_runner.attn_backend, "online_c128_mtp", None)
+        if online_c128 is not None and online_c128.enabled():
+            online_c128.commit_pending(
+                req_pool_indices=batch.req_pool_indices,
+                seq_lens=accept.new_seq_lens,
+            )
         if on_publish is not None:
             if confidence is not None:
                 on_publish(accept.new_seq_lens, confidence=confidence)
@@ -791,6 +809,7 @@ class DSparkWorkerV2(BaseSpecWorker):
             next_draft_input=next_draft_input,
             speculative_num_draft_tokens=int(self.verify_num_draft_tokens),
             new_seq_lens=accept.new_seq_lens,
+            extra_keep_alive_refs=[target_verify.verify_forward_batch],
         )
 
     def _commit_target_mamba_states_after_verify(
