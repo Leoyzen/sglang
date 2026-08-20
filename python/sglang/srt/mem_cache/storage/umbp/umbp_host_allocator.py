@@ -7,6 +7,7 @@ from typing import Any, Dict
 import torch
 
 from sglang.srt.mem_cache.pool_host.common import HostTensorAllocator
+from sglang.srt.mem_cache.storage.mmap import free_hugepage_bytes
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +50,13 @@ class UMBPHostTensorAllocator(HostTensorAllocator):
         # config parsing.
         self._standalone_process = bool(os.getenv("UMBP_STANDALONE_ADDRESS"))
         self._handles: Dict[int, Any] = {}
+
+    def free_hugetlb_bytes(self) -> int:
+        # mori maps AnonymousHugetlb from the same kernel pool, but selects the
+        # page size with its own knobs rather than SGLANG_HUGEPAGE_SIZE.
+        if not self._use_hugepage:
+            return 0
+        return free_hugepage_bytes(self._hugepage_size)
 
     def allocate(
         self, dims: tuple, dtype: torch.dtype, device: str = "cpu"
