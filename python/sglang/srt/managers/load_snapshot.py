@@ -75,7 +75,12 @@ def should_use_zmq() -> bool:
     ) or envs.SGLANG_LOAD_SNAPSHOT_USE_ZMQ.get()
 
 
-_LOAD_AWARE_METHODS = frozenset({"total_requests", "total_tokens"})
+_LOAD_AWARE_METHODS = frozenset({"total_requests", "total_tokens", "prefix_affinity"})
+
+
+def is_load_aware_method(method: str) -> bool:
+    """Whether ``method`` requires fresh per-rank load snapshots to dispatch."""
+    return method.lower() in _LOAD_AWARE_METHODS
 
 
 def _tokenizer_load_snapshot_owner_caller() -> str:
