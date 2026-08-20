@@ -2110,38 +2110,37 @@ class UnifiedRadixCache(BasePrefixCache):
             cc.prefetch_buffer.put(operation)
             return True
 
-        def _drain_and_alloc_storage_hit():
-            # Parked hits first (FIFO fairness with retries; buffer only).
-            if buffer_mode:
-                parked = self.buffer_pipeline.pending_hit_allocs
-                while parked:
-                    if not _try_alloc_storage_hit(parked[0]):
-                        break
-                    parked.popleft()
-            for operation in _drain_queue(cc.prefetch_hit_queue, n_storage_hit):
-                req_id = operation.request_id
-                info = self.ongoing_prefetch.get(req_id)
-                if info is None:
-                    # Request already aborted/cleaned up; still flush the
-                    # query's absent-hash feedback.
-                    self._invalidate_absent_from_hit_query(operation)
-                    continue
-                if operation.is_terminated():
-                    # Aborted while the storage query was in flight.
-                    self.revoke_pending_prefetch(req_id)
-                    continue
-                if operation.storage_hit_count < self.prefetch_threshold:
-                    # Below-threshold hit: classify + feed the L3 miss
-                    # accounting, then revoke (not enough benefit).
-                    self._account_prefetch_outcome(operation, revoked=True)
-                    self.revoke_pending_prefetch(req_id)
-                    continue
+        # Parked hits first (FIFO fairness with retries; buffer only).
+        if buffer_mode:
+            parked = self.buffer_pipeline.pending_hit_allocs
+            while parked:
+                if not _try_alloc_storage_hit(parked[0]):
+                    break
+                parked.popleft()
+        for operation in _drain_queue(cc.prefetch_hit_queue, n_storage_hit):
+            req_id = operation.request_id
+            info = self.ongoing_prefetch.get(req_id)
+            if info is None:
+                # Request already aborted/cleaned up; still flush the
+                # query's absent-hash feedback.
                 self._invalidate_absent_from_hit_query(operation)
-                self._account_prefetch_outcome(operation, revoked=False)
-                if not _try_alloc_storage_hit(operation):
-                    # Counted once at first parking, not per retry tick.
-                    self._prefetch_outcome_stats["declined_rate_limited"] += 1
-                    self.buffer_pipeline.pending_hit_allocs.append(operation)
+                continue
+            if operation.is_terminated():
+                # Aborted while the storage query was in flight.
+                self.revoke_pending_prefetch(req_id)
+                continue
+            if operation.storage_hit_count < self.prefetch_threshold:
+                # Below-threshold hit: classify + feed the L3 miss
+                # accounting, then revoke (not enough benefit).
+                self._account_prefetch_outcome(operation, revoked=True)
+                self.revoke_pending_prefetch(req_id)
+                continue
+            self._invalidate_absent_from_hit_query(operation)
+            self._account_prefetch_outcome(operation, revoked=False)
+            if not _try_alloc_storage_hit(operation):
+                # Counted once at first parking, not per retry tick.
+                self._prefetch_outcome_stats["declined_rate_limited"] += 1
+                self.buffer_pipeline.pending_hit_allocs.append(operation)
 
         def _drain_backup():
             drained = 0
@@ -2195,7 +2194,6 @@ class UnifiedRadixCache(BasePrefixCache):
                 drained[pool_name] = (len(host_indices_list), released_tokens)
             return drained
 
-        _drain_and_alloc_storage_hit()
         _drain_backup()
         _drain_release()
         _drain_extra_release()
