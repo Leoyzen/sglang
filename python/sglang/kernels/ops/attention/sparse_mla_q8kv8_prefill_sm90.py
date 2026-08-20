@@ -284,9 +284,10 @@ def sparse_mla_q8kv8_prefill_fwd(
     """Run Q8KV8 (FP8) sparse prefill attention on SM90.
 
     The kernel writes into three output tensors. By default fresh tensors
-    are allocated and returned; callers that want to reuse buffers may pass
-    pre-allocated ``out`` / ``max_logits`` / ``lse`` tensors of the expected
-    shape/dtype/device. The three output tensors must not alias each other.
+    are allocated and returned; callers that want to reuse buffers (e.g.
+    for CUDA graph capture) may pass pre-allocated ``out`` / ``max_logits``
+    / ``lse`` tensors of the expected shape/dtype/device. The three output
+    tensors must not alias each other.
 
     Returns:
         out:        [s_q, h_q, d_v], bfloat16
@@ -440,12 +441,10 @@ def sparse_mla_q8kv8_prefill_fwd(
         out = torch.empty(s_q, h_q, d_v, dtype=torch.bfloat16, device=device)
     else:
         _check_out_buffer(out, "out", (s_q, h_q, d_v), torch.bfloat16, device)
-
     if max_logits is None:
         max_logits = torch.empty(s_q, h_q, dtype=torch.float32, device=device)
     else:
         _check_out_buffer(max_logits, "max_logits", (s_q, h_q), torch.float32, device)
-
     if lse is None:
         lse = torch.empty(s_q, h_q, dtype=torch.float32, device=device)
     else:
