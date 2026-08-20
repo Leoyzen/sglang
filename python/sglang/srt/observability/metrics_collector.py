@@ -1888,6 +1888,16 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             labelnames=labels.keys(),
         )
 
+        self.backuped_failed_tokens_total = Counter(
+            name="sglang:backuped_failed_tokens_total",
+            documentation="Number of tokens that failed to back up to the "
+            "storage backend (L3). Non-zero values indicate storage backend "
+            "issues (e.g. Mooncake TCP failures). When this counter rises "
+            "while sglang:backuped_tokens_total flatlines, the L3 drainage "
+            "path is broken and L2 will saturate.",
+            labelnames=labels.keys(),
+        )
+
         bucket_io = [
             1,
             5,
@@ -1951,6 +1961,10 @@ class StorageMetricsCollector(_StatLoggerDIMixin):
             self.prefetch_aux_alloc_failed_tokens_total.labels(**self.labels).inc(
                 num_tokens
             )
+
+    def log_backuped_failed_tokens(self, failed_tokens: int):
+        if failed_tokens > 0:
+            self.backuped_failed_tokens_total.labels(**self.labels).inc(failed_tokens)
 
     def _log_histogram(self, histogram, data: Union[int, float]):
         histogram.labels(**self.labels).observe(data)
