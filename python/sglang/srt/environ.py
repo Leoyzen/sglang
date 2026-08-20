@@ -1061,6 +1061,9 @@ class Envs:
     # and benchmarks at parity, so this is a consolidation escape hatch, not a perf flip.
     SGLANG_OPT_USE_JIT_KERNEL_GROUPED_TOPK = EnvBool(False)
     SGLANG_OPT_USE_TOPK_V2 = EnvBool(True)
+    # Force the topk_transform_512 path to use the PyTorch vectorized kernel
+    # instead of the default fused kernel. Used by #33288 for C4 indexer memory.
+    SGLANG_TOPK_TRANSFORM_512_TORCH = EnvBool(False)
 
     # ===================================================================
     # Kernel selection and fused backends
