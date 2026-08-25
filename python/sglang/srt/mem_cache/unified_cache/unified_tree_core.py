@@ -909,10 +909,19 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 comp.refresh_lru(LRURefreshPhase.WALKDOWN, node, self.root_node)
 
     def _inc_hit_count_and_check(
-        self, node: UnifiedTreeNode, chunked: bool = False
+        self,
+        node: UnifiedTreeNode,
+        chunked: bool = False,
+        is_finished: bool = False,
     ) -> bool:
-        """Increment hit count; check whether a write backup should be fired."""
-        if node.evicted or chunked:
+        """Increment hit count; check whether a write backup should be fired.
+
+        Skip counting when the insert comes from a finished-request cache
+        (is_finished=True): the same request's unfinished prefill insert
+        already counted, so a second increment would reach the threshold
+        in a single request lifecycle and defeat write_through_selective.
+        """
+        if node.evicted or chunked or is_finished:
             return False
         if self.is_write_back:
             return False
@@ -1081,7 +1090,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                     FreeDeviceKV([value_slice[dup_start:consumed_from]])
                 )
 
-        if self._inc_hit_count_and_check(node, state.params.chunked):
+        if self._inc_hit_count_and_check(
+            node, state.params.chunked, state.params.is_finished
+        ):
             step_actions.append(self._build_backup_kv_action(node))
         state.node = node
         state.total_prefix_length += prefix_len
@@ -1134,7 +1145,9 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         """Check whether the insert target needs a Host backup."""
         if state.is_new_leaf:
             return self._inc_hit_count_and_check(
-                state.target_node, state.params.chunked
+                state.target_node,
+                state.params.chunked,
+                state.params.is_finished,
             )
 
         node = state.target_node
