@@ -6842,11 +6842,16 @@ class TestPrefetchCommitOrdering(CustomTestCase):
 
 
 class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
-    """Prefetch must not hang a backed-up host child under an un-backed-up parent.
+    """Prefetch refills under un-backed-up parents.
 
-    Under write-through that broke the "child backed up => parent backed up"
-    invariant, failing as an idle-sanity error and, on eviction, as
-    `_remove_leaf_from_parent -> assert v == node`. Fix: drop the refill.
+    #31902 originally dropped ALL refills under un-backed-up parents in
+    write-through to prevent ``assert v == node`` crashes during eviction.
+    However, that guard was stricter than the match-walk dead-node check
+    (L725: ``evicted and not backuped``), incorrectly dropping refills under
+    live nodes that still had device KV.  The fix aligns the guard with the
+    match-walk definition and routes write-through eviction of unbacked
+    D-leaves with children through ``drop_subtree_no_host`` to clean up
+    host-only descendants before deletion.
     """
 
     ps = 16
@@ -6916,8 +6921,10 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
             cache.cache_controller.mem_pool_host.free(host_idx)
         return res.inserted_host_node
 
-    def test_prefetch_refill_under_unbacked_parent_is_dropped(self):
-        """Write-through: a refill under an un-backed-up parent is dropped."""
+    def test_prefetch_refill_kept_under_live_unbacked_parent(self):
+        """Write-through: a refill under a live (device-KV) un-backed-up parent
+        is kept, aligning the insert_host guard with the match-walk dead-node
+        check (evicted + not backuped)."""
         cache, allocator, _ = build_fixture(self.cfg)
         self._init_hicache(cache)
 
@@ -6926,11 +6933,86 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
         )
         parent = cache.tree_core.node_by_id(parent_id)
         self.assertFalse(parent.backuped)
+        self.assertFalse(parent.evicted)
 
-        child = self._attach_host_child(cache, parent_id, start_token=1000)
-        self.assertIsNone(child)
-        self.assertEqual(len(parent.children), 0)
+        child_id = self._attach_host_child(cache, parent_id, start_token=1000)
+        self.assertIsNotNone(
+            child_id, "graft should succeed under live unbacked parent"
+        )
+        self.assertEqual(len(parent.children), 1)
+        child = cache.tree_core.node_by_id(child_id)
+        self.assertTrue(child.backuped)
+        self.assertTrue(child.evicted)
+        self.assertIn(child, cache.tree_core.evictable_host_leaves)
+        self.assertIn(parent, cache.tree_core.evictable_device_leaves)
         cache.sanity_check()
+
+    def test_prefetch_refill_dropped_under_dead_node(self):
+        """Write-through: a refill under a dead node (evicted + not backuped)
+        is still dropped — the guard only relaxed for live unbacked parents.
+
+        Part 1 exercises the full eviction path: parent (unbacked D-leaf)
+        with a host-only child is cleaned up via drop_subtree_no_host.
+
+        Part 2 manually constructs a dead node in the tree and verifies
+        the guard still fires.  We skip sanity_check here because a
+        manually-constructed dead node violates the "every node must keep
+        Full data on at least one layer" invariant (L2166) — in normal
+        operation dead nodes are immediately deleted by
+        _iteratively_delete_tombstone_leaf and never persist.
+        """
+        cache, allocator, _ = build_fixture(self.cfg)
+        self._init_hicache(cache)
+
+        # Part 1: full eviction path with host-only descendant.
+        # Build a two-level tree: parent (3 pages) → child (2 pages).
+        parent_seq = list(range(1, 1 + 3 * self.ps))
+        child_seq = parent_seq + list(range(1000, 1000 + 2 * self.ps))
+        parent_id = self._insert_device(cache, allocator, parent_seq)
+        self._insert_device(cache, allocator, child_seq)
+        parent = cache.tree_core.node_by_id(parent_id)
+
+        # Back up the child so it survives device eviction (host-only).
+        child_match = cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", child_seq)).page_aligned(self.ps))
+        )
+        child_node = cache.resolve_node_handle(child_match.last_device_node)
+        ct = ComponentType.FULL
+        child_node.component_data[ct].host_value = child_node.component_data[
+            ct
+        ].value.clone()
+        self.assertTrue(child_node.backuped)
+        self.assertFalse(parent.backuped)
+
+        # Demote child to host-only, then evict the unbacked parent D-leaf.
+        # drop_subtree_no_host cleans up the host-only child before deletion.
+        child_node.component_data[ct].value = None
+        cache.tree_core._update_evictable_leaf_sets(child_node)
+        cache.tree_core._update_evictable_leaf_sets(parent)
+        cache.evict(EvictParams(num_tokens=3 * self.ps))
+        self.assertEqual(len(cache.root_node.children), 0)
+        cache.sanity_check()
+
+        # Part 2: manually construct a dead node and verify the guard fires.
+        parent_id = self._insert_device(cache, allocator, parent_seq)
+        parent = cache.tree_core.node_by_id(parent_id)
+        # Graft a host-only child (succeeds under the relaxed guard).
+        host_child_id = self._attach_host_child(cache, parent_id, start_token=1000)
+        self.assertIsNotNone(host_child_id)
+
+        # Manually make the parent dead: clear device KV, no host mirror.
+        parent.component_data[ct].value = None
+        cache.tree_core._update_evictable_leaf_sets(parent)
+        self.assertTrue(parent.evicted)
+        self.assertFalse(parent.backuped)
+
+        # Attempt to graft another host child under the dead parent.
+        # The guard should fire: parent is evicted + not backuped → drop.
+        second_child_id = self._attach_host_child(cache, parent_id, start_token=2000)
+        self.assertIsNone(second_child_id, "graft should be dropped under dead node")
+        # NOTE: sanity_check is intentionally omitted — a manually-constructed
+        # dead node violates the "no dead nodes in tree" invariant (L2166),
+        # which is expected here since we bypassed the normal eviction cleanup.
 
     def test_dropped_prefetch_releases_all_host_resources(self):
         """The caller owns every completed buffer when host insertion drops."""
@@ -7031,16 +7113,97 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
         cache.sanity_check()
 
     def test_prefetch_refill_leaves_eviction_path_uncorrupted(self):
-        """Write-through: eviction after such a refill must not corrupt the tree."""
+        """Write-through: eviction after a kept refill must not corrupt the tree.
+
+        With the guard aligned to the match-walk dead-node check, the graft
+        succeeds under a live unbacked parent.  The eviction path must clean
+        up host-only descendants via drop_subtree_no_host before deleting the
+        unbacked D-leaf, preventing the ``assert v == node`` crash that
+        #31902 originally guarded against.
+        """
         cache, allocator, _ = build_fixture(self.cfg)
         self._init_hicache(cache)
 
         parent_id = self._insert_device(
             cache, allocator, list(range(1, 1 + 3 * self.ps))
         )
-        self._attach_host_child(cache, parent_id, start_token=1000)
+        parent = cache.tree_core.node_by_id(parent_id)
+        child_id = self._attach_host_child(cache, parent_id, start_token=1000)
+        self.assertIsNotNone(child_id)
+        child = cache.tree_core.node_by_id(child_id)
+        self.assertIn(child, cache.tree_core.evictable_host_leaves)
 
+        # Evict device memory — must clean up the host-only child too.
         cache.evict(EvictParams(num_tokens=10 * self.ps))
+
+        # Both parent and child should be gone from the tree.
+        self.assertNotIn(parent, cache.tree_core.evictable_device_leaves)
+        self.assertNotIn(child, cache.tree_core.evictable_host_leaves)
+        self.assertEqual(len(cache.root_node.children), 0)
+        cache.sanity_check()
+
+    def test_host_eviction_after_device_eviction_no_crash(self):
+        """Explicitly trigger host eviction after device eviction of an
+        unbacked parent with a grafted host-only child.
+
+        This is the exact crash path identified in the analysis: without the
+        drop_subtree_no_host routing, _iteratively_delete_tombstone_leaf would
+        re-pop an already-removed parent, hitting ``assert v == node``.
+        """
+        cache, allocator, _ = build_fixture(self.cfg)
+        self._init_hicache(cache)
+
+        parent_id = self._insert_device(
+            cache, allocator, list(range(1, 1 + 3 * self.ps))
+        )
+        parent = cache.tree_core.node_by_id(parent_id)
+        child_id = self._attach_host_child(cache, parent_id, start_token=1000)
+        self.assertIsNotNone(child_id)
+        child = cache.tree_core.node_by_id(child_id)
+
+        # Device-evict the parent through the tree-core API directly.
+        result = cache.tree_core.evict_device_leaf(parent_id, is_write_back=False)
+        cache._free_values(result.device_frees, result.host_frees)
+
+        # Parent is gone; child must have been cleaned up by drop_subtree_no_host.
+        self.assertNotIn(child, cache.tree_core.evictable_host_leaves)
+        self.assertEqual(len(cache.root_node.children), 0)
+
+        # Explicitly drive host eviction — nothing left, must be a no-op.
+        cache.evict_host(10 * self.ps)
+        cache.sanity_check()
+
+    def test_locked_descendant_blocks_device_eviction(self):
+        """A host-lock on the grafted child must prevent device eviction of
+        the unbacked parent (drop_subtree_no_host declines on locked descendants)."""
+        cache, allocator, _ = build_fixture(self.cfg)
+        self._init_hicache(cache)
+
+        parent_id = self._insert_device(
+            cache, allocator, list(range(1, 1 + 3 * self.ps))
+        )
+        parent = cache.tree_core.node_by_id(parent_id)
+        child_id = self._attach_host_child(cache, parent_id, start_token=1000)
+        self.assertIsNotNone(child_id)
+        child = cache.tree_core.node_by_id(child_id)
+
+        # Acquire a host lock on the child so drop_subtree_no_host declines.
+        lock_cd = child.component_data[ComponentType.FULL]
+        lock_cd.host_lock_ref += 1
+
+        # Attempt device eviction — should decline (node stays device-resident).
+        result = cache.tree_core.evict_device_leaf(parent_id, is_write_back=False)
+        cache._free_values(result.device_frees, result.host_frees)
+        self.assertFalse(
+            parent.evicted, "parent must stay device-resident when child is locked"
+        )
+
+        # Release the lock and retry — should succeed now.
+        lock_cd.host_lock_ref -= 1
+        result = cache.tree_core.evict_device_leaf(parent_id, is_write_back=False)
+        cache._free_values(result.device_frees, result.host_frees)
+        self.assertNotIn(child, cache.tree_core.evictable_host_leaves)
+        self.assertEqual(len(cache.root_node.children), 0)
         cache.sanity_check()
 
     def test_prefetch_refill_kept_under_unbacked_parent_in_write_back(self):
