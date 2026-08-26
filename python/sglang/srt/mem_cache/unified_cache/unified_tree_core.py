@@ -1361,6 +1361,29 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 result.backup_kv = self._build_backup_kv_action(node, write_back=True)
                 return result
             # Write-through: node has no backup, delete entirely.
+            # L3 prefetch may have grafted host-only descendants under this
+            # D-leaf; clean them up before deleting to prevent orphans that
+            # would crash _iteratively_delete_tombstone_leaf on re-pop.
+            if node.children:
+                if node.write_through_pending_id is not None:
+                    # Backup in flight — can't safely clean up subtree yet.
+                    # Skip this node; it will take the _demote path after the
+                    # backup ack sets backuped=True, or be retried after the
+                    # ack clears the pending mark.
+                    return result
+                drop_result = self.drop_subtree_no_host(node_id)
+                # Merge freed values/counts into the caller's result, draining
+                # drop_result so its __del__ tripwire sees empty dicts.
+                for ct in list(drop_result.device_frees):
+                    result.device_frees[ct].extend(drop_result.device_frees.pop(ct))
+                for ct in list(drop_result.host_frees):
+                    result.host_frees[ct].extend(drop_result.host_frees.pop(ct))
+                for ct, cnt in drop_result.tracker.items():
+                    result.tracker[ct] += cnt
+                drop_result.tracker.clear()
+                # If drop declined (locked descendant), the node stays
+                # device-resident; caller advances to the next D-leaf.
+                return result
             self._delete_unbacked_device_leaf(
                 node,
                 result.tracker,
@@ -1920,7 +1943,10 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         # Drop the refill only for dead nodes (evicted + not backuped) under
         # write-through (a non-write-back policy).  Aligns with the match-walk
         # dead-node check (L725): a node with device KV but no host mirror is
-        # still live and match-traversable, so grafting L3 data under it is safe.
+        # still live and match-traversable, so grafting L3 data under it is
+        # safe.  The eviction path (evict_device_leaf → drop_subtree_no_host)
+        # cleans up host-only descendants when the parent is later
+        # device-evicted.
         if (
             node is not self.root_node
             and node.evicted
@@ -2299,7 +2325,15 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 if full_dev and not p_dev:
                     E(f"node {nid} device present but parent {node.parent.id} evicted")
                 if full_hst and not p_hst and not self.is_write_back:
-                    E(f"node {nid} backed up but parent {node.parent.id} not backed up")
+                    # L3 prefetch under write_through_selective may graft
+                    # host-only children under live (device-KV-bearing) but
+                    # unbacked parents.  This is structurally valid; only
+                    # flag when the parent is also device-evicted (truly
+                    # dead), which would indicate corruption.
+                    if not p_dev:
+                        E(
+                            f"node {nid} backed up but parent {node.parent.id} dead (no device, no host)"
+                        )
 
             # Lock hierarchy and counters must stay sane.
             fl = node.component_data[FCT].lock_ref
