@@ -1802,8 +1802,16 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
                 result.inserted_host_node = node.id
             return result
 
-        # Drop the refill only under write-through (a non-write-back policy).
-        if node is not self.root_node and not node.backuped and not self.is_write_back:
+        # Drop the refill only for dead nodes (evicted + not backuped) under
+        # write-through (a non-write-back policy).  Aligns with the match-walk
+        # dead-node check (L725): a node with device KV but no host mirror is
+        # still live and match-traversable, so grafting L3 data under it is safe.
+        if (
+            node is not self.root_node
+            and node.evicted
+            and not node.backuped
+            and not self.is_write_back
+        ):
             logger.info(
                 "HiCache prefetch dropped %d-token refill under un-backed-up node %d",
                 len(host_value),
