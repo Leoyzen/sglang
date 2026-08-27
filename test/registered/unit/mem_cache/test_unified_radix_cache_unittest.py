@@ -818,6 +818,192 @@ class TestUnifiedRadixCacheEagleHiCacheStorageKey(CustomTestCase):
         self.assertNotEqual(canonical_hashes, cache.tree_core.get_hash_values(leaf))
 
 
+class TestUnifiedRadixPrefetchHashRecompute(CustomTestCase):
+    """Verify prefetch_from_storage recomputes last_hash from matched_prefix_tokens.
+
+    Bug: the scheduler passes last_hash = get_last_hash_value(last_host_node),
+    which is the hash at the anchor's position — not at matched_len.  When the
+    anchor sits above matched_len (async backup lag), the hash chain is broken
+    and L3 batch_exists always misses.  The fix recomputes last_hash from the
+    full matched_prefix_tokens via get_hash_str(tokens, None, page_size).
+    """
+
+    cfg = CacheConfig(
+        page_size=4,
+        components=(ComponentType.FULL,),
+        kv_size=128,
+        max_context_len=128,
+    )
+
+    def _make_fake_controller(self):
+        """Return a FakeCacheController that captures prefetch() arguments."""
+
+        class FakeHostPool:
+            def alloc(self, num_tokens):
+                return torch.arange(num_tokens, dtype=torch.int64)
+
+        class FakeCacheController:
+            def __init__(self):
+                self.mem_pool_host = FakeHostPool()
+                self.prefetch_tokens_occupied = 0
+                self.prefetch_args = None
+                self.write_policy = "write_through"
+
+            def prefetch_rate_limited(self):
+                return False
+
+            def prefetch(
+                self,
+                request_id,
+                new_input_tokens,
+                last_hash=None,
+                prefix_keys=None,
+                extra_pools=None,
+            ):
+                self.prefetch_args = (
+                    request_id,
+                    new_input_tokens,
+                    last_hash,
+                    prefix_keys,
+                    extra_pools,
+                )
+                return mock.Mock()
+
+        return FakeCacheController()
+
+    def _setup_cache(self):
+        """Create a cache with [1..16] inserted (4 pages of size 4)."""
+        cache, allocator, _ = build_fixture(self.cfg)
+        cache.enable_storage = True
+        cache.prefetch_threshold = 1
+        tokens = array("q", list(range(1, 17)))
+        value = allocator.alloc(len(tokens))
+        self.assertIsNotNone(value)
+        cache.insert(InsertParams(key=RadixKey(tokens), value=value))
+        match = cache.match_prefix(MatchPrefixParams(key=RadixKey(tokens)))
+        leaf = match.last_device_node
+        return cache, leaf, list(tokens)
+
+    def test_recomputes_last_hash_from_matched_prefix(self):
+        """last_hash is recomputed from matched_prefix_tokens, overriding
+        the stale hash from a shallower anchor position."""
+        from sglang.srt.mem_cache.utils import get_hash_str
+
+        cache, leaf, tokens = self._setup_cache()
+
+        # Simulate a shallow anchor: hash at position 8 (page 2 of 4).
+        shallow_hash = get_hash_str(tokens[:8], None, cache.page_size)[-1]
+        # Correct hash at position 16 (full 4 pages).
+        correct_hash = get_hash_str(tokens, None, cache.page_size)[-1]
+        self.assertNotEqual(shallow_hash, correct_hash)
+
+        controller = self._make_fake_controller()
+        cache.cache_controller = controller
+
+        cache.prefetch_from_storage(
+            "req1",
+            leaf,
+            [17, 18, 19, 20],
+            last_hash=shallow_hash,
+            matched_prefix_tokens=tokens,
+        )
+
+        _, _, captured, _, _ = controller.prefetch_args
+        self.assertEqual(captured, correct_hash)
+        self.assertNotEqual(captured, shallow_hash)
+
+    def test_preserves_last_hash_without_matched_prefix(self):
+        """Without matched_prefix_tokens, the caller-supplied last_hash
+        is preserved (no recompute)."""
+        cache, leaf, tokens = self._setup_cache()
+
+        controller = self._make_fake_controller()
+        cache.cache_controller = controller
+
+        cache.prefetch_from_storage(
+            "req2",
+            leaf,
+            [17, 18, 19, 20],
+            last_hash="PRESERVED",
+            matched_prefix_tokens=None,
+        )
+
+        _, _, captured, _, _ = controller.prefetch_args
+        self.assertEqual(captured, "PRESERVED")
+
+    def test_recompute_skipped_for_short_prefix(self):
+        """When matched_prefix_tokens is shorter than page_size, the
+        recompute is skipped and the caller-supplied last_hash is kept."""
+        cache, leaf, tokens = self._setup_cache()
+
+        controller = self._make_fake_controller()
+        cache.cache_controller = controller
+
+        cache.prefetch_from_storage(
+            "req3",
+            leaf,
+            [17, 18, 19, 20],
+            last_hash="KEPT",
+            matched_prefix_tokens=[1, 2],  # shorter than page_size=4
+        )
+
+        _, _, captured, _, _ = controller.prefetch_args
+        self.assertEqual(captured, "KEPT")
+
+    def test_recompute_works_at_exact_page_boundary(self):
+        """matched_prefix_tokens of exactly page_size (1 full page) should
+        produce a valid single-page hash."""
+        from sglang.srt.mem_cache.utils import get_hash_str
+
+        cache, leaf, tokens = self._setup_cache()
+
+        # Exactly 1 page (4 tokens).
+        one_page = tokens[:4]
+        expected = get_hash_str(one_page, None, cache.page_size)[-1]
+
+        controller = self._make_fake_controller()
+        cache.cache_controller = controller
+
+        cache.prefetch_from_storage(
+            "req4",
+            leaf,
+            [17, 18, 19, 20],
+            last_hash="SHOULD_BE_OVERRIDDEN",
+            matched_prefix_tokens=one_page,
+        )
+
+        _, _, captured, _, _ = controller.prefetch_args
+        self.assertEqual(captured, expected)
+
+    def test_recompute_truncates_non_page_aligned_prefix(self):
+        """When matched_prefix_tokens length is not a multiple of page_size,
+        the recompute truncates to the last full page to avoid a partial-page
+        hash that would never match L3 keys."""
+        from sglang.srt.mem_cache.utils import get_hash_str
+
+        cache, leaf, tokens = self._setup_cache()
+
+        # 14 tokens = 3 full pages (12) + 2 remainder.
+        # The recompute should use only the first 12 tokens.
+        unaligned = list(range(1, 15))
+        aligned = unaligned[:12]
+        expected = get_hash_str(aligned, None, cache.page_size)[-1]
+
+        controller = self._make_fake_controller()
+        cache.cache_controller = controller
+
+        cache.prefetch_from_storage(
+            "req5",
+            leaf,
+            [17, 18, 19, 20],
+            last_hash="SHOULD_BE_OVERRIDDEN",
+            matched_prefix_tokens=unaligned,
+        )
+
+        _, _, captured, _, _ = controller.prefetch_args
+        self.assertEqual(captured, expected)
+
+
 class TestUnifiedRadixCacheKVEvents(CustomTestCase):
     cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
 

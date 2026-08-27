@@ -2775,9 +2775,10 @@ class Scheduler(
             # Buffer mode host-backups nothing, so match_prefix anchors at
             # root; re-anchor on the deepest device node. The anchor is only
             # read for hash/extra-key context here (never locked), so a device
-            # node serves. Cache mode keeps the is_backuped gate below: its
-            # write-through prefix is contiguous from root, so an unbacked
-            # anchor means a guaranteed storage miss.
+            # node serves. The gate also admits nodes with a hash value even
+            # when not yet backuped: prefetch_from_storage recomputes the
+            # hash chain from matched_prefix_tokens, so the L3 query is
+            # correct regardless of the anchor's backup state.
             if (
                 buffer_mode
                 and tree_cache.is_root(last_host_node)
@@ -2788,10 +2789,7 @@ class Scheduler(
             if (
                 tree_cache.is_backuped(last_host_node)
                 or tree_cache.is_root(last_host_node)
-                or (
-                    buffer_mode
-                    and tree_cache.get_last_hash_value(last_host_node) is not None
-                )
+                or tree_cache.get_last_hash_value(last_host_node) is not None
             ):
                 matched_len = len(req.prefix_indices) + req.host_hit_length
                 match_end = req._compute_max_prefix_len(
