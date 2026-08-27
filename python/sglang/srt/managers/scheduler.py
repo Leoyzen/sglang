@@ -2740,10 +2740,7 @@ class Scheduler(
             if (
                 tree_cache.is_backuped(last_host_node)
                 or tree_cache.is_root(last_host_node)
-                or (
-                    buffer_mode
-                    and tree_cache.get_last_hash_value(last_host_node) is not None
-                )
+                or tree_cache.get_last_hash_value(last_host_node) is not None
             ):
                 matched_len = len(req.prefix_indices) + req.host_hit_length
                 match_end = req._compute_max_prefix_len(

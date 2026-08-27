@@ -77,6 +77,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core import (  # noqa: F401
     UnifiedTreeCore,
     UnifiedTreeNode,
 )
+from sglang.srt.mem_cache.utils import get_hash_str
 from sglang.srt.observability.metrics_collector import (
     StorageMetrics,
     StorageMetricsCollector,
@@ -1572,6 +1573,15 @@ class UnifiedRadixCache(BasePrefixCache):
             # A fetch (or an unconsumed hold) already exists for this rid;
             # overwriting would leak its staging slots.
             return
+
+        # Recompute last_hash from the full matched prefix so the hash chain
+        # is correct regardless of which node was selected as anchor.  The
+        # anchor's hash_value may be at a different position than matched_len
+        # when the anchor has no host_value (async backup not yet complete).
+        if matched_prefix_tokens and len(matched_prefix_tokens) >= self.page_size:
+            prefix_hashes = get_hash_str(matched_prefix_tokens, None, self.page_size)
+            if prefix_hashes:
+                last_hash = prefix_hashes[-1]
 
         # Buffer mode holds no tree state during the fetch: buffers are
         # operation-owned, so the anchor needs no pin.
