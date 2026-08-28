@@ -1863,37 +1863,79 @@ class UnifiedRadixCache(BasePrefixCache):
         min_completed_tokens = int(packed[0].item())
         pool_hit_pages = list(map(int, packed[1:].tolist()))
 
-        # Hybrid cache state is all-or-nothing: every extra pool (SWA / Mamba / ...)
-        # must cover the same fetched prefix. If any pool falls short the whole
-        # prefetch result is unusable, so discard it and release everything.
+        # Hybrid cache: KV-derived sidecars (indices_from_pool == KV) share
+        # the KV hit length and are always covered when KV succeeds.  Non-KV
+        # independent pools (SWA, Mamba, ...) cover only a window / tail and
+        # cannot be truncated page-by-page, so any shortfall historically
+        # forced an all-or-nothing discard — throwing away the successfully
+        # fetched Full KV as well.
+        #
+        # Fail-soft strategy: when the KV pool itself fetched a usable prefix
+        # (min_completed_tokens > 0) but a non-KV pool fell short, retain the
+        # KV (+ KV-derived sidecar) result and discard **only** the non-KV
+        # pools.  Their host buffers are released here and their component
+        # entries are removed from comp_xfers so the caller's normal commit /
+        # staging path never touches the freed memory.  At load-back time the
+        # missing SWA window is rebuilt via the existing
+        # RecoverSWAWithLockedFull / SWARebuild path in swa_component.py.
         expected_tokens = len(hash_value) * self.page_size
         all_succeeded = min_completed_tokens == expected_tokens and all(
             transfer.keys is not None and count == len(transfer.keys)
             for transfer, count in zip(pool_transfers, pool_hit_pages)
         )
         if pool_transfers and not all_succeeded:
-            # The controller's prefetch IO thread already releases the untransferred
-            # tail (host_indices[completed_tokens:])
+            if min_completed_tokens == 0:
+                # Nothing usable from any pool — full discard (original path).
+                self.cache_controller.append_host_mem_release(
+                    host_indices=host_indices[:completed_tokens],
+                    extra_pools=(
+                        pool_transfers if operation.pool_transfers_done else None
+                    ),
+                )
+                if anchor_lock_params is not None:
+                    self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
+                del self.ongoing_prefetch[req_id]
+                if self.buffer_pipeline is not None:
+                    self.buffer_pipeline.pop_prefix_ctx(req_id)
+                self.cache_controller.prefetch_tokens_occupied -= (
+                    self._prefetch_occupied_span(prefetch_key, host_indices)
+                )
+                self.prefetch_loaded_tokens_by_reqid[req_id] = 0
+                logger.warning(
+                    "HiCache hybrid prefetch discarded req=%s completed=%d requested=%d",
+                    req_id,
+                    completed_tokens,
+                    expected_tokens,
+                )
+                return None
+
+            # Fail-soft: retain Full KV + KV-derived sidecars, discard only
+            # the non-KV independent pools (SWA, Mamba, …) whose storage
+            # fetch fell short.  The caller continues with the usable KV
+            # prefix; SWA is rebuilt at load-back.
             self.cache_controller.append_host_mem_release(
-                host_indices=host_indices[:completed_tokens],
                 extra_pools=pool_transfers if operation.pool_transfers_done else None,
             )
-            if anchor_lock_params is not None:
-                self.dec_host_lock_ref(last_host_node_id, anchor_lock_params)
-            del self.ongoing_prefetch[req_id]
-            if self.buffer_pipeline is not None:
-                self.buffer_pipeline.pop_prefix_ctx(req_id)
-            self.cache_controller.prefetch_tokens_occupied -= (
-                self._prefetch_occupied_span(prefetch_key, host_indices)
-            )
-            self.prefetch_loaded_tokens_by_reqid[req_id] = 0
+            # Remove non-KV-derived components from comp_xfers so the caller's
+            # commit / staging path won't touch the freed host buffers.
+            comp_xfers = self.ongoing_prefetch[req_id].comp_xfers
+            failed_components = [
+                ct
+                for ct, xfers in comp_xfers.items()
+                if any(x.indices_from_pool != PoolName.KV for x in xfers)
+            ]
+            for ct in failed_components:
+                del comp_xfers[ct]
             logger.warning(
-                "HiCache hybrid prefetch discarded req=%s completed=%d requested=%d",
+                "HiCache hybrid prefetch degraded req=%s completed=%d "
+                "requested=%d retained_kv=%d discarded_components=%s",
                 req_id,
                 completed_tokens,
                 expected_tokens,
+                min_completed_tokens,
+                [ct.value for ct in failed_components],
             )
-            return None
+            return min_completed_tokens
         return min_completed_tokens
 
     def terminate_prefetch(self, req_id: str) -> None:
