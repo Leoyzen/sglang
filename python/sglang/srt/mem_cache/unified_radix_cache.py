@@ -1884,8 +1884,22 @@ class UnifiedRadixCache(BasePrefixCache):
             for transfer, count in zip(pool_transfers, pool_hit_pages)
         )
         if pool_transfers and not all_succeeded:
-            if min_completed_tokens == 0:
-                # Nothing usable from any pool — full discard (original path).
+            # Identify which non-KV components fell short.  KV-derived
+            # sidecars (indices_from_pool == KV) are excluded — they share
+            # the KV hit length and are always covered when KV succeeds.
+            comp_xfers = self.ongoing_prefetch[req_id].comp_xfers
+            failed_components = [
+                ct
+                for ct, xfers in comp_xfers.items()
+                if any(x.indices_from_pool != PoolName.KV for x in xfers)
+            ]
+            # Only SWA has a cheap rebuild path (_translate_full_to_swa).
+            # Mamba SSM states require O(seq_len) recompute — not degradable.
+            rebuildable = all(ct != ComponentType.MAMBA for ct in failed_components)
+
+            if min_completed_tokens == 0 or not rebuildable:
+                # Full discard — nothing usable, or a non-rebuildable pool
+                # (Mamba) fell short so the whole result is unusable.
                 self.cache_controller.append_host_mem_release(
                     host_indices=host_indices[:completed_tokens],
                     extra_pools=(
@@ -1910,20 +1924,15 @@ class UnifiedRadixCache(BasePrefixCache):
                 return None
 
             # Fail-soft: retain Full KV + KV-derived sidecars, discard only
-            # the non-KV independent pools (SWA, Mamba, …) whose storage
-            # fetch fell short.  The caller continues with the usable KV
-            # prefix; SWA is rebuilt at load-back.
+            # the non-KV independent pools (SWA, …) whose storage fetch fell
+            # short.  The caller continues with the usable KV prefix; SWA is
+            # rebuilt at load-back via SWARebuild/RecoverSWAWithLockedFull.
             self.cache_controller.append_host_mem_release(
                 extra_pools=pool_transfers if operation.pool_transfers_done else None,
             )
-            # Remove non-KV-derived components from comp_xfers so the caller's
-            # commit / staging path won't touch the freed host buffers.
-            comp_xfers = self.ongoing_prefetch[req_id].comp_xfers
-            failed_components = [
-                ct
-                for ct, xfers in comp_xfers.items()
-                if any(x.indices_from_pool != PoolName.KV for x in xfers)
-            ]
+            # Remove failed non-KV components from comp_xfers (same dict as
+            # the caller's) so the commit / staging path won't touch freed
+            # host buffers.
             for ct in failed_components:
                 del comp_xfers[ct]
             logger.warning(
