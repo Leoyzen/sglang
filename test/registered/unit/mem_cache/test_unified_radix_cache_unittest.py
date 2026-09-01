@@ -8631,12 +8631,10 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
 
         # Demote child to host-only, then evict the unbacked parent D-leaf.
         # drop_subtree_no_host cleans up the host-only child before deletion.
-        # Full LRU bookkeeping must reflect the demotion for sanity_check:
-        # value=None with host_value present belongs in the host LRU only,
-        # and the evictable-size counter must drop with the device layer.
+        # The FULL component in this write-through fixture tracks eviction
+        # through the evictable leaf sets, not the device LRU; only the
+        # evictable-size counter must drop with the device layer.
         child_node.component_data[ct].value = None
-        cache.tree_core.remove_node_from_device_lru(child_node, ct)
-        cache.tree_core.insert_node_into_host_lru(child_node, ct)
         cache.tree_core.set_component_evictable_size(
             ct,
             cache.tree_core.component_evictable_size(ct) - len(child_val),
@@ -8689,7 +8687,9 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
         parent_val = parent.component_data[ct].value
         self.assertIsNotNone(parent_val)
         parent.component_data[ct].value = None
-        cache.tree_core.remove_node_from_device_lru(parent, ct)
+        # The FULL component in this write-through fixture tracks eviction
+        # through the evictable leaf sets, not the device LRU; only the
+        # evictable-size counter must drop with the device layer.
         cache.tree_core.set_component_evictable_size(
             ct,
             cache.tree_core.component_evictable_size(ct) - len(parent_val),
