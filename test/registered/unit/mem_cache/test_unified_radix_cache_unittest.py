@@ -4571,7 +4571,7 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(self._host_avail_sizes(cons3), avail3)
         cons3.sanity_check()
 
-    # ---------- TP consistency for SWA prefetch (all-or-nothing) ----------
+    # ---------- TP consistency for SWA prefetch (fail-soft degrade) ----------
 
     def _patch_tp_prefetch_sync(self, cache, drop_swa: bool):
         """Fake all_reduce so _reduce_prefetch_ack runs the tp>1 path."""
@@ -4658,9 +4658,11 @@ class UnifiedRadixCacheSuite:
             self.skipTest("fixture does not exercise SWA L3 prefetch")
         return storage_dir, seq
 
-    def test_tp_swa_prefetch_dropped_when_peer_misses(self):
-        """A peer rank missing the SWA window drops the whole prefetch result
-        on every rank (TP-consistent all-or-nothing)."""
+    def test_tp_swa_prefetch_degrades_to_kv_only_when_peer_misses(self):
+        """A peer rank missing the SWA window degrades the prefetch to KV-only
+        on every rank (TP-consistent fail-soft: the fetched KV prefix is
+        retained, only the failed SWA pool is discarded and rebuilt at
+        load-back)."""
         setup = self._setup_swa_tp_prefetch()
         if setup is None:
             return
@@ -4672,7 +4674,10 @@ class UnifiedRadixCacheSuite:
         self._consume_prefetch(cons, seq, "drop")
 
         m = cons.match_prefix(MatchPrefixParams(key=RadixKey(array("q", seq))))
-        self.assertEqual(m.host_hit_length, 0)
+        # Fail-soft: the KV pool fetched a usable prefix and it is retained.
+        self.assertEqual(m.host_hit_length, len(seq))
+        # TP consistency: every rank agrees SWA itself is missing — the
+        # degraded span carries no SWA host mirror (rebuilt from Full KV).
         self.assertFalse(
             self._swa_host_on_path(cons, seq), "SWA must be dropped when a peer misses"
         )
@@ -4699,9 +4704,11 @@ class UnifiedRadixCacheSuite:
         )
         cons.sanity_check()
 
-    def test_tp_swa_prefetch_drop_frees_host_pool(self):
-        """A dropped SWA prefetch must return its whole host buffer to the pool
-        (no leak, no over-free)."""
+    def test_tp_swa_prefetch_degrade_frees_failed_swa_host_pool(self):
+        """A degraded prefetch (peer missing SWA) must return the failed SWA
+        pool's host buffer to the pool (no leak, no over-free) while the
+        retained KV span stays occupied — the fail-soft degrade never
+        double-frees the kept side (TP-consistent on every rank)."""
         setup = self._setup_swa_tp_prefetch()
         if setup is None:
             return
@@ -4710,18 +4717,25 @@ class UnifiedRadixCacheSuite:
         cons = self._l3_consumer(storage_dir)
         cons.tp_world_size = 2
         self._patch_tp_prefetch_sync(cons, drop_swa=True)
-        avail_before = cons.swa_kv_pool_host.available_size()
+        avail_before = self._host_avail_sizes(cons)
         self._consume_prefetch(cons, seq, "drop")
 
         self.assertEqual(
             cons.match_prefix(
                 MatchPrefixParams(key=RadixKey(array("q", seq)))
             ).host_hit_length,
-            0,
+            len(seq),
         )
-        # Whole window dropped -> its host buffer is fully released back.
         cons.drain_storage_control_queues()  # Drain the release queue.
-        self.assertEqual(cons.swa_kv_pool_host.available_size(), avail_before)
+        avail_after = self._host_avail_sizes(cons)
+        # Failed pool: its whole SWA window is released back (no leak).
+        self.assertEqual(
+            cons.swa_kv_pool_host.available_size(), avail_before[PoolName.SWA]
+        )
+        # Retained side: the KV graft keeps its host buffer occupied — the
+        # degrade must not release the KV it just decided to keep.
+        self.assertLess(avail_after[PoolName.KV], avail_before[PoolName.KV])
+        cons.sanity_check()
 
     def test_hicache_write_back_evict_drops_unbacked_leaf_when_host_full(self):
         """Write-back eviction will keep freeing device KV when the host pool
@@ -6686,10 +6700,17 @@ class UnifiedRadixCacheSuite:
         self.assertEqual(xfer.nodes_to_load, [y])
         self.assertEqual(int(xfer.host_indices.numel()), ps)
 
-        with self.assertRaises(AssertionError):
-            cache.tree_core.build_hicache_transfers(
-                ComponentType.SWA, y, CacheTransferPhase.LOAD_BACK
-            )
+        # Anchored on Y, the walk reaches N's both-layers-absent SWA hole:
+        # the fail-soft LOAD_BACK builder stops collecting there instead of
+        # asserting — the missing SWA window is rebuilt from Full KV at
+        # load-back via SWARebuild/RecoverSWAWithLockedFull.
+        transfers = cache.tree_core.build_hicache_transfers(
+            ComponentType.SWA, y, CacheTransferPhase.LOAD_BACK
+        )
+        self.assertEqual(len(transfers), 1)
+        xfer = transfers[0]
+        self.assertEqual(xfer.nodes_to_load, [y])
+        self.assertEqual(int(xfer.host_indices.numel()), ps)
 
     def test_hicache_swa_finalize_anchored_on_best_match_node(self):
         cache, _, _, y, x, _ = self._swa_anchor_setup()
@@ -8597,15 +8618,29 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
         )
         child_node = cache.resolve_node_handle(child_match.last_device_node)
         ct = ComponentType.FULL
-        child_node.component_data[ct].host_value = child_node.component_data[
-            ct
-        ].value.clone()
+        child_val = child_node.component_data[ct].value
+        self.assertIsNotNone(child_val)
+        # Allocate REAL host slots for the mirror: cloning the device slot
+        # ids into host_value would later free indices the host pool never
+        # handed out when drop_subtree_no_host releases the host-only child.
+        host_idx = cache.cache_controller.mem_pool_host.alloc(2 * self.ps)
+        self.assertIsNotNone(host_idx, "host pool alloc failed")
+        child_node.component_data[ct].host_value = host_idx.to(dtype=torch.int64)
         self.assertTrue(child_node.backuped)
         self.assertFalse(parent.backuped)
 
         # Demote child to host-only, then evict the unbacked parent D-leaf.
         # drop_subtree_no_host cleans up the host-only child before deletion.
+        # Full LRU bookkeeping must reflect the demotion for sanity_check:
+        # value=None with host_value present belongs in the host LRU only,
+        # and the evictable-size counter must drop with the device layer.
         child_node.component_data[ct].value = None
+        cache.tree_core.remove_node_from_device_lru(child_node, ct)
+        cache.tree_core.insert_node_into_host_lru(child_node, ct)
+        cache.tree_core.set_component_evictable_size(
+            ct,
+            cache.tree_core.component_evictable_size(ct) - len(child_val),
+        )
         cache.tree_core._update_evictable_leaf_sets(child_node)
         cache.tree_core._update_evictable_leaf_sets(parent)
         cache.evict(EvictParams(num_tokens=3 * self.ps))
@@ -8634,13 +8669,35 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
         # which is expected here since we bypassed the normal eviction cleanup.
 
     def test_dropped_prefetch_releases_all_host_resources(self):
-        """The caller owns every completed buffer when host insertion drops."""
+        """The caller owns every completed buffer when host insertion drops.
+
+        The anchor is made a dead node (device KV cleared, no host mirror)
+        so the insert_host guard takes the drop branch; the kept-graft path
+        is covered by test_prefetch_refill_kept_under_live_unbacked_parent.
+        """
         cache, allocator, _ = build_fixture(self.cfg)
         self._init_hicache(cache)
 
         parent_id = self._insert_device(
             cache, allocator, list(range(1, 1 + 3 * self.ps))
         )
+        # Turn the parent into a dead node: with the guard aligned to the
+        # match-walk dead-node check (evicted + not backuped -> drop), a
+        # merely unbacked parent would keep the graft and commit transfers.
+        parent = cache.tree_core.node_by_id(parent_id)
+        ct = ComponentType.FULL
+        parent_val = parent.component_data[ct].value
+        self.assertIsNotNone(parent_val)
+        parent.component_data[ct].value = None
+        cache.tree_core.remove_node_from_device_lru(parent, ct)
+        cache.tree_core.set_component_evictable_size(
+            ct,
+            cache.tree_core.component_evictable_size(ct) - len(parent_val),
+        )
+        cache.tree_core._update_evictable_leaf_sets(parent)
+        self.assertTrue(parent.evicted)
+        self.assertFalse(parent.backuped)
+
         prefetch_key = RadixKey(
             array("q", list(range(1000, 1000 + 2 * self.ps)))
         ).page_aligned(self.ps)
@@ -8731,7 +8788,10 @@ class TestUnifiedRadixPrefetchCorruption(CustomTestCase):
         self.assertIs(drop_releases[0].kwargs["extra_pools"][0], swa_transfer)
         self.assertIs(drop_releases[0].kwargs["extra_pools"][1], mamba_transfer)
 
-        cache.sanity_check()
+        # NOTE: sanity_check is intentionally omitted — the manually-constructed
+        # dead anchor violates the "every node must keep Full data on at least
+        # one layer" invariant (L2166), which is expected here since we bypassed
+        # the normal eviction cleanup that would have deleted it.
 
     def test_prefetch_refill_leaves_eviction_path_uncorrupted(self):
         """Write-through: eviction after a kept refill must not corrupt the tree.
