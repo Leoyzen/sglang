@@ -292,11 +292,13 @@ class SWAComponent(TreeComponent):
                 state["len"] = 0
                 if swa_device_only_hicache and (node.backuped or not node.evicted):
                     return True
-                # Fail-soft: a backuped node whose SWA was never backed up to
-                # L3 (tombstoned before backup) still has Full KV on host.
-                # Treat it as a valid match boundary — SWA will be rebuilt
-                # from Full KV at load-back via SWARebuild/RecoverSWAWithLockedFull.
-                if node.backuped:
+                # Fail-soft: a backuped node whose SWA is absent on *both*
+                # layers (device tombstone plus no L3 backup — the hole a
+                # degraded prefetch can graft) still has Full KV on host.
+                # Treat only that case as a valid match boundary — SWA will
+                # be rebuilt from Full KV at load-back via
+                # SWARebuild/RecoverSWAWithLockedFull.
+                if cd.host_value is None and node.backuped:
                     return True
                 return False
             state["len"] += len(node.key)
