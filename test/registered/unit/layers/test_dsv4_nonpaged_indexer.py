@@ -72,7 +72,7 @@ class TestDSV4PagedIndexerMetadata(CustomTestCase):
 
 
 class TestDSV4TopKDispatch(CustomTestCase):
-    def test_v2_raw_output_uses_sparse_prefill_buffer_with_capture(self):
+    def test_sparse_prefill_raw_output_with_capture_routes_through_v1(self):
         page_table = torch.zeros((1, 1), dtype=torch.int32)
         c4_seq_lens = torch.ones(1, dtype=torch.int32)
         page_indices = torch.full((1, 512), -1, dtype=torch.int32)
@@ -134,16 +134,20 @@ class TestDSV4TopKDispatch(CustomTestCase):
                 forward_batch=SimpleNamespace(forward_mode=ForwardMode.EXTEND),
             )
 
-        topk_v2.assert_called_once_with(
+        # topk_transform_512_v2 has no raw-index output parameter (upstream
+        # #33672 proposes one but is still open and would need kernel/wrapper
+        # support), so a non-None c4_sparse_raw_indices buffer routes through
+        # the v1 transform, which takes the raw buffer natively. The capturer
+        # still observes the same buffer afterwards.
+        topk_v1.assert_called_once_with(
             logits,
             c4_seq_lens,
             page_table,
             page_indices,
             64,
-            topk_metadata,
             raw_indices,
         )
-        topk_v1.assert_not_called()
+        topk_v2.assert_not_called()
         indexer_capturer.capture.assert_called_once_with(7, raw_indices)
 
 
