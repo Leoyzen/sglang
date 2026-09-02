@@ -115,6 +115,11 @@ class TestDSV4TopKDispatch(CustomTestCase):
             envs.SGLANG_OPT_USE_AITER_INDEXER.override(False),
             envs.SGLANG_FP8_PAGED_MQA_LOGITS_TORCH.override(True),
             envs.SGLANG_OPT_USE_TOPK_V2.override(True),
+            # forward_c4_indexer reads get_parallel().attn_cp_size (the
+            # CP gate at the chunking guard); the parallel namespace is
+            # only published by a real runtime, so pin the non-CP width
+            # here like _is_eligible does below.
+            get_parallel().override(attn_cp_size=1),
             patch(
                 f"{_INDEXER}.get_global_indexer_capturer",
                 return_value=indexer_capturer,
