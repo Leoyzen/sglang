@@ -1023,6 +1023,32 @@ def cutlass_w8a8_block_fp8_linear_with_fallback(
     return output.to(dtype=input_2d.dtype).view(*output_shape)
 
 
+# DeepGEMM runtime failures (e.g. lazy JIT nvcc compile failing inside a
+# long-running scheduler process, or NVRTC image errors) must degrade to the
+# triton path instead of killing the engine. Log once per weight shape.
+_DEEPGEMM_W8A8_FAILURE_LATCH: set = set()
+
+
+def _w8a8_block_fp8_triton_fallback(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    block_size: List[int],
+    weight_scale: torch.Tensor,
+    input_scale: Optional[torch.Tensor] = None,
+    bias: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    # If weight_scale is in UE8M0 packed format (int32), convert back to float32
+    # UE8M0 format has shape (N, K//block_k//4) with dtype int32
+    # Triton expects shape (N//block_n, K//block_k) with dtype float32
+    if weight_scale is not None and weight_scale.dtype == torch.int32:
+        weight_scale = _unpack_ue8m0_scale_for_triton(
+            weight_scale, weight.shape, block_size
+        )
+    return triton_w8a8_block_fp8_linear(
+        input, weight, block_size, weight_scale, input_scale, bias
+    )
+
+
 def deepgemm_w8a8_block_fp8_linear_with_fallback(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -1047,14 +1073,30 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
             f"(got {tuple(weight.shape)})"
         )
         input_2d = input.view(-1, input.shape[-1])
-        output = w8a8_block_fp8_matmul_deepgemm(
-            input_2d,
-            weight,
-            input_scale,
-            weight_scale,
-            block_size,
-            output_dtype=torch.bfloat16,
-        )
+        try:
+            output = w8a8_block_fp8_matmul_deepgemm(
+                input_2d,
+                weight,
+                input_scale,
+                weight_scale,
+                block_size,
+                output_dtype=torch.bfloat16,
+            )
+        except Exception as e:
+            if tuple(weight.shape) not in _DEEPGEMM_W8A8_FAILURE_LATCH:
+                _DEEPGEMM_W8A8_FAILURE_LATCH.add(tuple(weight.shape))
+                logger.exception(
+                    "DeepGEMM w8a8 GEMM failed on the pre-quantized path "
+                    "(weight shape %s, input shape %s); this shape now falls "
+                    "back to triton. Error: %s: %s",
+                    tuple(weight.shape),
+                    tuple(input.shape),
+                    type(e).__name__,
+                    e,
+                )
+            return _w8a8_block_fp8_triton_fallback(
+                input, weight, block_size, weight_scale, input_scale, bias
+            )
         if bias is not None:
             output += bias
         return output.view(*input.shape[:-1], weight.shape[0])
@@ -1065,16 +1107,13 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
     # TODO: https://github.com/sgl-project/sglang/pull/6890#issuecomment-2943395737
     shape_supported = weight.shape[0] % 64 == 0 and weight.shape[1] % 128 == 0
 
-    if not (shape_supported and dtype_supported):
-        # fall back to triton
-        # If weight_scale is in UE8M0 packed format (int32), convert back to float32
-        # UE8M0 format has shape (N, K//block_k//4) with dtype int32
-        # Triton expects shape (N//block_n, K//block_k) with dtype float32
-        if weight_scale.dtype == torch.int32:
-            weight_scale = _unpack_ue8m0_scale_for_triton(
-                weight_scale, weight.shape, block_size
-            )
-        return triton_w8a8_block_fp8_linear(
+    if (
+        not (shape_supported and dtype_supported)
+        or not deep_gemm_wrapper.ENABLE_JIT_DEEPGEMM
+    ):
+        # fall back to triton (also when DeepGEMM is disabled, so this path
+        # never trips the ENABLE_JIT_DEEPGEMM assert in the deepgemm kernel)
+        return _w8a8_block_fp8_triton_fallback(
             input, weight, block_size, weight_scale, input_scale, bias
         )
 
@@ -1095,9 +1134,37 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
             block_size[1],
         )
 
-    output = w8a8_block_fp8_matmul_deepgemm(
-        q_input, weight, x_scale, weight_scale, block_size, output_dtype=output_dtype
-    )
+    try:
+        output = w8a8_block_fp8_matmul_deepgemm(
+            q_input,
+            weight,
+            x_scale,
+            weight_scale,
+            block_size,
+            output_dtype=output_dtype,
+        )
+    except Exception as e:
+        # A DeepGEMM failure here is typically a lazy JIT nvcc/NVRTC compile
+        # error inside a long-running scheduler process (e.g. dspark
+        # CommitKvProj hitting an uncovered block config at runtime).
+        # Degrade this call to the triton path instead of killing the engine.
+        if tuple(weight.shape) not in _DEEPGEMM_W8A8_FAILURE_LATCH:
+            _DEEPGEMM_W8A8_FAILURE_LATCH.add(tuple(weight.shape))
+            logger.exception(
+                "DeepGEMM w8a8 GEMM failed (weight shape %s, input shape %s); "
+                "this shape now falls back to triton. Error: %s: %s",
+                tuple(weight.shape),
+                tuple(input.shape),
+                type(e).__name__,
+                e,
+            )
+        return (
+            _w8a8_block_fp8_triton_fallback(
+                input, weight, block_size, weight_scale, input_scale, bias
+            )
+            .to(dtype=output_dtype)
+            .view(*output_shape)
+        )
     if bias is not None:
         output += bias
     return output.to(dtype=output_dtype).view(*output_shape)
