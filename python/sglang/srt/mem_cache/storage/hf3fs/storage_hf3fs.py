@@ -519,6 +519,8 @@ class HiCacheHF3FS(HiCacheStorage):
     def batch_exists(
         self, keys: List[str], extra_info: Optional[HiCacheStorageExtraInfo] = None
     ) -> int:
+        if getattr(self, "_logical_anchor", False):
+            return len(keys)
         factor = 1
         if self.mha_zero_copy:
             keys = self._get_mha_zero_copy_keys(keys)
@@ -567,6 +569,10 @@ class HiCacheHF3FS(HiCacheStorage):
 
     def register_mem_pool_host(self, mem_pool_host: HostKVCache):
         super().register_mem_pool_host(mem_pool_host)
+        # DeepSeek-V4's primary KV pool is a logical anchor.  Its physical
+        # compressed pools are registered through the v2 API below, so the v1
+        # anchor operations must not try to read/write an empty KV page.
+        self._logical_anchor = getattr(self.mem_pool_host, "kv_buffer", None) is None
         self.is_zero_copy = self.mem_pool_host.layout in [
             "page_first",
             "page_first_direct",
@@ -885,6 +891,8 @@ class HiCacheHF3FS(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
+        if getattr(self, "_logical_anchor", False):
+            return [True] * len(keys)
         keys, values = self._batch_get_preprocess(keys, host_indices)
         results = self._batch_get(keys, values)
         return self._batch_get_postprocess(host_indices, values, results)
@@ -912,7 +920,8 @@ class HiCacheHF3FS(HiCacheStorage):
         host_indices: torch.Tensor,
         extra_info: Optional[HiCacheStorageExtraInfo] = None,
     ) -> List[bool]:
-        len_keys = len(keys)
+        if getattr(self, "_logical_anchor", False):
+            return [True] * len(keys)
         keys, values = self._batch_set_preprocess(keys, host_indices)
         results = self._batch_set(keys, values)
         return results
