@@ -109,9 +109,7 @@ class SchedulerLoadInquirer:
         elif self.disaggregation_mode == DisaggregationMode.DECODE:
             decode_prealloc_queue = self.get_disagg_decode_prealloc_queue().queue
             decode_transfer_queue = self.get_disagg_decode_transfer_queue().queue
-            decode_retracted_queue = (
-                self.get_disagg_decode_prealloc_queue().retracted_queue
-            )
+            decode_retracted_queue = self.get_disagg_decode_prealloc_queue().retracted_queue
             waiting_queues.append(decode_prealloc_queue)
             waiting_queues.append(decode_transfer_queue)
             waiting_queues.append(decode_retracted_queue)
@@ -120,44 +118,28 @@ class SchedulerLoadInquirer:
             # slots, so they are already included in num_used_tokens.
             pending_token_queues = [decode_prealloc_queue, decode_retracted_queue]
             # KV not yet arrived from the prefill side.
-            awaiting_kv_tokens = sum(
-                req.seqlen
-                for queue in (decode_prealloc_queue, decode_transfer_queue)
-                for req in queue
-            )
+            awaiting_kv_tokens = sum(req.seqlen for queue in (decode_prealloc_queue, decode_transfer_queue) for req in queue)
 
         num_waiting_reqs = sum(len(queue) for queue in waiting_queues)
-        num_used_tokens, kv_token_usage = (
-            self.pool_stats_observer.get_pool_stats().get_kv_token_stats()
-        )
-        num_total_tokens = num_used_tokens + sum(
-            req.seqlen for queue in pending_token_queues for req in queue
-        )
+        num_used_tokens, kv_token_usage = self.pool_stats_observer.get_pool_stats().get_kv_token_stats()
+        num_total_tokens = num_used_tokens + sum(req.seqlen for queue in pending_token_queues for req in queue)
         num_active_tokens = max(0, num_total_tokens - awaiting_kv_tokens)
 
         memory = None
         try:
             memory = MemoryMetrics(
                 weight_gb=round(self.tp_worker.model_runner.weight_load_mem_usage, 3),
-                kv_cache_gb=round(
-                    self.token_to_kv_pool_allocator.get_kvcache().mem_usage, 3
-                ),
+                kv_cache_gb=round(self.token_to_kv_pool_allocator.get_kvcache().mem_usage, 3),
                 graph_gb=round(sum(self.tp_worker.graph_memory_usage.values()), 3),
-                token_capacity=int(self.max_total_num_tokens),
+                token_capacity=int(self.max_total_num_tokens * self.server_args.dcp_size),
             )
         except (AttributeError, TypeError) as e:
             logger.debug(f"Memory metrics not available: {e}")
 
         speculative = None
-        if (
-            not self.spec_algorithm.is_none()
-            and self.get_spec_total_num_forward_ct() > 0
-        ):
+        if not self.spec_algorithm.is_none() and self.get_spec_total_num_forward_ct() > 0:
             speculative = SpeculativeMetrics(
-                accept_length=(
-                    self.get_spec_total_num_accept_tokens()
-                    / self.get_spec_total_num_forward_ct()
-                ),
+                accept_length=(self.get_spec_total_num_accept_tokens() / self.get_spec_total_num_forward_ct()),
                 accept_rate=stats.spec_accept_rate,
             )
 
@@ -182,14 +164,8 @@ class SchedulerLoadInquirer:
             mode_str = "decode"
             decode_prealloc = len(self.get_disagg_decode_prealloc_queue().queue)
             decode_transfer = len(self.get_disagg_decode_transfer_queue().queue)
-            decode_retracted = len(
-                self.get_disagg_decode_prealloc_queue().retracted_queue
-            )
-            ready_reqs = [
-                decode_req.req
-                for decode_req in self.get_disagg_decode_prealloc_queue().queue
-                if decode_req.waiting_for_input
-            ]
+            decode_retracted = len(self.get_disagg_decode_prealloc_queue().retracted_queue)
+            ready_reqs = [decode_req.req for decode_req in self.get_disagg_decode_prealloc_queue().queue if decode_req.waiting_for_input]
             decode_prealloc_ready = len(ready_reqs)
             num_prealloc_ready_tokens = sum(req.seqlen for req in ready_reqs)
         disaggregation = DisaggregationMetrics(

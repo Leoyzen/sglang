@@ -55,17 +55,13 @@ def dcp_enabled() -> bool:
 
 def get_attention_dcp_world_size() -> int:
     """Deprecated: use ``get_parallel().attn_dcp_size``."""
-    _warn_deprecated_dcp_accessor(
-        "get_attention_dcp_world_size()", "get_parallel().attn_dcp_size"
-    )
+    _warn_deprecated_dcp_accessor("get_attention_dcp_world_size()", "get_parallel().attn_dcp_size")
     return get_parallel().attn_dcp_size
 
 
 def get_attention_dcp_rank() -> int:
     """Deprecated: use ``get_parallel().attn_dcp_rank``."""
-    _warn_deprecated_dcp_accessor(
-        "get_attention_dcp_rank()", "get_parallel().attn_dcp_rank"
-    )
+    _warn_deprecated_dcp_accessor("get_attention_dcp_rank()", "get_parallel().attn_dcp_rank")
     return get_parallel().attn_dcp_rank
 
 
@@ -75,9 +71,7 @@ def _ag_lse(cp_attn_lse: torch.Tensor, cp_group: GroupCoordinator) -> torch.Tens
     Shared prologue of both ``cp_lse_ag_out_rs_{mha,mla}``. Callers do their own
     pre-processing (``contiguous()`` for MHA, fp32 cast for MLA) before calling.
     """
-    return cp_group.all_gather(cp_attn_lse, dim=0).view(
-        (cp_group.world_size,) + cp_attn_lse.shape
-    )
+    return cp_group.all_gather(cp_attn_lse, dim=0).view((cp_group.world_size,) + cp_attn_lse.shape)
 
 
 def cp_lse_ag_out_rs_mha(
@@ -133,9 +127,7 @@ def cp_lse_ag_out_rs_mla(
 
     with use_symmetric_memory(cp_group):
         # cp_attn_out is [B,H,D], we want to transpose it to [H,B,D] for the kernel, and then transpose back after correction.
-        new_output = cp_attn_out.new_empty(
-            cp_attn_out.transpose(0, 1).shape, dtype=torch.float32
-        )
+        new_output = cp_attn_out.new_empty(cp_attn_out.transpose(0, 1).shape, dtype=torch.float32)
         cp_attn_lse = cp_attn_lse.to(torch.float32)
     lses = _ag_lse(cp_attn_lse, cp_group)
     out, _ = correct_attn_out(
@@ -160,16 +152,10 @@ def _all_gather_dcp_kv_cache(kv_a: torch.Tensor):
     # pynccl has no fp8 dtype; all-gather is a byte copy, so transport an fp8 KV
     # cache as raw bytes via a uint8 view (works with --kv-cache-dtype fp8_*).
     if kv_a.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-        parallel.dcp_group.all_gather_into_tensor(
-            gathered_kv_a.view(torch.uint8), kv_a.contiguous().view(torch.uint8)
-        )
+        parallel.dcp_group.all_gather_into_tensor(gathered_kv_a.view(torch.uint8), kv_a.contiguous().view(torch.uint8))
     else:
         parallel.dcp_group.all_gather_into_tensor(gathered_kv_a, kv_a)
-    gathered_kv_a = (
-        gathered_kv_a.reshape((dcp_world_size,) + kv_a.shape)
-        .transpose(0, 1)
-        .reshape(-1, *kv_a.shape[1:])
-    )
+    gathered_kv_a = gathered_kv_a.reshape((dcp_world_size,) + kv_a.shape).transpose(0, 1).reshape(-1, *kv_a.shape[1:])
     return gathered_kv_a
 
 
@@ -203,18 +189,14 @@ def all_gather_kv_cache_for_mha_extend(
     kv_a: torch.Tensor,
     k_pe: torch.Tensor,
 ):
-    prefix_kv_a, prefix_k_pe = token_to_kv_pool.get_mla_kv_buffer(
-        attn_mqa, dcp_local_prefix_kv_indices, dst_dtype=kv_a.dtype
-    )
+    prefix_kv_a, prefix_k_pe = token_to_kv_pool.get_mla_kv_buffer(attn_mqa, dcp_local_prefix_kv_indices, dst_dtype=kv_a.dtype)
     extend_prefix_lens_cpu = torch.tensor(extend_prefix_lens_cpu)
     gathered_kv_cache = all_gather_kv_cache_for_dcp(
         prefix_kv_a,
         prefix_k_pe,
         extend_prefix_lens_cpu,
     )
-    prefix_kv_a, prefix_k_pe = gathered_kv_cache.split(
-        [kv_a.shape[-1], k_pe.shape[-1]], dim=-1
-    )
+    prefix_kv_a, prefix_k_pe = gathered_kv_cache.split([kv_a.shape[-1], k_pe.shape[-1]], dim=-1)
     prefix_kv_a = prefix_kv_a.squeeze(1)
     # torch.cat can't promote fp8 (gathered prefix) + bf16 (current extend), so
     # align dtypes first (dequant the fp8 prefix; exact for the scale=1.0 default).
@@ -247,17 +229,43 @@ def all_gather_kv_cache_for_mha_extend(
     return kv_a.contiguous(), k_pe.contiguous()
 
 
+def alloc_dcp_q_combine_buf(
+    q_nope: torch.Tensor,
+    num_heads: int,
+    d_pe: int,
+    d_nope: int,
+) -> torch.Tensor:
+    """Pre-allocate the ``[H, B, d_pe + d_nope]`` buffer an upcoming
+    ``all_gather_q_for_mla_decode`` will gather, from the symmetric-memory
+    pool. Callers write the q_nope bmm's output directly into the returned
+    buffer's ``[..., d_pe:]`` slice via ``out=``, so only q_pe still needs
+    copying in later — no separate concat of the two.
+    """
+    group = get_parallel().dcp_group
+    with use_symmetric_memory(group):
+        return q_nope.new_empty((num_heads, q_nope.shape[0], d_pe + d_nope))
+
+
 def all_gather_q_for_mla_decode(
     q_nope_out: torch.Tensor,
     q_pe: torch.Tensor,
+    combined_buf: Optional[torch.Tensor] = None,
 ):
+    # q_nope_out arrives as [H, B, L] (its bmm's native layout; callers skip
+    # transposing it to [B, H, L] and back just to undo that here). q_pe is
+    # [B, H, L] and needs the transpose.
     group = get_parallel().dcp_group
-    with use_symmetric_memory(group):
-        # transpose q_pe and q_nope_out from [B, H, L] to [H, B, L]
-        combined = torch.cat([q_pe.transpose(0, 1), q_nope_out.transpose(0, 1)], dim=-1)
-    gathered = group.all_gather(combined, dim=0)
     d_pe = q_pe.size(-1)
     d_nope = q_nope_out.size(-1)
+    if combined_buf is not None:
+        # q_nope_out is already this buffer's [..., d_pe:] slice (written by
+        # the caller's bmm out=); only q_pe needs to land in the pool.
+        combined_buf[..., :d_pe].copy_(q_pe.transpose(0, 1))
+        combined = combined_buf
+    else:
+        with use_symmetric_memory(group):
+            combined = torch.cat([q_pe.transpose(0, 1), q_nope_out], dim=-1)
+    gathered = group.all_gather(combined, dim=0)
     q_pe, q_nope_out = gathered.split([d_pe, d_nope], dim=-1)
     q_pe = q_pe.transpose(0, 1)
     q_nope_out = q_nope_out.transpose(0, 1)
@@ -324,13 +332,9 @@ def all_gather_kv_cache_for_dcp(
 
     left_pads = prefix_starts_cpu % dcp_world_size > dcp_rank
     left_pads = left_pads.to(torch.int32)
-    right_pads = (
-        prefix_starts_cpu + prefix_kv_lens_cpu - 1
-    ) % dcp_world_size < dcp_rank
+    right_pads = (prefix_starts_cpu + prefix_kv_lens_cpu - 1) % dcp_world_size < dcp_rank
     right_pads = right_pads.to(torch.int32)
-    padded_lens = (
-        prefix_kv_lens_cpu + (prefix_starts_cpu % dcp_world_size) + dcp_world_size - 1
-    ) // dcp_world_size
+    padded_lens = (prefix_kv_lens_cpu + (prefix_starts_cpu % dcp_world_size) + dcp_world_size - 1) // dcp_world_size
 
     local_kv_lens = padded_lens - left_pads - right_pads
     local_kv_lens_cu = torch.zeros(
@@ -342,12 +346,8 @@ def all_gather_kv_cache_for_dcp(
     padded_kv_cache_arr = []
     prefix_kv_cache = torch.cat([prefix_kv_a, prefix_k_pe], dim=-1)
     for req_idx in range(len(prefix_kv_lens_cpu)):
-        padded_tensor = prefix_kv_cache.new_empty(
-            (padded_lens[req_idx].item(),) + prefix_kv_cache.size()[1:]
-        )
-        padded_tensor[
-            left_pads[req_idx] : left_pads[req_idx] + local_kv_lens[req_idx]
-        ] = prefix_kv_cache[local_kv_lens_cu[req_idx] : local_kv_lens_cu[req_idx + 1]]
+        padded_tensor = prefix_kv_cache.new_empty((padded_lens[req_idx].item(),) + prefix_kv_cache.size()[1:])
+        padded_tensor[left_pads[req_idx] : left_pads[req_idx] + local_kv_lens[req_idx]] = prefix_kv_cache[local_kv_lens_cu[req_idx] : local_kv_lens_cu[req_idx + 1]]
         padded_kv_cache_arr.append(padded_tensor)
 
     padded_kv_cache = torch.cat(padded_kv_cache_arr, dim=0)
@@ -362,12 +362,7 @@ def all_gather_kv_cache_for_dcp(
     padded_lens_cu[1:] = torch.cumsum(padded_lens, dim=0)
     kv_cache_tuple = ()
     for req_idx in range(len(prefix_kv_lens_cpu)):
-        kv_cache_tuple += (
-            gatherd_kv_cache[
-                padded_lens_cu[req_idx] * dcp_world_size
-                + (prefix_starts_cpu[req_idx] % dcp_world_size) :
-            ][: prefix_kv_lens_cpu[req_idx]],
-        )
+        kv_cache_tuple += (gatherd_kv_cache[padded_lens_cu[req_idx] * dcp_world_size + (prefix_starts_cpu[req_idx] % dcp_world_size) :][: prefix_kv_lens_cpu[req_idx]],)
     gatherd_kv_cache = torch.cat(kv_cache_tuple, dim=0)
 
     return gatherd_kv_cache
@@ -403,11 +398,7 @@ def init_fi_a2a_workspace(cp_group: "GroupCoordinator") -> None:
         from flashinfer.comm.mapping import Mapping
         from flashinfer.comm.mnnvl import MnnvlConfig, is_mnnvl_fabric_supported
     except ImportError as e:
-        raise ImportError(
-            "--dcp-comm-backend fi_a2a requires FlashInfer with the DCP "
-            "all-to-all kernel (flashinfer #2951); could not import "
-            "flashinfer.comm.dcp_alltoall."
-        ) from e
+        raise ImportError("--dcp-comm-backend fi_a2a requires FlashInfer with the DCP all-to-all kernel (flashinfer #2951); could not import flashinfer.comm.dcp_alltoall.") from e
 
     # Reuse the MoE adapter: its Split() returns a CommBackend (what FlashInfer's
     # Mapping expects); the flashinfer_comm_fusion copy has drifted to return a
@@ -435,9 +426,7 @@ def init_fi_a2a_workspace(cp_group: "GroupCoordinator") -> None:
     )
     workspace = decode_cp_a2a_allocate_mnnvl_workspace(
         mapping,
-        mnnvl_config=MnnvlConfig(
-            comm_backend=TorchDistributedCommBackend(cp_group.device_group)
-        ),
+        mnnvl_config=MnnvlConfig(comm_backend=TorchDistributedCommBackend(cp_group.device_group)),
     )
     decode_cp_a2a_init_workspace(workspace, cp_rank, cp_size)
     # REQUIRED barrier before the first alltoall: every rank must finish init,
@@ -466,9 +455,7 @@ def dcp_a2a_lse_reduce(
         return cp_attn_out
 
     if comm_backend == "fi_a2a":
-        return _dcp_fi_a2a_lse_reduce(
-            cp_attn_out, cp_attn_lse, cp_group, is_lse_base_on_e
-        )
+        return _dcp_fi_a2a_lse_reduce(cp_attn_out, cp_attn_lse, cp_group, is_lse_base_on_e)
 
     N = cp_group.world_size
     B, H, D = cp_attn_out.shape
@@ -509,9 +496,7 @@ def dcp_a2a_lse_reduce(
     recv_output = recv_combined[:, :B, :, :D]
     recv_lse = recv_combined.view(torch.float32)[:, :B, :, D // lpd]
 
-    combined, _ = dcp_lse_combine_triton(
-        recv_output, recv_lse, is_lse_base_on_e=is_lse_base_on_e
-    )
+    combined, _ = dcp_lse_combine_triton(recv_output, recv_lse, is_lse_base_on_e=is_lse_base_on_e)
     return combined
 
 
@@ -529,10 +514,7 @@ def _dcp_fi_a2a_lse_reduce(
     from flashinfer.comm.dcp_alltoall import decode_cp_a2a_alltoall
 
     state = _FI_A2A_STATE
-    assert state is not None, (
-        "fi_a2a workspace not initialized — call init_fi_a2a_workspace(dcp_group) "
-        "at model-runner init (before CUDA graph capture)."
-    )
+    assert state is not None, "fi_a2a workspace not initialized — call init_fi_a2a_workspace(dcp_group) at model-runner init (before CUDA graph capture)."
 
     N = cp_group.world_size
     B, H, D = cp_attn_out.shape
@@ -542,12 +524,8 @@ def _dcp_fi_a2a_lse_reduce(
     # Note(kpham-sgl): empty(), not zeros() -- the pack below fills partial_o and
     # stats slot 0, and slot 1 is never read by anyone. The a2a moves the stats
     # field as opaque bytes and we only ever read slot 0 back off the wire.
-    partial_o = torch.empty(
-        B, H_per_rank, N, D, dtype=cp_attn_out.dtype, device=cp_attn_out.device
-    )
-    softmax_stats = torch.empty(
-        B, H_per_rank, N, 2, dtype=torch.float32, device=cp_attn_out.device
-    )
+    partial_o = torch.empty(B, H_per_rank, N, D, dtype=cp_attn_out.dtype, device=cp_attn_out.device)
+    softmax_stats = torch.empty(B, H_per_rank, N, 2, dtype=torch.float32, device=cp_attn_out.device)
     dcp_pack_a2a_send(
         cp_attn_out,
         cp_attn_lse,
@@ -566,7 +544,5 @@ def _dcp_fi_a2a_lse_reduce(
     recv_output = o_out.permute(2, 0, 1, 3)
     recv_lse = stats_out[..., 0].permute(2, 0, 1)
 
-    combined, _ = dcp_lse_combine_triton(
-        recv_output, recv_lse, is_lse_base_on_e=is_lse_base_on_e
-    )
+    combined, _ = dcp_lse_combine_triton(recv_output, recv_lse, is_lse_base_on_e=is_lse_base_on_e)
     return combined

@@ -35,38 +35,19 @@ def handle_context_parallelism(server_args: Any):
         hf_config = model_config.hf_config
         model_arch = hf_config.architectures[0]
         platform = get_platform()
-        if (
-            cfg.enable_prefill_cp
-            and model_arch == "DeepseekV32ForCausalLM"
-            and cfg.cp_strategy == "zigzag"
-            and not (platform.is_hip or platform.is_npu or platform.is_musa)
-        ):
-            raise ValueError(
-                "DeepSeek V3.2 prefill CP does not support --cp-strategy "
-                "zigzag; use interleave."
-            )
+        if cfg.enable_prefill_cp and model_arch == "DeepseekV32ForCausalLM" and cfg.cp_strategy == "zigzag" and not (platform.is_hip or platform.is_npu or platform.is_musa):
+            raise ValueError("DeepSeek V3.2 prefill CP does not support --cp-strategy zigzag; use interleave.")
         if cfg.enable_prefill_cp and model_arch in (
             "MiMoV2ForCausalLM",
             "MiMoV2FlashForCausalLM",
         ):
             if cfg.cp_strategy != "zigzag":
-                raise ValueError(
-                    "MiMo V2 prefill CP only supports --cp-strategy zigzag."
-                )
-            if (
-                model_config.is_multimodal
-                and not cfg.language_only
-                and not cfg.language_model_only
-            ):
-                raise ValueError(
-                    "MiMo V2 prefill CP only supports text inference; add "
-                    "--language-only."
-                )
+                raise ValueError("MiMo V2 prefill CP only supports --cp-strategy zigzag.")
+            if model_config.is_multimodal and not cfg.language_only and not cfg.language_model_only:
+                raise ValueError("MiMo V2 prefill CP only supports text inference; add --language-only.")
 
     if cfg.enable_prefill_cp and cfg.cp_strategy is None:
-        raise ValueError(
-            "--cp-strategy must be set when --enable-prefill-cp is enabled."
-        )
+        raise ValueError("--cp-strategy must be set when --enable-prefill-cp is enabled.")
 
     if cfg.enable_prefill_context_parallel and cfg.enable_dsa_prefill_context_parallel:
         raise ValueError(
@@ -81,40 +62,24 @@ def handle_context_parallelism(server_args: Any):
     view = resolved_view(server_args)
     if view.attn_cp_size > 1:
         # The tp_size is the world size, not the real tensor parallel size
-        assert cfg.tp_size % view.attn_cp_size == 0, (
-            "tp_size must be divisible by attn_cp_size"
-        )
-        assert cfg.tp_size % (cfg.dp_size * view.attn_cp_size) == 0, (
-            "tp_size must be divisible by dp_size * attn_cp_size"
-        )
+        assert cfg.tp_size % view.attn_cp_size == 0, "tp_size must be divisible by attn_cp_size"
+        assert cfg.tp_size % (cfg.dp_size * view.attn_cp_size) == 0, "tp_size must be divisible by dp_size * attn_cp_size"
 
-        assert not cfg.enable_aiter_allreduce_fusion, (
-            "Aiter allreduce fusion is not supported with context parallelism"
-        )
+        assert not cfg.enable_aiter_allreduce_fusion, "Aiter allreduce fusion is not supported with context parallelism"
 
     if cfg.moe_dp_size > 1:
         # The tp_size is the world size, not the real tensor parallel size
-        assert cfg.tp_size % cfg.moe_dp_size == 0, (
-            "tp_size must be divisible by moe_dp_size"
-        )
-        assert view.ep_size * cfg.moe_dp_size <= cfg.tp_size, (
-            "ep_size * moe_dp_size must be less than or equal to tp_size"
-        )
+        assert cfg.tp_size % cfg.moe_dp_size == 0, "tp_size must be divisible by moe_dp_size"
+        assert view.ep_size * cfg.moe_dp_size <= cfg.tp_size, "ep_size * moe_dp_size must be less than or equal to tp_size"
         assert cfg.pp_size == 1, "PP is not supported with context parallelism"
 
         if view.ep_size > 1:
-            assert view.ep_size * cfg.moe_dp_size == cfg.tp_size, (
-                "ep_size * moe_dp_size must be equal to tp_size"
-            )
+            assert view.ep_size * cfg.moe_dp_size == cfg.tp_size, "ep_size * moe_dp_size must be equal to tp_size"
 
-        assert not cfg.enable_aiter_allreduce_fusion, (
-            "Aiter allreduce fusion is not supported with context parallelism"
-        )
+        assert not cfg.enable_aiter_allreduce_fusion, "Aiter allreduce fusion is not supported with context parallelism"
 
     if view.attn_cp_size != cfg.moe_dp_size:
-        assert cfg.moe_dp_size == 1, (
-            "attn_cp_size != moe_dp_size is only supported when moe_dp_size == 1"
-        )
+        assert cfg.moe_dp_size == 1, "attn_cp_size != moe_dp_size is only supported when moe_dp_size == 1"
 
     from sglang.srt.layers.cp.base import init_cp_strategy
 
@@ -128,11 +93,7 @@ def handle_context_parallelism(server_args: Any):
 def handle_dcp_validation(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.dcp_size < 1:
-        raise ValueError(
-            "Decode context parallel size (--dcp-size / "
-            "--decode-context-parallel-size) must be >= 1, but got "
-            f"dcp_size={cfg.dcp_size}."
-        )
+        raise ValueError(f"Decode context parallel size (--dcp-size / --decode-context-parallel-size) must be >= 1, but got dcp_size={cfg.dcp_size}.")
     if cfg.dcp_comm_backend in ("a2a", "fi_a2a") and cfg.dcp_size <= 1:
         raise ValueError(
             f"--dcp-comm-backend {cfg.dcp_comm_backend} only affects the "
@@ -147,6 +108,13 @@ def handle_dcp_validation(server_args: Any):
             "with SM90+ and MNNVL fabric memory (e.g. GB200 NVL72). The "
             "authoritative fabric probe runs at model-runner init; use 'a2a' "
             "or 'ag_rs' on clusters without MNNVL."
+        )
+    if cfg.dcp_size > 1 and cfg.speculative_algorithm is not None and get_platform().is_cuda():
+        logger.warning(
+            "Decode context parallel (--dcp-size > 1) with "
+            "speculative decoding is experimental: validated for DSA "
+            "models (GLM-5.x EAGLE/nextn) on the default kernel "
+            "stack; the dense-MLA draft path is not implemented."
         )
     if cfg.dcp_replicate_q_proj:
         if cfg.dcp_size <= 1:
@@ -173,9 +141,7 @@ def handle_data_parallelism(server_args: Any):
     if cfg.mm_enable_dp_encoder:
         if cfg.tp_size == 1:
             logger.warning(
-                "--mm-enable-dp-encoder is enabled with TP=1, so the encoder "
-                "has no data-parallel work to distribute. Disable it unless "
-                "you need to validate this configuration."
+                "--mm-enable-dp-encoder is enabled with TP=1, so the encoder has no data-parallel work to distribute. Disable it unless you need to validate this configuration."
             )
         else:
             logger.info(
@@ -201,10 +167,7 @@ def handle_data_parallelism(server_args: Any):
             "_handle_data_parallelism",
             chunked_prefill_size=cfg.chunked_prefill_size // cfg.dp_size,
         )
-        logger.warning(
-            f"DP attention is enabled. chunked prefill size is adjusted "
-            f"from {original_chunked_prefill_size} to {cfg.chunked_prefill_size}."
-        )
+        logger.warning(f"DP attention is enabled. chunked prefill size is adjusted from {original_chunked_prefill_size} to {cfg.chunked_prefill_size}.")
 
         # The prefill CUDA graph max_bs was derived from the pre-DP-division
         # chunked_prefill_size in _handle_gpu_memory_settings (which runs
@@ -221,15 +184,11 @@ def handle_data_parallelism(server_args: Any):
         ):
             clamped = {"max_bs": cfg.chunked_prefill_size}
             if (Phase.PREFILL, "bs") not in server_args._cuda_graph_config_locked:
-                clamped["bs"] = generate_prefill_cuda_graph_batch_sizes(
-                    clamped["max_bs"]
-                )
+                clamped["bs"] = generate_prefill_cuda_graph_batch_sizes(clamped["max_bs"])
             declare_resolution(
                 server_args,
                 "_handle_data_parallelism",
-                cuda_graph_config=with_phase(
-                    cfg.cuda_graph_config, Phase.PREFILL, **clamped
-                ),
+                cuda_graph_config=with_phase(cfg.cuda_graph_config, Phase.PREFILL, **clamped),
             )
 
     # Resolve the phase-aware TP LM-head default before validating the
@@ -244,26 +203,16 @@ def handle_dwdp(server_args: Any):
     if cfg.dwdp_size <= 1:
         return
 
-    assert cfg.dwdp_size >= 2, (
-        f"dwdp_size must be >= 2 when enabled, got {cfg.dwdp_size}"
-    )
-    assert cfg.dwdp_size == cfg.tp_size, (
-        f"dwdp_size ({cfg.dwdp_size}) must equal tp_size ({cfg.tp_size})"
-    )
+    assert cfg.dwdp_size >= 2, f"dwdp_size must be >= 2 when enabled, got {cfg.dwdp_size}"
+    assert cfg.dwdp_size == cfg.tp_size, f"dwdp_size ({cfg.dwdp_size}) must equal tp_size ({cfg.tp_size})"
     assert cfg.disaggregation_mode in (
         "null",
         "prefill",
     ), "DWDP requires --disaggregation-mode null or prefill"
-    assert not cfg.enable_eplb, (
-        "EPLB dynamic migration conflicts with static DWDP partitioning"
-    )
-    assert cfg.speculative_algorithm is None, (
-        "DWDP does not support speculative decoding (MTP/draft workers)"
-    )
+    assert not cfg.enable_eplb, "EPLB dynamic migration conflicts with static DWDP partitioning"
+    assert cfg.speculative_algorithm is None, "DWDP does not support speculative decoding (MTP/draft workers)"
     assert cfg.pp_size == 1, "DWDP requires pp_size == 1"
-    assert not cfg.enable_two_batch_overlap, (
-        "DWDP's prefetch event protocol does not support two-batch overlap"
-    )
+    assert not cfg.enable_two_batch_overlap, "DWDP's prefetch event protocol does not support two-batch overlap"
 
     if cfg.disaggregation_mode == "null":
         logger.warning(
@@ -282,9 +231,7 @@ def handle_dwdp(server_args: Any):
         "_handle_dwdp",
         enable_dp_attention=True,
     )
-    declare_resolution(
-        server_args, "_handle_dwdp", enable_dp_attention_local_control_broadcast=True
-    )
+    declare_resolution(server_args, "_handle_dwdp", enable_dp_attention_local_control_broadcast=True)
     declare_resolution(
         server_args,
         "_handle_dwdp",
@@ -335,19 +282,14 @@ def handle_elastic_ep(server_args: Any):
     cfg = resolving_view(server_args)
     if cfg.elastic_ep_rejoin:
         if cfg.ep_join_mode is None:
-            logger.warning(
-                "--elastic-ep-rejoin is deprecated, use --elastic-ep-join-mode recover instead."
-            )
+            logger.warning("--elastic-ep-rejoin is deprecated, use --elastic-ep-join-mode recover instead.")
             declare_resolution(
                 server_args,
                 "_handle_elastic_ep",
                 ep_join_mode="recover",
             )
         else:
-            assert cfg.ep_join_mode == "recover", (
-                "--elastic-ep-rejoin (deprecated) conflicts with "
-                f"--elastic-ep-join-mode {cfg.ep_join_mode}."
-            )
+            assert cfg.ep_join_mode == "recover", f"--elastic-ep-rejoin (deprecated) conflicts with --elastic-ep-join-mode {cfg.ep_join_mode}."
     if cfg.elastic_ep_backend is not None:
         if cfg.enable_eplb:
             if cfg.eplb_algorithm == "auto":
@@ -359,9 +301,7 @@ def handle_elastic_ep(server_args: Any):
             assert cfg.eplb_algorithm in [
                 "elasticity_aware",
                 "elasticity_aware_hierarchical",
-            ], (
-                "Elastic EP requires eplb_algorithm to be set to 'auto' or 'elasticity_aware(_hierarchical)'."
-            )
+            ], "Elastic EP requires eplb_algorithm to be set to 'auto' or 'elasticity_aware(_hierarchical)'."
 
         assert cfg.pp_size == 1, "PP size should be set to 1 under elastic EP"
 
@@ -372,81 +312,40 @@ def handle_elastic_ep(server_args: Any):
                 mooncake_ib_device=validate_ib_devices(cfg.mooncake_ib_device),
             )
     if cfg.ep_join_mode is not None:
-        assert cfg.elastic_ep_backend is not None, (
-            "--elastic-ep-join-mode requires --elastic-ep-backend to be set."
-        )
+        assert cfg.elastic_ep_backend is not None, "--elastic-ep-join-mode requires --elastic-ep-backend to be set."
         if cfg.ep_join_mode == "scale":
-            assert cfg.node_rank == 1, (
-                "Elastic EP scale-up requires one joining TP group at "
-                f"--node-rank 1 (got {cfg.node_rank})."
-            )
-            assert cfg.ep_join_rank_offset > 0, (
-                "Elastic EP scale joiners require "
-                "--elastic-ep-join-rank-offset set to the current "
-                "effective EP size."
-            )
+            assert cfg.node_rank == 1, f"Elastic EP scale-up requires one joining TP group at --node-rank 1 (got {cfg.node_rank})."
+            assert cfg.ep_join_rank_offset > 0, "Elastic EP scale joiners require --elastic-ep-join-rank-offset set to the current effective EP size."
     if cfg.ep_join_rank_offset != 0:
-        assert cfg.ep_join_mode == "scale", (
-            "--elastic-ep-join-rank-offset is only valid with "
-            "--elastic-ep-join-mode scale."
-        )
+        assert cfg.ep_join_mode == "scale", "--elastic-ep-join-rank-offset is only valid with --elastic-ep-join-mode scale."
         assert cfg.ep_join_rank_offset >= 0, "elastic EP join rank offset must be >= 0."
     if cfg.max_ep_size is not None:
-        assert cfg.elastic_ep_backend is not None, (
-            "--max-ep-size requires --elastic-ep-backend to be set."
-        )
+        assert cfg.elastic_ep_backend is not None, "--max-ep-size requires --elastic-ep-backend to be set."
         assert cfg.max_ep_size > 0, "--max-ep-size must be a positive integer."
 
-    scaling_active = (
-        cfg.elastic_ep_backend is not None
-        and cfg.max_ep_size is not None
-        and cfg.max_ep_size > cfg.tp_size
-    )
+    scaling_active = cfg.elastic_ep_backend is not None and cfg.max_ep_size is not None and cfg.max_ep_size > cfg.tp_size
     if cfg.elastic_ep_initial_size is not None:
-        assert scaling_active, (
-            "--elastic-ep-initial-size is only valid for an Elastic EP "
-            "deployment with --max-ep-size larger than its local TP size."
-        )
+        assert scaling_active, "--elastic-ep-initial-size is only valid for an Elastic EP deployment with --max-ep-size larger than its local TP size."
     if scaling_active:
         resolved = resolved_view(server_args)
-        assert cfg.elastic_ep_scale_timeout > 0, (
-            "--elastic-ep-scale-timeout must be greater than zero."
-        )
-        assert cfg.tokenizer_worker_num == 1, (
-            "Elastic EP runtime scale-up currently requires --tokenizer-worker-num 1."
-        )
-        assert not cfg.use_ray, (
-            "Elastic EP runtime scale-up does not support --use-ray."
-        )
-        assert not cfg.enable_elastic_expert_backup, (
-            "Elastic EP runtime scale-up does not support "
-            "--enable-elastic-expert-backup."
-        )
+        assert cfg.elastic_ep_scale_timeout > 0, "--elastic-ep-scale-timeout must be greater than zero."
+        assert cfg.tokenizer_worker_num == 1, "Elastic EP runtime scale-up currently requires --tokenizer-worker-num 1."
+        assert not cfg.use_ray, "Elastic EP runtime scale-up does not support --use-ray."
+        assert not cfg.enable_elastic_expert_backup, "Elastic EP runtime scale-up does not support --enable-elastic-expert-backup."
         declare_resolution(
             server_args,
             "_handle_elastic_ep",
             enable_dp_attention_local_control_broadcast=True,
         )
         if cfg.ep_join_mode == "scale":
-            assert cfg.elastic_ep_initial_size is not None, (
-                "Elastic EP scale joiners require --elastic-ep-initial-size "
-                "set to the primary deployment's launch-time EP size."
-            )
+            assert cfg.elastic_ep_initial_size is not None, "Elastic EP scale joiners require --elastic-ep-initial-size set to the primary deployment's launch-time EP size."
             assert cfg.elastic_ep_initial_size <= cfg.ep_join_rank_offset, (
-                "--elastic-ep-initial-size cannot exceed the current EP size "
-                f"(initial={cfg.elastic_ep_initial_size}, "
-                f"current={cfg.ep_join_rank_offset})."
+                f"--elastic-ep-initial-size cannot exceed the current EP size (initial={cfg.elastic_ep_initial_size}, current={cfg.ep_join_rank_offset})."
             )
             join_target = cfg.ep_join_rank_offset + cfg.tp_size
-            assert join_target <= cfg.max_ep_size, (
-                "Elastic EP joining group exceeds --max-ep-size "
-                f"(join_target={join_target}, max_ep_size={cfg.max_ep_size})."
-            )
+            assert join_target <= cfg.max_ep_size, f"Elastic EP joining group exceeds --max-ep-size (join_target={join_target}, max_ep_size={cfg.max_ep_size})."
             if cfg.tp_size == 1:
-                assert cfg.moe_dense_tp_size == 1, (
-                    "A single-rank Elastic EP joining group requires "
-                    "--moe-dense-tp-size 1."
-                )
+                assert cfg.moe_dense_tp_size == 1, "A single-rank Elastic EP joining group requires --moe-dense-tp-size 1."
         else:
             if cfg.elastic_ep_initial_size is None:
                 declare_resolution(
@@ -454,66 +353,30 @@ def handle_elastic_ep(server_args: Any):
                     "_handle_elastic_ep",
                     elastic_ep_initial_size=cfg.tp_size,
                 )
-            assert cfg.elastic_ep_initial_size == cfg.tp_size, (
-                "The primary --elastic-ep-initial-size must equal its "
-                f"launch-time TP size ({cfg.tp_size})."
-            )
+            assert cfg.elastic_ep_initial_size == cfg.tp_size, f"The primary --elastic-ep-initial-size must equal its launch-time TP size ({cfg.tp_size})."
         assert cfg.elastic_ep_initial_size > 0
         assert cfg.load_balance_method == "round_robin", (
-            "Elastic EP scale-up requires --load-balance-method round_robin; "
-            "load-aware methods "
-            "require global-rank load snapshots after scale "
-            f"(got {cfg.load_balance_method})."
+            f"Elastic EP scale-up requires --load-balance-method round_robin; load-aware methods require global-rank load snapshots after scale (got {cfg.load_balance_method})."
         )
-        assert cfg.elastic_ep_backend == "mooncake", (
-            "Elastic EP runtime scale-up requires --elastic-ep-backend "
-            f"mooncake (got elastic_ep_backend={cfg.elastic_ep_backend})."
-        )
-        assert cfg.pp_size == 1, (
-            "Elastic EP scale-up requires --pp-size 1 "
-            f"(got pp_size={cfg.pp_size}); WORLD must not span PP stages."
-        )
+        assert cfg.elastic_ep_backend == "mooncake", f"Elastic EP runtime scale-up requires --elastic-ep-backend mooncake (got elastic_ep_backend={cfg.elastic_ep_backend})."
+        assert cfg.pp_size == 1, f"Elastic EP scale-up requires --pp-size 1 (got pp_size={cfg.pp_size}); WORLD must not span PP stages."
 
-        decode_cuda_graph_disabled = (
-            cfg.cuda_graph_config.decode.backend == Backend.DISABLED
-        )
-        prefill_cuda_graph_disabled = (
-            cfg.cuda_graph_config.prefill.backend == Backend.DISABLED
-        )
-        assert decode_cuda_graph_disabled and prefill_cuda_graph_disabled, (
-            "Elastic EP runtime scale-up requires decode and prefill CUDA "
-            "graphs to be disabled."
-        )
+        decode_cuda_graph_disabled = cfg.cuda_graph_config.decode.backend == Backend.DISABLED
+        prefill_cuda_graph_disabled = cfg.cuda_graph_config.prefill.backend == Backend.DISABLED
+        assert decode_cuda_graph_disabled and prefill_cuda_graph_disabled, "Elastic EP runtime scale-up requires decode and prefill CUDA graphs to be disabled."
         assert resolved.enable_dp_attention, (
-            "Elastic EP scale-up requires --enable-dp-attention; without it "
-            "the TP group is not equivalent to WORLD and the post-scale "
-            "collective path is invalid."
+            "Elastic EP scale-up requires --enable-dp-attention; without it the TP group is not equivalent to WORLD and the post-scale collective path is invalid."
         )
-        assert resolved.enable_dp_lm_head, (
-            "Elastic EP scale-up requires --enable-dp-lm-head so output "
-            "projection does not depend on the joining group's TP size."
-        )
-        assert resolved.attn_cp_size == 1, (
-            "Elastic EP scale-up requires --attn-cp-size 1 "
-            f"(got attn_cp_size={resolved.attn_cp_size})."
-        )
-        assert cfg.moe_dp_size == 1, (
-            "Elastic EP scale-up requires --moe-dp-size 1 "
-            f"(got moe_dp_size={cfg.moe_dp_size})."
-        )
+        assert resolved.enable_dp_lm_head, "Elastic EP scale-up requires --enable-dp-lm-head so output projection does not depend on the joining group's TP size."
+        assert resolved.attn_cp_size == 1, f"Elastic EP scale-up requires --attn-cp-size 1 (got attn_cp_size={resolved.attn_cp_size})."
+        assert cfg.moe_dp_size == 1, f"Elastic EP scale-up requires --moe-dp-size 1 (got moe_dp_size={cfg.moe_dp_size})."
         assert resolved.ep_size == cfg.tp_size, (
             "Elastic EP scale-up requires ep_size == tp_size "
             f"(got ep_size={resolved.ep_size}, tp_size={cfg.tp_size}); EP, TP "
             "and the attention DP group must all coincide with WORLD."
         )
-        assert cfg.dp_size == cfg.tp_size, (
-            "Elastic EP scale-up requires dp_size == tp_size "
-            f"(got dp_size={cfg.dp_size}, tp_size={cfg.tp_size})."
-        )
-        assert resolved.moe_a2a_backend == "nixl", (
-            "Elastic EP scale-up requires --moe-a2a-backend nixl "
-            f"(got moe_a2a_backend={resolved.moe_a2a_backend})."
-        )
+        assert cfg.dp_size == cfg.tp_size, f"Elastic EP scale-up requires dp_size == tp_size (got dp_size={cfg.dp_size}, tp_size={cfg.tp_size})."
+        assert resolved.moe_a2a_backend == "nixl", f"Elastic EP scale-up requires --moe-a2a-backend nixl (got moe_a2a_backend={resolved.moe_a2a_backend})."
 
 
 def handle_eplb_and_dispatch(server_args: Any):
@@ -524,23 +387,17 @@ def handle_eplb_and_dispatch(server_args: Any):
             "_handle_eplb_and_dispatch",
             expert_distribution_recorder_mode="stat",
         )
-        logger.warning(
-            "EPLB is enabled. The expert_distribution_recorder_mode is automatically set."
-        )
+        logger.warning("EPLB is enabled. The expert_distribution_recorder_mode is automatically set.")
 
     # Without an a2a backend all EP ranks run the MoE over the same tokens and
     # sum their partial outputs, so the pick has to agree across ranks.
     needs_rank_invariant_dispatch = resolved_view(server_args).moe_a2a_backend == "none"
 
-    if (cfg.enable_eplb or (cfg.init_expert_location != "trivial")) and (
-        cfg.ep_dispatch_algorithm is None
-    ):
+    if (cfg.enable_eplb or (cfg.init_expert_location != "trivial")) and (cfg.ep_dispatch_algorithm is None):
         declare_resolution(
             server_args,
             "_handle_eplb_and_dispatch",
-            ep_dispatch_algorithm=(
-                "dynamic" if needs_rank_invariant_dispatch else "static"
-            ),
+            ep_dispatch_algorithm=("dynamic" if needs_rank_invariant_dispatch else "static"),
         )
 
     # `dynamic` / `fake` switch to the row-index pick; `static` reads a
@@ -565,15 +422,8 @@ def handle_platform_cp_compatibility(server_args: Any):
     platform = get_platform()
     is_protected_platform = platform.is_hip or platform.is_npu or platform.is_musa
     if not is_protected_platform:
-        if (
-            cfg.enable_prefill_context_parallel
-            or cfg.enable_dsa_prefill_context_parallel
-        ):
-            raise ValueError(
-                "Legacy prefill context-parallel options are supported only "
-                "by protected HIP, Ascend NPU, or MUSA paths. Use "
-                "--enable-prefill-cp with --cp-strategy."
-            )
+        if cfg.enable_prefill_context_parallel or cfg.enable_dsa_prefill_context_parallel:
+            raise ValueError("Legacy prefill context-parallel options are supported only by protected HIP, Ascend NPU, or MUSA paths. Use --enable-prefill-cp with --cp-strategy.")
         return
 
     legacy_mode_to_strategy = {
@@ -620,9 +470,7 @@ def handle_legacy_cp_runtime_compatibility(server_args: Any):
         "interleave": "round-robin-split",
     }
     mode = strategy_to_legacy_mode[cfg.cp_strategy]
-    use_dsa_legacy_aliases = cfg.enable_dsa_prefill_context_parallel or getattr(
-        resolved_view(server_args), "attention_backend", None
-    ) in ("dsa", "dsv4")
+    use_dsa_legacy_aliases = cfg.enable_dsa_prefill_context_parallel or getattr(resolved_view(server_args), "attention_backend", None) in ("dsa", "dsv4")
     if use_dsa_legacy_aliases:
         declare_resolution(
             server_args,
@@ -655,15 +503,9 @@ def handle_legacy_cp_runtime_compatibility(server_args: Any):
 def handle_expert_distribution_metrics(server_args: Any):
     cfg = resolving_view(server_args)
     if "SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC" in os.environ:
-        raise ValueError(
-            "SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC is no longer supported. Use "
-            "--expert-balancedness-report-mode with one of: off, server_log, "
-            "prometheus, both."
-        )
+        raise ValueError("SGLANG_ENABLE_EPLB_BALANCEDNESS_METRIC is no longer supported. Use --expert-balancedness-report-mode with one of: off, server_log, prometheus, both.")
 
-    if should_report_expert_balancedness(server_args) and (
-        cfg.expert_distribution_recorder_mode is None
-    ):
+    if should_report_expert_balancedness(server_args) and (cfg.expert_distribution_recorder_mode is None):
         declare_resolution(
             server_args,
             "_handle_expert_distribution_metrics",
