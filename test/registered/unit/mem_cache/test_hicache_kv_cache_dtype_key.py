@@ -9,6 +9,7 @@ Issue: https://github.com/sgl-project/sglang/issues/33268
 
 import os
 import tempfile
+
 import pytest
 import torch
 
@@ -16,6 +17,9 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheFile,
     HiCacheStorageConfig,
 )
+from sglang.test.ci.ci_register import register_cpu_ci
+
+register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 
 def _make_config(
@@ -56,8 +60,7 @@ class TestHiCacheDtypeKeyCollision:
             )
 
             assert cache_bf16.config_suffix != cache_fp8.config_suffix, (
-                f"Suffix collision: bf16={cache_bf16.config_suffix}, "
-                f"fp8={cache_fp8.config_suffix}"
+                f"Suffix collision: bf16={cache_bf16.config_suffix}, fp8={cache_fp8.config_suffix}"
             )
             assert "dtype_torch.bfloat16" in cache_bf16.config_suffix
             assert "dtype_torch.float8_e4m3fn" in cache_fp8.config_suffix
@@ -78,8 +81,7 @@ class TestHiCacheDtypeKeyCollision:
         with tempfile.TemporaryDirectory() as tmpdir:
             cache = HiCacheFile(_make_config(None), file_path=tmpdir)
             assert "dtype" not in cache.config_suffix, (
-                f"dtype leaked into suffix when kv_cache_dtype is None: "
-                f"{cache.config_suffix}"
+                f"dtype leaked into suffix when kv_cache_dtype is None: {cache.config_suffix}"
             )
             assert cache.config_suffix == "_DeepSeek-V4-Flash", (
                 f"Unexpected suffix for None dtype: {cache.config_suffix}"
@@ -351,4 +353,6 @@ class TestHf3fsDtypeKeyRoundTrip:
 
 
 if __name__ == "__main__":
-    pytest.main([__file__, "-v", "-s"])
+    import sys
+
+    sys.exit(pytest.main([__file__, "-v", "-s"]))

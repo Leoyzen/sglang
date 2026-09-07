@@ -71,6 +71,13 @@ def fast_round_scale(amax, fp8_max_inv):
     return fast_pow2(fast_log2_ceil(amax * fp8_max_inv))
 
 
+@lru_cache(maxsize=1)
+def _cuda_sm_count() -> int:
+    return torch.cuda.get_device_properties(
+        torch.cuda.current_device()
+    ).multi_processor_count
+
+
 @lru_cache(maxsize=8)
 def _pick_inner_iter(seq: int, ni: int, cu: int, block_per_cu: int) -> int:
     """
@@ -271,6 +278,7 @@ def sparse_attention_fwd_kernel_v1(
     block_I=64,
     num_stages=2,
     threads=256,
+    return_lse=False,
 ):
     assert dim == tilelang.math.next_power_of_2(dim) or dim % 64 == 0, (
         f"dim={dim} must be a power of 2 or a multiple of 64"
@@ -296,6 +304,7 @@ def sparse_attention_fwd_kernel_v1(
     q_shape = [batch, seq_len, num_heads, dim + tail_dim]
     kv_shape = [batch, seq_len_kv, kv_group, dim + tail_dim]
     o_shape = [batch, seq_len, num_heads, dim]
+    lse_shape = [batch, seq_len, num_heads]
     indices_shape = [batch, seq_len, kv_group, topk]
     indices_dtype = "int32"
     dtype = "bfloat16"
@@ -323,6 +332,7 @@ def sparse_attention_fwd_kernel_v1(
         Q: T.Tensor(q_shape, dtype),  # type: ignore
         KV: T.Tensor(kv_shape, dtype),  # type: ignore
         Indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore
+        LSE: T.Tensor(lse_shape, accum_dtype),  # type: ignore
         Output: T.Tensor(o_shape, dtype),  # type: ignore
     ):
         with T.Kernel(seq_len * REPLICATE_H, batch, kv_group, threads=threads) as (
@@ -422,6 +432,8 @@ def sparse_attention_fwd_kernel_v1(
                 acc_o[h_i, d_i] /= sumexp[h_i]
             for h_i in T.Parallel(H_per_block):
                 sumexp[h_i] = T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale
+            if return_lse:
+                T.copy(sumexp, LSE[b_i, s_i, H0:H1])
 
             T.copy(acc_o, O_shared)
             T.copy(acc_o, Output[b_i, s_i, H0:H1, :])
@@ -453,6 +465,7 @@ def sparse_attention_fwd_kernel_v2(
     kv_group: int = 1,
     sm_scale: Optional[float] = None,
     block_I: int = 64,
+    return_lse: bool = False,
 ):
     assert dim == tilelang.math.next_power_of_2(dim), (
         f"haven't check padding correctness yet, dim={dim}"
@@ -476,6 +489,7 @@ def sparse_attention_fwd_kernel_v2(
     q_shape = [batch, qo_len, num_heads, dim + tail_dim]
     kv_shape = [batch, num_pages, kv_group, dim + tail_dim]
     o_shape = [batch, qo_len, num_heads, dim]
+    lse_shape = [batch, qo_len, num_heads]
     indices_shape = [batch, qo_len, kv_group, topk]
 
     indices_dtype = "int32"
@@ -504,6 +518,7 @@ def sparse_attention_fwd_kernel_v2(
         Q: T.Tensor(q_shape, dtype),  # type: ignore
         KV: T.Tensor(kv_shape, dtype),  # type: ignore
         Indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore
+        LSE: T.Tensor(lse_shape, accum_dtype),  # type: ignore
         Output: T.Tensor(o_shape, dtype),  # type: ignore
     ):
         """
@@ -671,6 +686,8 @@ def sparse_attention_fwd_kernel_v2(
                     acc_o_l[h_i, d_i] /= sumexp[h_i]
                 for h_i in T.Parallel(H_per_block):
                     sumexp[h_i] = T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale
+                if return_lse:
+                    T.copy(sumexp, LSE[b_i, s_i, H0:H1])
                 T.copy(acc_o_l, O_shared_l)
                 T.copy(O_shared_l, Output[b_i, s_i, H0:H1, 0 : D // 2])
             elif tx >= 128 and tx < 256:
@@ -839,8 +856,7 @@ def sparse_mla_fwd_decode_partial(
     assert kv_group == 1
     assert topk % block_I == 0
     assert topk % (block_I * inner_iter) == 0, (
-        f"topk ({topk}) must be divisible by block_I * inner_iter = "
-        f"{block_I} * {inner_iter}"
+        f"topk ({topk}) must be divisible by block_I * inner_iter = {block_I} * {inner_iter}"
     )
 
     # NoPE/norope geometry (tail_dim == 0): TileLang cannot emit 0-width
@@ -1013,6 +1029,7 @@ def sparse_mla_fwd_decode_combine(
     *,
     block_I=64,
     threads=256,
+    return_lse=False,
 ):
     """
     grid: (seq_len * REPLICATE_H). batch=1, kv_group=1.
@@ -1031,6 +1048,7 @@ def sparse_mla_fwd_decode_combine(
     partial_o_shape = [batch, seq_len, NI, heads, dim]
     partial_lse_shape = [batch, seq_len, NI, heads]
     o_shape = [batch, seq_len, heads, dim]
+    lse_shape = [batch, seq_len, heads]
     dtype = T.bfloat16
     accum_dtype = T.float32
 
@@ -1038,6 +1056,7 @@ def sparse_mla_fwd_decode_combine(
     def main(
         Partial_O: T.Tensor(partial_o_shape, dtype),
         Partial_Lse: T.Tensor(partial_lse_shape, accum_dtype),
+        LSE: T.Tensor(lse_shape, accum_dtype),
         Output: T.Tensor(o_shape, dtype),
     ):
         with T.Kernel(seq_len * REPLICATE_H, threads=threads) as (bx,):
@@ -1080,6 +1099,12 @@ def sparse_mla_fwd_decode_combine(
                     ].astype(accum_dtype)
 
             T.copy(acc_o, Output[b_i, s_i, H0:H1, :])
+            if return_lse:
+                # Global base-2 LSE over all partial groups: the DCP combine
+                # consumes log2(sum_k exp2(lse_k - lse_max)) + lse_max.
+                for h_i in T.Parallel(H_per_block):
+                    lse_sum[h_i] = T.log2(lse_sum[h_i]) + lse_max[h_i]
+                T.copy(lse_sum, LSE[b_i, s_i, H0:H1])
 
     return main
 
@@ -1351,7 +1376,8 @@ def tilelang_sparse_fwd(
     indices: torch.Tensor,
     sm_scale: float,
     d_v: int = 512,
-) -> torch.Tensor:
+    return_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     assert q.dim() == 3 and kv.dim() == 3 and indices.dim() == 3
     num_heads = q.shape[1]
     dim = q.shape[2]
@@ -1359,12 +1385,21 @@ def tilelang_sparse_fwd(
     topk = indices.shape[-1]
     assert topk % 64 == 0, "topk must be padded to a multiple of 64"
 
-    if _is_hip:
-        is_fp8_kv = kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+    is_fp8_kv = kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+    if _is_hip or is_fp8_kv:
+        # The partial+combine path supports return_lse via the combine kernel
+        # (global base-2 LSE over partial groups; see sparse_mla_fwd_decode_combine).
         if is_fp8_kv:
             if q.dtype != kv.dtype:
                 q = q.to(kv.dtype)
-            if _is_gfx95_supported:
+            if not _is_hip:
+                # CUDA: the fp8 partial kernel is generic TileLang (no HIP
+                # intrinsics). Tiles sized for the ~100 KB dynamic-smem class
+                # (SM12x): fp8 K tiles are half the bytes of bf16, so
+                # block_I=32/threads=128 uses ~25 KB smem and block_I=64
+                # would use ~42 KB; 32/128 is the shape validated on GB10.
+                block_I, threads, block_per_cu, cu = 32, 128, 1, _cuda_sm_count()
+            elif _is_gfx95_supported:
                 block_I, threads, block_per_cu, cu = 64, 256, 2, 256
             else:
                 block_I, threads, block_per_cu, cu = 64, 256, 1, 304
@@ -1408,16 +1443,33 @@ def tilelang_sparse_fwd(
             head_per_block=4,
             block_I=block_I,
             threads=threads,
+            return_lse=return_lse,
         )
-        out = kernel_combine(partial_o_batched, partial_lse_batched)
+        # Caller-allocated LSE (in-place kernel arg): written only by kernels
+        # traced with return_lse=True, but the prim_func signature always has it.
+        lse = torch.empty(
+            (1, q.shape[0], num_heads), dtype=torch.float32, device=q.device
+        )
+        out = kernel_combine(partial_o_batched, partial_lse_batched, lse)  # type: ignore
+        if return_lse:
+            return out, lse
     else:
         kernel_factory = (
             sparse_attention_fwd_kernel_v1
             if tail_dim == 0
             else sparse_attention_fwd_kernel_v2
         )
-        kernel = kernel_factory(num_heads, d_v, tail_dim, topk, sm_scale=sm_scale)
-        out = kernel(q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0))  # type: ignore
+        kernel = kernel_factory(
+            num_heads, d_v, tail_dim, topk, sm_scale=sm_scale, return_lse=return_lse
+        )
+        # Caller-allocated LSE (in-place kernel arg): written only by kernels
+        # traced with return_lse=True, but the prim_func signature always has it.
+        lse = torch.empty(
+            (1, q.shape[0], num_heads), dtype=torch.float32, device=q.device
+        )
+        out = kernel(q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0), lse)  # type: ignore
+    if return_lse:
+        return out, lse
     return out
 
 

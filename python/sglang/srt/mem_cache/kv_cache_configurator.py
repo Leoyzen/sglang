@@ -126,8 +126,7 @@ def _get_dsv4_compress_state_dtypes() -> tuple[torch.dtype, torch.dtype]:
     if dtype_name in ("bfloat16", "bf16"):
         return torch.bfloat16, torch.bfloat16
     raise ValueError(
-        "Unsupported SGLANG_DSV4_COMPRESS_STATE_DTYPE="
-        f"{dtype_name!r}. Expected one of: float32, fp32, bfloat16, bf16."
+        f"Unsupported SGLANG_DSV4_COMPRESS_STATE_DTYPE={dtype_name!r}. Expected one of: float32, fp32, bfloat16, bf16."
     )
 
 
@@ -155,8 +154,7 @@ def mm_runtime_reservation_gb(
         reserved_mb += envs.SGLANG_MM_FEATURE_CACHE_MB.get()
     if reserved_mb > 0:
         logger.info(
-            "Reserving %.2f GB of the KV budget for post-sizing multimodal "
-            "allocations (feature-transport pools + embedding cache).",
+            "Reserving %.2f GB of the KV budget for post-sizing multimodal allocations (feature-transport pools + embedding cache).",
             reserved_mb / 1024,
         )
     return reserved_mb / 1024
@@ -187,8 +185,7 @@ def _pp_local_per_request_bytes(
         return 0
     if total_bytes % len(layer_ids) != 0:
         raise ValueError(
-            "Linear-state bytes must be uniform per layer: "
-            f"total_bytes={total_bytes}, num_layers={len(layer_ids)}"
+            f"Linear-state bytes must be uniform per layer: total_bytes={total_bytes}, num_layers={len(layer_ids)}"
         )
     local_layer_count = sum(
         start_layer <= layer_id < end_layer for layer_id in layer_ids
@@ -530,9 +527,7 @@ class KVCacheConfigurator:
                     token_to_kv_pool_allocator.draft_virtual_id_space
                 )
                 assert draft_virtual_id_space >= sizes.max_total_num_tokens, (
-                    "unified allocator virtual space smaller than the token "
-                    f"budget: virtual_id_space={draft_virtual_id_space} < "
-                    f"max_total_num_tokens={sizes.max_total_num_tokens}"
+                    f"unified allocator virtual space smaller than the token budget: virtual_id_space={draft_virtual_id_space} < max_total_num_tokens={sizes.max_total_num_tokens}"
                 )
                 # Round UP to page alignment (paged draft backends view the
                 # pool as (-1, page_size, H, D); the virtual space is not aligned).
@@ -1149,8 +1144,7 @@ class KVCacheConfigurator:
             and kimi_linear_config(self.model_config) is None
         ):
             raise ValueError(
-                "--enable-linear-replayssm-spec with DSPARK/DFLASH requires a KDA "
-                "(kimi_linear) model; got a non-KDA model."
+                "--enable-linear-replayssm-spec with DSPARK/DFLASH requires a KDA (kimi_linear) model; got a non-KDA model."
             )
         req_to_token_pool = HybridReqToTokenPool(
             size=max_num_reqs,
@@ -2180,9 +2174,9 @@ class KVCacheConfigurator:
                     swa_allocator = token_to_kv_pool_allocator.logical_attn_allocator
                 else:
                     swa_allocator = token_to_kv_pool_allocator
-                uses_unified_virtual_ids = isinstance(
-                    swa_allocator, UnifiedSWAAllocatorBase
-                )
+                    uses_unified_virtual_ids = isinstance(
+                        swa_allocator, UnifiedSWAAllocatorBase
+                    )
                 has_draft_swa_layers = (
                     not self.is_hybrid_swa_mtp_draft or self.draft_swa_full_capacity
                 )
@@ -2304,8 +2298,7 @@ class KVCacheConfigurator:
         if user_limit is not None:
             if user_limit > token_capacity:
                 logging.warning(
-                    f"max_total_tokens={user_limit} is larger than the profiled value "
-                    f"{token_capacity}. Use the profiled value instead."
+                    f"max_total_tokens={user_limit} is larger than the profiled value {token_capacity}. Use the profiled value instead."
                 )
             token_capacity = min(token_capacity, user_limit)
 
@@ -2369,8 +2362,7 @@ class KVCacheConfigurator:
             and not capped_by_mamba
         ):
             logger.warning(
-                "max_running_requests was reduced from the requested %d to %d "
-                "(per dp worker) due to the available KV cache capacity.",
+                "max_running_requests was reduced from the requested %d to %d (per dp worker) due to the available KV cache capacity.",
                 requested_per_worker,
                 max_num_reqs,
             )
@@ -2635,6 +2627,16 @@ def calculate_mla_kv_cache_dim(
     if _is_hip and (
         get_exec().kernel.dsa_prefill_backend in ("tilelang", "triton", "aiter")
         or get_exec().kernel.dsa_decode_backend in ("tilelang", "triton", "aiter")
+    ):
+        return kv_cache_dim
+
+    # On CUDA, the TileLang DSA kernels likewise consume the raw MLA KV layout
+    # when the KV cache is fp8. Arg validation (_check_tilelang_dsa_fp8_kv)
+    # guarantees prefill == decode == tilelang whenever tilelang is combined
+    # with an fp8_e4m3 KV cache on CUDA, so no mixed-layout consumer exists.
+    if not _is_hip and (
+        get_exec().kernel.dsa_prefill_backend == "tilelang"
+        and get_exec().kernel.dsa_decode_backend == "tilelang"
     ):
         return kv_cache_dim
 
