@@ -67,6 +67,7 @@ from sglang.srt.mem_cache.utils import (
     get_mla_kv_buffer_triton,
     maybe_init_custom_mem_pool,
     set_mla_kv_buffer_dcp_sharded_triton,
+    set_mla_kv_buffer_dcp_sharded_triton_fp8_quant,
     set_mla_kv_buffer_triton,
     set_mla_kv_buffer_triton_fp8_quant,
     set_mla_kv_scale_buffer_triton,
@@ -3844,16 +3845,28 @@ class MLATokenToKVPool(KVCache):
         cache_k_rope: torch.Tensor,
     ) -> None:
         assert not (self.write_loc_is_dcp_resolved and (self.use_dsa or self.dsa_kv_cache_store_fp8)), "the DSA write paths have no resolved-loc variant"
-        if _is_hip and self.use_dsa and self.dtype == fp8_dtype:
-            # HIP FP8 path uses raw MLA KV layout (nope + rope) without per-block scales.
+        if self.use_dsa and self.dtype == fp8_dtype and not self.dsa_kv_cache_store_fp8:
+            # Raw MLA KV layout (nope + rope cast to fp8) without per-block
+            # scales: the HIP DSA kernels and the CUDA TileLang fp8 path.
             # Fuse BF16/FP16 -> FP8 cast with paged KV write.
-            set_mla_kv_buffer_triton_fp8_quant(
-                dst_buffer,
-                loc,
-                cache_k_nope,
-                cache_k_rope,
-                fp8_dtype,
-            )
+            if cache_k_rope is None:
+                cache_k_rope = cache_k_nope.new_empty((*cache_k_nope.shape[:-1], 0))
+            if self.write_loc_is_dcp_resolved:
+                set_mla_kv_buffer_triton_fp8_quant(
+                    dst_buffer,
+                    loc,
+                    cache_k_nope,
+                    cache_k_rope,
+                    fp8_dtype,
+                )
+            else:
+                set_mla_kv_buffer_dcp_sharded_triton_fp8_quant(
+                    dst_buffer,
+                    loc,
+                    cache_k_nope,
+                    cache_k_rope,
+                    fp8_dtype,
+                )
         elif self.dsa_kv_cache_store_fp8:
             # OPTIMIZATION: Quantize k_nope and k_rope separately to avoid concat overhead
             # This also enables reuse of set_mla_kv_buffer_triton two-tensor write path

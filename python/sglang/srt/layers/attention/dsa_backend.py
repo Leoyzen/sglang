@@ -400,6 +400,11 @@ class DeepseekSparseAttnBackend(
         assert model_runner.req_to_token_pool is not None
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
+        if not _is_hip and self.token_to_kv_pool.dtype == torch.float8_e4m3fn and not self.dsa_kv_cache_store_fp8 and "tilelang" in (self.dsa_prefill_impl, self.dsa_decode_impl):
+            # CUDA TileLang fp8 path stores the raw (unscaled) MLA KV layout;
+            # the MHA_ONE_SHOT fp8 dequant helpers assume the scaled layout,
+            # so keep the one-shot MHA fast path off.
+            self.supports_mha_one_shot = False
         self.hisparse_coordinator = model_runner.hisparse_coordinator
         self.req_to_token = model_runner.req_to_token_pool.req_to_token
 
@@ -494,6 +499,35 @@ class DeepseekSparseAttnBackend(
             dsa_backend_pair = (self.dsa_prefill_impl, self.dsa_decode_impl)
             if dsa_backend_pair == ("trtllm", "trtllm"):
                 pass
+            elif dsa_backend_pair == ("tilelang", "tilelang"):
+                # tilelang/tilelang DCP: works with the raw fp8 KV layout
+                # (CUDA TileLang fp8 path; the DCP rank filter is applied in
+                # the fused-quant writer via set_mla_kv_buffer_dcp_sharded_
+                # triton_fp8_quant and in transform_index / the fused-topk
+                # global->local slot mapping) and with a bf16 KV cache. On
+                # CUDA SM90 is the validated target (GLM-5.3-Flash); SM89+
+                # supports the fp8 tensor-core MMA. No FlashMLA-style
+                # head-count envelope applies: TileLang pads heads itself.
+                if self.device_sm_major < 8:
+                    raise ValueError(
+                        f"DSA DCP with tilelang is currently enabled only on SM80+ devices; got compute capability sm_{self.device_capability[0]}{self.device_capability[1]}."
+                    )
+                if not _is_hip and self.kv_cache_dtype == "fp8_e4m3":
+                    # The raw-fp8 path needs fp8 tensor-core MMA (SM89+) in the
+                    # TileLang kernels; arg validation (_check_tilelang_dsa_
+                    # fp8_kv) already enforces this at config time, so this is
+                    # a backend-side belt-and-braces check.
+                    if self.device_capability[0] * 10 + self.device_capability[1] < 89:
+                        raise ValueError(
+                            "DSA DCP with tilelang and an fp8_e4m3 KV cache "
+                            "requires SM89+ for fp8 tensor-core MMA; got "
+                            f"sm_{self.device_capability[0]}{self.device_capability[1]}. "
+                            "Use --kv-cache-dtype bfloat16 instead."
+                        )
+                # tilelang kernels take int32 paged indices from the DCP
+                # owner-filtered transform (transform_index_* / fused top-k
+                # _dcp_global_slots_to_local_rows); no additional head-count
+                # or LSE-envelope constraint like flashmla_kv.
             elif dsa_backend_pair == ("flashmla_kv", "flashmla_kv"):
                 if self.device_sm_major != 9:
                     raise ValueError(
@@ -550,10 +584,11 @@ class DeepseekSparseAttnBackend(
                     "Unsupported DSA backend pair for DCP: "
                     f"prefill={self.dsa_prefill_impl}, "
                     f"decode={self.dsa_decode_impl}. Supported pairs are "
-                    "trtllm/trtllm (SM100+) and flashmla_kv/flashmla_kv "
-                    "(SM90 with --kv-cache-dtype fp8_e4m3). Mixed pairs are "
-                    "rejected until their LSE and zero-local-KV contracts are "
-                    "validated together."
+                    "trtllm/trtllm (SM100+), flashmla_kv/flashmla_kv "
+                    "(SM90 with --kv-cache-dtype fp8_e4m3), and "
+                    "tilelang/tilelang (SM80+, bf16 or raw-fp8 KV). Mixed "
+                    "pairs are rejected until their LSE and zero-local-KV "
+                    "contracts are validated together."
                 )
             assert not model_runner.server_args.enable_prefill_cp, (
                 "DCP does not compose with prefill CP yet: the DCP extend "
@@ -2403,6 +2438,7 @@ class DeepseekSparseAttnBackend(
                 page_table_1=page_table_1,
                 sm_scale=layer.scaling,
                 v_head_dim=layer.v_head_dim,
+                return_lse=self.dcp_enabled,
             )
         elif dsa_impl == "fa3":
             return self._forward_fa3(
@@ -3015,7 +3051,8 @@ class DeepseekSparseAttnBackend(
         v_head_dim: int,
         page_table_1: torch.Tensor,
         sm_scale: float,
-    ) -> torch.Tensor:
+        return_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         from sglang.kernels.ops.attention.dsa.tilelang_kernel import tilelang_sparse_fwd
 
         # KPool appends up to index_kpool - 1 live tail tokens to the fixed
@@ -3030,6 +3067,39 @@ class DeepseekSparseAttnBackend(
                 ),
                 dim=-1,
             )
+
+        if return_lse:
+            out, lse = tilelang_sparse_fwd(
+                q=q_all,
+                kv=kv_cache,
+                indices=page_table_1.unsqueeze(1),
+                sm_scale=sm_scale,
+                d_v=v_head_dim,
+                return_lse=True,
+            )
+            # tilelang_sparse_fwd returns out [1, tokens, H, D_v] and a
+            # base-2 LSE [1, tokens, H] — the exact log base the DCP
+            # correction kernel (cp_lse_ag_out_rs_mla / dcp_lse_combine)
+            # consumes, so no _LOG2_E normalization is needed (unlike
+            # flashmla_kv's natural-log LSE). Reshape to the [T, H, D] /
+            # [T, H] fp32 layout the DCP combine expects.
+            out = out.squeeze(0).contiguous()
+            lse = lse.squeeze(0).to(torch.float32).contiguous()
+
+            # The DCP owner filter leaves -1 holes. A short request can leave
+            # a rank with no selected KV at all; force that partial to the
+            # online-softmax identity (out=0, LSE=-inf) before the cross-rank
+            # combine (same contract as the flashmla_kv / trtllm paths).
+            dcp_local_counts = (page_table_1 >= 0).sum(dim=-1, dtype=torch.int32)
+            batch_size = page_table_1.shape[0]
+            fixup_zero_kv_rows(
+                out,
+                lse,
+                dcp_local_counts,
+                self.get_device_int32_arange(batch_size + 1),
+                max_seq_len=1,
+            )
+            return out, lse
 
         return tilelang_sparse_fwd(
             q=q_all,

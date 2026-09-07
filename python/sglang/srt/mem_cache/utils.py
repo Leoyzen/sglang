@@ -26,6 +26,9 @@ from sglang.kernels.ops.kvcache.mla_buffer import (
     set_mla_kv_buffer_dcp_sharded_triton as set_mla_kv_buffer_dcp_sharded_triton,
 )
 from sglang.kernels.ops.kvcache.mla_buffer import (
+    set_mla_kv_buffer_dcp_sharded_triton_fp8_quant as set_mla_kv_buffer_dcp_sharded_triton_fp8_quant,
+)
+from sglang.kernels.ops.kvcache.mla_buffer import (
     set_mla_kv_buffer_fp8_quant_kernel as set_mla_kv_buffer_fp8_quant_kernel,
 )
 from sglang.kernels.ops.kvcache.mla_buffer import (
@@ -67,18 +70,14 @@ _EVICTION_POLICY_FACTORIES: dict[str, Callable[..., EvictionStrategy]] = {
 }
 
 
-def get_eviction_strategy(
-    eviction_policy: str, config: Optional[dict[str, Any]] = None
-) -> EvictionStrategy:
+def get_eviction_strategy(eviction_policy: str, config: Optional[dict[str, Any]] = None) -> EvictionStrategy:
     """Build the eviction strategy; ``config`` is passed to it as keyword arguments."""
     policy = eviction_policy.lower()
     try:
         factory = _EVICTION_POLICY_FACTORIES[policy]
     except KeyError:
         supported = "', '".join(_EVICTION_POLICY_FACTORIES)
-        raise ValueError(
-            f"Unknown eviction policy: {policy}. Supported policies: '{supported}'."
-        ) from None
+        raise ValueError(f"Unknown eviction policy: {policy}. Supported policies: '{supported}'.") from None
     return factory(**config) if config else factory()
 
 
@@ -96,9 +95,7 @@ def maybe_init_custom_mem_pool(
     Returns:
         Tuple of (enable_custom_mem_pool, custom_mem_pool, custom_mem_pool_type)
     """
-    enable_custom_mem_pool = (
-        True if envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is not None else False
-    )
+    enable_custom_mem_pool = True if envs.SGLANG_MOONCAKE_CUSTOM_MEM_POOL.get() is not None else False
 
     if enable_custom_mem_pool:
         # Currently, only mooncake requires a custom mem pool for MNNVL/Barex PD disaggregation
@@ -154,31 +151,19 @@ def compute_node_event_hash_values(node: Any, page_size: int) -> List[str]:
 
     missing_nodes = []
     current = node
-    while (
-        current is not None
-        and current.key is not None
-        and len(current.key) > 0
-        and current.event_hash_value is None
-    ):
+    while current is not None and current.key is not None and len(current.key) > 0 and current.event_hash_value is None:
         if current.key.cache_salt != cache_salt:
             raise ValueError("Radix path contains mismatched cache_salt values")
         missing_nodes.append(current)
         current = current.parent
 
-    if (
-        current is not None
-        and current.key is not None
-        and len(current.key) > 0
-        and current.key.cache_salt != cache_salt
-    ):
+    if current is not None and current.key is not None and len(current.key) > 0 and current.key.cache_salt != cache_salt:
         raise ValueError("Radix path contains mismatched cache_salt values")
 
     if current is not None and current.event_hash_value:
         parent_hash = current.event_hash_value[-1]
     else:
-        parent_hash = hashlib.sha256(
-            b"sglang-cache-salt-v1\0" + cache_salt.encode("utf-8")
-        ).hexdigest()
+        parent_hash = hashlib.sha256(b"sglang-cache-salt-v1\0" + cache_salt.encode("utf-8")).hexdigest()
 
     for missing_node in reversed(missing_nodes):
         hash_values = get_hash_str(missing_node.key, parent_hash, page_size=page_size)
@@ -191,9 +176,7 @@ def compute_node_event_hash_values(node: Any, page_size: int) -> List[str]:
     return node.event_hash_value
 
 
-def split_node_hash_value(
-    child_hash_value: Optional[List[str]], split_len: int, page_size: int
-) -> tuple[Optional[List[str]], Optional[List[str]]]:
+def split_node_hash_value(child_hash_value: Optional[List[str]], split_len: int, page_size: int) -> tuple[Optional[List[str]], Optional[List[str]]]:
     """Split hash_value between parent and child nodes during node splitting.
 
     Args:

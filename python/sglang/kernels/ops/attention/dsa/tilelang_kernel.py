@@ -71,6 +71,11 @@ def fast_round_scale(amax, fp8_max_inv):
     return fast_pow2(fast_log2_ceil(amax * fp8_max_inv))
 
 
+@lru_cache(maxsize=1)
+def _cuda_sm_count() -> int:
+    return torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
+
+
 @lru_cache(maxsize=8)
 def _pick_inner_iter(seq: int, ni: int, cu: int, block_per_cu: int) -> int:
     """
@@ -89,9 +94,7 @@ def _pick_inner_iter(seq: int, ni: int, cu: int, block_per_cu: int) -> int:
 
 
 @tilelang.jit(pass_configs=pass_configs)
-def act_quant_kernel(
-    N, in_dtype=BF16, out_dtype=FP8, scale_dtype=FP32, round_scale=False
-):
+def act_quant_kernel(N, in_dtype=BF16, out_dtype=FP8, scale_dtype=FP32, round_scale=False):
     M = T.symbolic("M")
     fp8_min = -224.0 if _is_fp8_fnuz else -448.0
     fp8_max = 224.0 if _is_fp8_fnuz else 448.0
@@ -128,9 +131,7 @@ def act_quant_kernel(
                     else:
                         s_local[i] = amax_local[i] * fp8_max_inv
                 for i, j in T.Parallel(blk_m, group_size):
-                    y_local[i, j] = T.clamp(
-                        x_local[i, j] / s_local[i], fp8_min, fp8_max
-                    )
+                    y_local[i, j] = T.clamp(x_local[i, j] / s_local[i], fp8_min, fp8_max)
                 for i in T.Parallel(blk_m):
                     S[pid_m * blk_m + i, pid_n] = s_local[i]
                 T.copy(y_local, y_shared)
@@ -139,9 +140,7 @@ def act_quant_kernel(
     return act_quant_kernel_
 
 
-def act_quant(
-    x: torch.Tensor, block_size: int = 128, scale_fmt: Optional[str] = None
-) -> Tuple[torch.Tensor, torch.Tensor]:
+def act_quant(x: torch.Tensor, block_size: int = 128, scale_fmt: Optional[str] = None) -> Tuple[torch.Tensor, torch.Tensor]:
     """
     Quantizes the input tensor `x` using block-wise quantization.
 
@@ -155,9 +154,7 @@ def act_quant(
             - A tensor of scaling factors with dtype `torch.float32`.
     """
     assert x.is_contiguous(), "Input tensor must be contiguous"
-    assert x.size(-1) % block_size == 0, (
-        f"Last dimension size must be divisible by block_size (block_size={block_size})"
-    )
+    assert x.size(-1) % block_size == 0, f"Last dimension size must be divisible by block_size (block_size={block_size})"
     N = x.size(-1)
     if _is_fp8_fnuz:
         y = torch.empty_like(x, dtype=torch.float8_e4m3fnuz)
@@ -271,18 +268,13 @@ def sparse_attention_fwd_kernel_v1(
     block_I=64,
     num_stages=2,
     threads=256,
+    return_lse=False,
 ):
-    assert dim == tilelang.math.next_power_of_2(dim) or dim % 64 == 0, (
-        f"dim={dim} must be a power of 2 or a multiple of 64"
-    )
-    assert tail_dim == 0 or tail_dim == tilelang.math.next_power_of_2(tail_dim), (
-        f"tail_dim={tail_dim} must be 0 or a power of 2"
-    )
+    assert dim == tilelang.math.next_power_of_2(dim) or dim % 64 == 0, f"dim={dim} must be a power of 2 or a multiple of 64"
+    assert tail_dim == 0 or tail_dim == tilelang.math.next_power_of_2(tail_dim), f"tail_dim={tail_dim} must be 0 or a power of 2"
     has_tail = tail_dim > 0
     assert is_causal == True, "non-casual is not supported"
-    assert topk % block_I == 0, (
-        "otherwise will load some index=0 thus causing wrong kv to be loaded"
-    )
+    assert topk % block_I == 0, "otherwise will load some index=0 thus causing wrong kv to be loaded"
     if sm_scale is None:
         sm_scale = (1.0 / (dim + tail_dim)) ** 0.5 * 1.44269504  # log2(e)
     else:
@@ -296,6 +288,7 @@ def sparse_attention_fwd_kernel_v1(
     q_shape = [batch, seq_len, num_heads, dim + tail_dim]
     kv_shape = [batch, seq_len_kv, kv_group, dim + tail_dim]
     o_shape = [batch, seq_len, num_heads, dim]
+    lse_shape = [batch, seq_len, num_heads]
     indices_shape = [batch, seq_len, kv_group, topk]
     indices_dtype = "int32"
     dtype = "bfloat16"
@@ -323,6 +316,7 @@ def sparse_attention_fwd_kernel_v1(
         Q: T.Tensor(q_shape, dtype),  # type: ignore
         KV: T.Tensor(kv_shape, dtype),  # type: ignore
         Indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore
+        LSE: T.Tensor(lse_shape, accum_dtype),  # type: ignore
         Output: T.Tensor(o_shape, dtype),  # type: ignore
     ):
         with T.Kernel(seq_len * REPLICATE_H, batch, kv_group, threads=threads) as (
@@ -369,9 +363,7 @@ def sparse_attention_fwd_kernel_v1(
                     mask[bi_i] = Indices[b_i, s_i, g_i, i_i * BI + bi_i] >= 0
 
                 for bi_i, d_i in T.Parallel(BI, D):
-                    KV_shared[bi_i, d_i] = KV[
-                        b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, d_i
-                    ]
+                    KV_shared[bi_i, d_i] = KV[b_i, Indices[b_i, s_i, g_i, i_i * BI + bi_i], g_i, d_i]
                 if has_tail:
                     for bi_i, d_i in T.Parallel(BI, D_tail):
                         K_tail_shared[bi_i, d_i] = KV[
@@ -382,9 +374,7 @@ def sparse_attention_fwd_kernel_v1(
                         ]
 
                 for h_i, bi_i in T.Parallel(H_per_block, BI):
-                    acc_s[h_i, bi_i] = T.if_then_else(
-                        mask[bi_i], 0, -T.infinity(acc_s.dtype)
-                    )
+                    acc_s[h_i, bi_i] = T.if_then_else(mask[bi_i], 0, -T.infinity(acc_s.dtype))
                 T.gemm(
                     Q_shared,
                     KV_shared,
@@ -405,9 +395,7 @@ def sparse_attention_fwd_kernel_v1(
                 for h_i in T.Parallel(H_per_block):
                     alpha[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
                 for h_i, bi_i in T.Parallel(H_per_block, BI):
-                    acc_s[h_i, bi_i] = T.exp2(
-                        acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale
-                    )
+                    acc_s[h_i, bi_i] = T.exp2(acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale)
                 T.reduce_sum(acc_s, sumexp_i, dim=1)  # is this a accumulate operator?
                 for h_i in T.Parallel(H_per_block):
                     sumexp[h_i] = sumexp[h_i] * alpha[h_i] + sumexp_i[h_i]
@@ -422,6 +410,8 @@ def sparse_attention_fwd_kernel_v1(
                 acc_o[h_i, d_i] /= sumexp[h_i]
             for h_i in T.Parallel(H_per_block):
                 sumexp[h_i] = T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale
+            if return_lse:
+                T.copy(sumexp, LSE[b_i, s_i, H0:H1])
 
             T.copy(acc_o, O_shared)
             T.copy(acc_o, Output[b_i, s_i, H0:H1, :])
@@ -453,16 +443,11 @@ def sparse_attention_fwd_kernel_v2(
     kv_group: int = 1,
     sm_scale: Optional[float] = None,
     block_I: int = 64,
+    return_lse: bool = False,
 ):
-    assert dim == tilelang.math.next_power_of_2(dim), (
-        f"haven't check padding correctness yet, dim={dim}"
-    )
-    assert tail_dim == tilelang.math.next_power_of_2(tail_dim), (
-        f"haven't check padding correctness yet, dim={tail_dim}"
-    )
-    assert topk % block_I == 0, (
-        "otherwise will load some index=0 thus causing wrong kv to be loaded"
-    )
+    assert dim == tilelang.math.next_power_of_2(dim), f"haven't check padding correctness yet, dim={dim}"
+    assert tail_dim == tilelang.math.next_power_of_2(tail_dim), f"haven't check padding correctness yet, dim={tail_dim}"
+    assert topk % block_I == 0, "otherwise will load some index=0 thus causing wrong kv to be loaded"
     if sm_scale is None:
         sm_scale = (1.0 / (dim + tail_dim)) ** 0.5 * 1.44269504  # log2(e)
     else:
@@ -476,6 +461,7 @@ def sparse_attention_fwd_kernel_v2(
     q_shape = [batch, qo_len, num_heads, dim + tail_dim]
     kv_shape = [batch, num_pages, kv_group, dim + tail_dim]
     o_shape = [batch, qo_len, num_heads, dim]
+    lse_shape = [batch, qo_len, num_heads]
     indices_shape = [batch, qo_len, kv_group, topk]
 
     indices_dtype = "int32"
@@ -504,6 +490,7 @@ def sparse_attention_fwd_kernel_v2(
         Q: T.Tensor(q_shape, dtype),  # type: ignore
         KV: T.Tensor(kv_shape, dtype),  # type: ignore
         Indices: T.Tensor(indices_shape, indices_dtype),  # type: ignore
+        LSE: T.Tensor(lse_shape, accum_dtype),  # type: ignore
         Output: T.Tensor(o_shape, dtype),  # type: ignore
     ):
         """
@@ -582,9 +569,7 @@ def sparse_attention_fwd_kernel_v2(
                     T.barrier_wait(bar_0_128, 0)
 
                     for h_i, bi_i in T.Parallel(H_per_block, BI):
-                        acc_s[h_i, bi_i] = T.if_then_else(
-                            is_kv_valid_0[bi_i], 0, -T.infinity(acc_s.dtype)
-                        )
+                        acc_s[h_i, bi_i] = T.if_then_else(is_kv_valid_0[bi_i], 0, -T.infinity(acc_s.dtype))
                     T.gemm(Q_shared_l, KV_shared_0_l, acc_s, transpose_B=True)
                     T.gemm(Q_shared_r, KV_shared_0_r, acc_s, transpose_B=True)
                     T.gemm(
@@ -602,12 +587,8 @@ def sparse_attention_fwd_kernel_v2(
                     for h_i in T.Parallel(H_per_block):
                         alpha_local[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
                     for h_i, bi_i in T.Parallel(H_per_block, BI):
-                        acc_s[h_i, bi_i] = T.exp2(
-                            acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale
-                        )
-                    T.reduce_sum(
-                        acc_s, sumexp_i, dim=1
-                    )  # is this a accumulate operator?
+                        acc_s[h_i, bi_i] = T.exp2(acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale)
+                    T.reduce_sum(acc_s, sumexp_i, dim=1)  # is this a accumulate operator?
                     for h_i in T.Parallel(H_per_block):
                         sumexp[h_i] = sumexp[h_i] * alpha_local[h_i] + sumexp_i[h_i]
                     for h_i, d_i in T.Parallel(H_per_block, D // 2):
@@ -626,9 +607,7 @@ def sparse_attention_fwd_kernel_v2(
                     T.barrier_wait(bar_0_128, 1)
 
                     for h_i, bi_i in T.Parallel(H_per_block, BI):
-                        acc_s[h_i, bi_i] = T.if_then_else(
-                            is_kv_valid_1[bi_i], 0, -T.infinity(acc_s.dtype)
-                        )
+                        acc_s[h_i, bi_i] = T.if_then_else(is_kv_valid_1[bi_i], 0, -T.infinity(acc_s.dtype))
                     T.gemm(Q_shared_l, KV_shared_1_l, acc_s, transpose_B=True)
                     T.gemm(Q_shared_r, KV_shared_1_r, acc_s, transpose_B=True)
                     T.gemm(
@@ -645,12 +624,8 @@ def sparse_attention_fwd_kernel_v2(
                     for h_i in T.Parallel(H_per_block):
                         alpha_local[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
                     for h_i, bi_i in T.Parallel(H_per_block, BI):
-                        acc_s[h_i, bi_i] = T.exp2(
-                            acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale
-                        )
-                    T.reduce_sum(
-                        acc_s, sumexp_i, dim=1
-                    )  # is this a accumulate operator?
+                        acc_s[h_i, bi_i] = T.exp2(acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale)
+                    T.reduce_sum(acc_s, sumexp_i, dim=1)  # is this a accumulate operator?
                     for h_i in T.Parallel(H_per_block):
                         sumexp[h_i] = sumexp[h_i] * alpha_local[h_i] + sumexp_i[h_i]
                     for h_i, d_i in T.Parallel(H_per_block, D // 2):
@@ -671,6 +646,8 @@ def sparse_attention_fwd_kernel_v2(
                     acc_o_l[h_i, d_i] /= sumexp[h_i]
                 for h_i in T.Parallel(H_per_block):
                     sumexp[h_i] = T.log2(sumexp[h_i]) + m_i[h_i] * sm_scale
+                if return_lse:
+                    T.copy(sumexp, LSE[b_i, s_i, H0:H1])
                 T.copy(acc_o_l, O_shared_l)
                 T.copy(O_shared_l, Output[b_i, s_i, H0:H1, 0 : D // 2])
             elif tx >= 128 and tx < 256:
@@ -718,9 +695,7 @@ def sparse_attention_fwd_kernel_v2(
                     T.barrier_wait(bar_2_128, 0)
 
                     for r in T.serial(4):
-                        indices_tmp[0] = Indices[
-                            b_i, s_i, g_i, (i_i * 2) * BI + r * 16 + (tx - 256) // 8
-                        ]
+                        indices_tmp[0] = Indices[b_i, s_i, g_i, (i_i * 2) * BI + r * 16 + (tx - 256) // 8]
                         is_kv_valid_0[r * 16 + (tx - 256) // 8] = indices_tmp[0] >= 0
                         if is_kv_valid_0[r * 16 + (tx - 256) // 8]:
                             indices_local[0] = indices_tmp[0]
@@ -748,9 +723,7 @@ def sparse_attention_fwd_kernel_v2(
                                     ]
                         with T.attr("default", "async_scope", 1):  # type: ignore
                             for v in T.vectorized(8):
-                                K_tail_shared_0[
-                                    r * 16 + (tx - 256) // 8, (tx - 256) % 8 * 8 + v
-                                ] = KV[
+                                K_tail_shared_0[r * 16 + (tx - 256) // 8, (tx - 256) % 8 * 8 + v] = KV[
                                     b_i,
                                     indices_local[0],
                                     g_i,
@@ -765,9 +738,7 @@ def sparse_attention_fwd_kernel_v2(
                     T.barrier_wait(bar_2_128, 1)
 
                     for r in T.serial(4):
-                        indices_tmp[0] = Indices[
-                            b_i, s_i, g_i, (i_i * 2 + 1) * BI + r * 16 + (tx - 256) // 8
-                        ]
+                        indices_tmp[0] = Indices[b_i, s_i, g_i, (i_i * 2 + 1) * BI + r * 16 + (tx - 256) // 8]
                         is_kv_valid_1[r * 16 + (tx - 256) // 8] = indices_tmp[0] >= 0
                         if is_kv_valid_1[r * 16 + (tx - 256) // 8]:
                             indices_local[0] = indices_tmp[0]
@@ -795,9 +766,7 @@ def sparse_attention_fwd_kernel_v2(
                                     ]
                         with T.attr("default", "async_scope", 1):  # type: ignore
                             for v in T.vectorized(8):
-                                K_tail_shared_1[
-                                    r * 16 + (tx - 256) // 8, (tx - 256) % 8 * 8 + v
-                                ] = KV[
+                                K_tail_shared_1[r * 16 + (tx - 256) // 8, (tx - 256) % 8 * 8 + v] = KV[
                                     b_i,
                                     indices_local[0],
                                     g_i,
@@ -838,10 +807,7 @@ def sparse_mla_fwd_decode_partial(
     assert is_causal == True, "non-causal is not supported"
     assert kv_group == 1
     assert topk % block_I == 0
-    assert topk % (block_I * inner_iter) == 0, (
-        f"topk ({topk}) must be divisible by block_I * inner_iter = "
-        f"{block_I} * {inner_iter}"
-    )
+    assert topk % (block_I * inner_iter) == 0, f"topk ({topk}) must be divisible by block_I * inner_iter = {block_I} * {inner_iter}"
 
     # log2(e) = 1.44269504
     if sm_scale is None:
@@ -922,19 +888,13 @@ def sparse_mla_fwd_decode_partial(
                     mask[bi_i] = Indices[b_i, s_i, g_i, topk_block_i * BI + bi_i] >= 0
                 for bi_i, d_i in T.Parallel(BI, D):
                     idx = Indices[b_i, s_i, g_i, topk_block_i * BI + bi_i]
-                    KV_shared[bi_i, d_i] = KV[
-                        b_i, T.if_then_else(idx >= 0, idx, 0), g_i, d_i
-                    ]
+                    KV_shared[bi_i, d_i] = KV[b_i, T.if_then_else(idx >= 0, idx, 0), g_i, d_i]
                 for bi_i, d_i in T.Parallel(BI, D_tail):
                     idx = Indices[b_i, s_i, g_i, topk_block_i * BI + bi_i]
-                    K_tail_shared[bi_i, d_i] = KV[
-                        b_i, T.if_then_else(idx >= 0, idx, 0), g_i, D + d_i
-                    ]
+                    K_tail_shared[bi_i, d_i] = KV[b_i, T.if_then_else(idx >= 0, idx, 0), g_i, D + d_i]
 
                 for h_i, bi_i in T.Parallel(H_per_block, BI):
-                    acc_s[h_i, bi_i] = T.if_then_else(
-                        mask[bi_i], 0, -T.infinity(acc_s.dtype)
-                    )
+                    acc_s[h_i, bi_i] = T.if_then_else(mask[bi_i], 0, -T.infinity(acc_s.dtype))
 
                 T.gemm(
                     Q_buf,
@@ -956,9 +916,7 @@ def sparse_mla_fwd_decode_partial(
                 for h_i in T.Parallel(H_per_block):
                     alpha[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
                 for h_i, bi_i in T.Parallel(H_per_block, BI):
-                    acc_s[h_i, bi_i] = T.exp2(
-                        acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale
-                    )
+                    acc_s[h_i, bi_i] = T.exp2(acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale)
                 T.reduce_sum(acc_s, sumexp_i, dim=1)
                 for h_i in T.Parallel(H_per_block):
                     sumexp[h_i] = sumexp[h_i] * alpha[h_i] + sumexp_i[h_i]
@@ -970,9 +928,7 @@ def sparse_mla_fwd_decode_partial(
 
             # sumexp==0 (all masked), divide by 1 to get 0 and avoid nan
             for h_i, d_i in T.Parallel(H_per_block, D):
-                acc_o[h_i, d_i] = acc_o[h_i, d_i] / T.if_then_else(
-                    sumexp[h_i] == 0.0, 1.0, sumexp[h_i]
-                )
+                acc_o[h_i, d_i] = acc_o[h_i, d_i] / T.if_then_else(sumexp[h_i] == 0.0, 1.0, sumexp[h_i])
             # sumexp==0 (all masked), use large negative so combine ignores this split
             for h_i in T.Parallel(H_per_block):
                 sumexp[h_i] = T.if_then_else(
@@ -1002,6 +958,7 @@ def sparse_mla_fwd_decode_combine(
     *,
     block_I=64,
     threads=256,
+    return_lse=False,
 ):
     """
     grid: (seq_len * REPLICATE_H). batch=1, kv_group=1.
@@ -1020,6 +977,7 @@ def sparse_mla_fwd_decode_combine(
     partial_o_shape = [batch, seq_len, NI, heads, dim]
     partial_lse_shape = [batch, seq_len, NI, heads]
     o_shape = [batch, seq_len, heads, dim]
+    lse_shape = [batch, seq_len, heads]
     dtype = T.bfloat16
     accum_dtype = T.float32
 
@@ -1027,6 +985,7 @@ def sparse_mla_fwd_decode_combine(
     def main(
         Partial_O: T.Tensor(partial_o_shape, dtype),
         Partial_Lse: T.Tensor(partial_lse_shape, accum_dtype),
+        LSE: T.Tensor(lse_shape, accum_dtype),
         Output: T.Tensor(o_shape, dtype),
     ):
         with T.Kernel(seq_len * REPLICATE_H, threads=threads) as (bx,):
@@ -1052,23 +1011,23 @@ def sparse_mla_fwd_decode_combine(
             T.fill(lse_sum, 0)
             for k in T.serial(NI):
                 for h_i in T.Parallel(H_per_block):
-                    lse_sum[h_i] = lse_sum[h_i] + T.exp2(
-                        shared_lse[k, h_i] - lse_max[h_i]
-                    )
+                    lse_sum[h_i] = lse_sum[h_i] + T.exp2(shared_lse[k, h_i] - lse_max[h_i])
             for k in T.serial(NI):
                 for h_i in T.Parallel(H_per_block):
-                    scale[h_i, k] = T.exp2(
-                        shared_lse[k, h_i] - lse_max[h_i] - T.log2(lse_sum[h_i])
-                    )
+                    scale[h_i, k] = T.exp2(shared_lse[k, h_i] - lse_max[h_i] - T.log2(lse_sum[h_i]))
 
             T.fill(acc_o, 0)
             for k in T.serial(NI):
                 for h_i, d_i in T.Parallel(H_per_block, dim):
-                    acc_o[h_i, d_i] = acc_o[h_i, d_i] + scale[h_i, k] * Partial_O[
-                        b_i, s_i, k, H0 + h_i, d_i
-                    ].astype(accum_dtype)
+                    acc_o[h_i, d_i] = acc_o[h_i, d_i] + scale[h_i, k] * Partial_O[b_i, s_i, k, H0 + h_i, d_i].astype(accum_dtype)
 
             T.copy(acc_o, Output[b_i, s_i, H0:H1, :])
+            if return_lse:
+                # Global base-2 LSE over all partial groups: the DCP combine
+                # consumes log2(sum_k exp2(lse_k - lse_max)) + lse_max.
+                for h_i in T.Parallel(H_per_block):
+                    lse_sum[h_i] = T.log2(lse_sum[h_i]) + lse_max[h_i]
+                T.copy(lse_sum, LSE[b_i, s_i, H0:H1])
 
     return main
 
@@ -1086,9 +1045,7 @@ def sparse_mla_fwd_decode_partial_fp8(
     threads=256,
 ):
     assert d_v == 512, f"only support d_v=512"
-    assert topk % block_I == 0, (
-        "otherwise will load some index=0 thus causing wrong kv to be loaded"
-    )
+    assert topk % block_I == 0, "otherwise will load some index=0 thus causing wrong kv to be loaded"
 
     # Softmax scores are in [0, 1]. We scale by fp8_max_val before FP8 cast
     # to better utilize FP8 dynamic range, then apply the inverse scale after GEMM.
@@ -1112,9 +1069,7 @@ def sparse_mla_fwd_decode_partial_fp8(
     h_per_block = 16
     # Match bf16 partial behavior: keep fixed 16-head tiles and use
     # sliced T.copy on H0:H1 for tail handling.
-    assert num_heads <= h_per_block or num_heads % h_per_block == 0, (
-        "num_heads must be <=16 or divisible by 16"
-    )
+    assert num_heads <= h_per_block or num_heads % h_per_block == 0, "num_heads must be <=16 or divisible by 16"
     head_blocks_per_seq = (num_heads + h_per_block - 1) // h_per_block
 
     batch = 1
@@ -1215,9 +1170,7 @@ def sparse_mla_fwd_decode_partial_fp8(
                     k_tail_shared[bi_i, j] = kv_fp8[b_i, page, g_i, rope_offset_fp8 + j]
 
                 for h_i, bi_i in T.Parallel(h_per_block, BI):
-                    acc_s[h_i, bi_i] = T.if_then_else(
-                        mask[bi_i], 0, -T.infinity(acc_s.dtype)
-                    )
+                    acc_s[h_i, bi_i] = T.if_then_else(mask[bi_i], 0, -T.infinity(acc_s.dtype))
 
                 T.gemm(q_tile0, kv_tile0, acc_s, transpose_B=True, clear_accum=False)
                 T.gemm(q_tile1, kv_tile1, acc_tile, transpose_B=True, clear_accum=True)
@@ -1242,9 +1195,7 @@ def sparse_mla_fwd_decode_partial_fp8(
                 for h_i in T.Parallel(h_per_block):
                     alpha[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
                 for h_i, bi_i in T.Parallel(h_per_block, BI):
-                    acc_s[h_i, bi_i] = T.exp2(
-                        acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale
-                    )
+                    acc_s[h_i, bi_i] = T.exp2(acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale)
                 T.reduce_sum(acc_s, sumexp_i, dim=1)
                 for h_i in T.Parallel(h_per_block):
                     sumexp[h_i] = sumexp[h_i] * alpha[h_i] + sumexp_i[h_i]
@@ -1262,27 +1213,19 @@ def sparse_mla_fwd_decode_partial_fp8(
                     )
                 T.gemm(s_fp8_shared, kv_tile0, sv_tile, clear_accum=True)
                 for h_i, j in T.Parallel(h_per_block, group_size):
-                    acc_o_tile0[h_i, j] = (
-                        acc_o_tile0[h_i, j] + sv_tile[h_i, j] * s_scale_const
-                    )
+                    acc_o_tile0[h_i, j] = acc_o_tile0[h_i, j] + sv_tile[h_i, j] * s_scale_const
 
                 T.gemm(s_fp8_shared, kv_tile1, sv_tile, clear_accum=True)
                 for h_i, j in T.Parallel(h_per_block, group_size):
-                    acc_o_tile1[h_i, j] = (
-                        acc_o_tile1[h_i, j] + sv_tile[h_i, j] * s_scale_const
-                    )
+                    acc_o_tile1[h_i, j] = acc_o_tile1[h_i, j] + sv_tile[h_i, j] * s_scale_const
 
                 T.gemm(s_fp8_shared, kv_tile2, sv_tile, clear_accum=True)
                 for h_i, j in T.Parallel(h_per_block, group_size):
-                    acc_o_tile2[h_i, j] = (
-                        acc_o_tile2[h_i, j] + sv_tile[h_i, j] * s_scale_const
-                    )
+                    acc_o_tile2[h_i, j] = acc_o_tile2[h_i, j] + sv_tile[h_i, j] * s_scale_const
 
                 T.gemm(s_fp8_shared, kv_tile3, sv_tile, clear_accum=True)
                 for h_i, j in T.Parallel(h_per_block, group_size):
-                    acc_o_tile3[h_i, j] = (
-                        acc_o_tile3[h_i, j] + sv_tile[h_i, j] * s_scale_const
-                    )
+                    acc_o_tile3[h_i, j] = acc_o_tile3[h_i, j] + sv_tile[h_i, j] * s_scale_const
 
             for h_i in T.Parallel(h_per_block):
                 denom = T.if_then_else(sumexp[h_i] == 0.0, 1.0, sumexp[h_i])
@@ -1328,7 +1271,8 @@ def tilelang_sparse_fwd(
     indices: torch.Tensor,
     sm_scale: float,
     d_v: int = 512,
-) -> torch.Tensor:
+    return_lse: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     assert q.dim() == 3 and kv.dim() == 3 and indices.dim() == 3
     num_heads = q.shape[1]
     dim = q.shape[2]
@@ -1336,12 +1280,21 @@ def tilelang_sparse_fwd(
     topk = indices.shape[-1]
     assert topk % 64 == 0, "topk must be padded to a multiple of 64"
 
-    if _is_hip:
-        is_fp8_kv = kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+    is_fp8_kv = kv.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+    if _is_hip or is_fp8_kv:
+        # The partial+combine path supports return_lse via the combine kernel
+        # (global base-2 LSE over partial groups; see sparse_mla_fwd_decode_combine).
         if is_fp8_kv:
             if q.dtype != kv.dtype:
                 q = q.to(kv.dtype)
-            if _is_gfx95_supported:
+            if not _is_hip:
+                # CUDA: the fp8 partial kernel is generic TileLang (no HIP
+                # intrinsics). Tiles sized for the ~100 KB dynamic-smem class
+                # (SM12x): fp8 K tiles are half the bytes of bf16, so
+                # block_I=32/threads=128 uses ~25 KB smem and block_I=64
+                # would use ~42 KB; 32/128 is the shape validated on GB10.
+                block_I, threads, block_per_cu, cu = 32, 128, 1, _cuda_sm_count()
+            elif _is_gfx95_supported:
                 block_I, threads, block_per_cu, cu = 64, 256, 2, 256
             else:
                 block_I, threads, block_per_cu, cu = 64, 256, 1, 304
@@ -1374,9 +1327,7 @@ def tilelang_sparse_fwd(
                 inner_iter=inner_iter,
                 threads=threads,
             )
-        partial_o_batched, partial_lse_batched = kernel_partial(
-            q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0)
-        )
+        partial_o_batched, partial_lse_batched = kernel_partial(q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0))
         n_groups = ni // inner_iter
         kernel_combine = sparse_mla_fwd_decode_combine(
             num_heads,
@@ -1385,16 +1336,23 @@ def tilelang_sparse_fwd(
             head_per_block=4,
             block_I=block_I,
             threads=threads,
+            return_lse=return_lse,
         )
-        out = kernel_combine(partial_o_batched, partial_lse_batched)
+        # Caller-allocated LSE (in-place kernel arg): written only by kernels
+        # traced with return_lse=True, but the prim_func signature always has it.
+        lse = torch.empty((1, q.shape[0], num_heads), dtype=torch.float32, device=q.device)
+        out = kernel_combine(partial_o_batched, partial_lse_batched, lse)  # type: ignore
+        if return_lse:
+            return out, lse
     else:
-        kernel_factory = (
-            sparse_attention_fwd_kernel_v1
-            if tail_dim == 0
-            else sparse_attention_fwd_kernel_v2
-        )
-        kernel = kernel_factory(num_heads, d_v, tail_dim, topk, sm_scale=sm_scale)
-        out = kernel(q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0))  # type: ignore
+        kernel_factory = sparse_attention_fwd_kernel_v1 if tail_dim == 0 else sparse_attention_fwd_kernel_v2
+        kernel = kernel_factory(num_heads, d_v, tail_dim, topk, sm_scale=sm_scale, return_lse=return_lse)
+        # Caller-allocated LSE (in-place kernel arg): written only by kernels
+        # traced with return_lse=True, but the prim_func signature always has it.
+        lse = torch.empty((1, q.shape[0], num_heads), dtype=torch.float32, device=q.device)
+        out = kernel(q.unsqueeze(0), kv.unsqueeze(0), indices.unsqueeze(0), lse)  # type: ignore
+    if return_lse:
+        return out, lse
     return out
 
 
@@ -1542,9 +1500,7 @@ def _build_fp8_combined_view(k_cache: torch.Tensor) -> Tuple[torch.Tensor, int, 
     block_size = k_u8.shape[1]
     block_pad_u32 = k_u8.stride(0) // 4
     storage = k_u8.untyped_storage()
-    flat_u32 = torch.empty(0, dtype=torch.uint32, device=k_u8.device).set_(
-        storage, 0, (storage.nbytes() // 4,), (1,)
-    )
+    flat_u32 = torch.empty(0, dtype=torch.uint32, device=k_u8.device).set_(storage, 0, (storage.nbytes() // 4,), (1,))
     k_combined = torch.as_strided(
         flat_u32,
         size=(num_blocks, block_pad_u32),
@@ -1562,9 +1518,7 @@ def _topk_length_sentinel(device: torch.device, batch: int) -> torch.Tensor:
     """Cached `(batch,) int32 INT_MAX` tensor used when `topk_length` is None."""
     cur = _TOPK_LEN_SENTINEL_CACHE.get(device)
     if cur is None or cur.numel() < batch:
-        cur = torch.full(
-            (max(batch, 256),), _INT32_MAX, dtype=torch.int32, device=device
-        )
+        cur = torch.full((max(batch, 256),), _INT32_MAX, dtype=torch.int32, device=device)
         _TOPK_LEN_SENTINEL_CACHE[device] = cur
     return cur[:batch]
 
@@ -1605,18 +1559,14 @@ def dpsk_v4_fp8_partial_kernel(
         sm_scale = sm_scale * log2e
     assert dim == 448 and tail_dim == 64
     assert topk_1 % block_I == 0
-    assert (topk_1 // block_I) % inner_iter_1 == 0, (
-        f"NI_1={topk_1 // block_I} must be divisible by inner_iter_1={inner_iter_1}"
-    )
+    assert (topk_1 // block_I) % inner_iter_1 == 0, f"NI_1={topk_1 // block_I} must be divisible by inner_iter_1={inner_iter_1}"
     assert block_size_kv_1 > 0 and (block_size_kv_1 & (block_size_kv_1 - 1)) == 0
 
     is_dual = topk_2 > 0
     if is_dual:
         assert inner_iter_2 > 0, "dual-cache call requires inner_iter_2 > 0"
         assert topk_2 % block_I == 0
-        assert (topk_2 // block_I) % inner_iter_2 == 0, (
-            f"NI_2={topk_2 // block_I} must be divisible by inner_iter_2={inner_iter_2}"
-        )
+        assert (topk_2 // block_I) % inner_iter_2 == 0, f"NI_2={topk_2 // block_I} must be divisible by inner_iter_2={inner_iter_2}"
         assert block_size_kv_2 > 0 and (block_size_kv_2 & (block_size_kv_2 - 1)) == 0
 
     PACKED_W = dim + 2 * tail_dim
@@ -1689,9 +1639,7 @@ def dpsk_v4_fp8_partial_kernel(
             Each block processes `inner_iter_1` (or `inner_iter_2`) consecutive
             KV tiles of one phase and writes one (partial_o, partial_lse) entry.
             """
-            with T.Kernel(
-                seq_len * REPLICATE_H * n_groups, batch, kv_group, threads=threads
-            ) as (bx, by, bz):
+            with T.Kernel(seq_len * REPLICATE_H * n_groups, batch, kv_group, threads=threads) as (bx, by, bz):
                 Q_shared = T.alloc_fragment([H_per_block, D], BF16)
                 Q_tail_shared = T.alloc_fragment([H_per_block, D_tail], BF16)
                 K_packed_shared = T.alloc_shared([BI, PACKED_W4], "uint32")
@@ -1750,9 +1698,7 @@ def dpsk_v4_fp8_partial_kernel(
                             page = page_idx_shared[bi_i]
                             block_id = page // BS_KV_1
                             t_in_block = page % BS_KV_1
-                            K_packed_shared[bi_i, w_i] = K_combined_1[
-                                block_id, t_in_block * PACKED_W4 + w_i
-                            ]
+                            K_packed_shared[bi_i, w_i] = K_combined_1[block_id, t_in_block * PACKED_W4 + w_i]
 
                         for bi_i, w_i in T.Parallel(BI, SCALE_W4):
                             page = page_idx_shared[bi_i]
@@ -1767,28 +1713,20 @@ def dpsk_v4_fp8_partial_kernel(
                             word_idx = ti // 4
                             byte_in_word = ti % 4
                             word = K_scale_shared[bi_i, word_idx]
-                            scale_byte_local[bi_i, ti] = (
-                                word >> T.Cast("uint32", byte_in_word * 8)
-                            ) & T.uint32(0xFF)
+                            scale_byte_local[bi_i, ti] = (word >> T.Cast("uint32", byte_in_word * 8)) & T.uint32(0xFF)
 
                         for bi_i, d_i in T.Parallel(BI, D):
                             word_idx = d_i // 4
                             byte_in_word = d_i % 4
                             word = K_packed_shared[bi_i, word_idx]
-                            b_u32 = (
-                                word >> T.Cast("uint32", byte_in_word * 8)
-                            ) & T.uint32(0xFF)
+                            b_u32 = (word >> T.Cast("uint32", byte_in_word * 8)) & T.uint32(0xFF)
                             sign_bf = (b_u32 & T.uint32(0x80)) * T.uint32(0x100)
                             exp_e4 = (b_u32 & T.uint32(0x78)) >> T.uint32(3)
                             mant_bf = (b_u32 & T.uint32(0x7)) * T.uint32(0x10)
                             scale_byte = scale_byte_local[bi_i, d_i // NOPE_TILE]
                             exp_combined = exp_e4 + scale_byte - T.uint32(7)
-                            bf16_bits = (
-                                sign_bf | (exp_combined << T.uint32(7)) | mant_bf
-                            )
-                            KV_shared[bi_i, d_i] = T.reinterpret(
-                                BF16, T.Cast("uint16", bf16_bits)
-                            )
+                            bf16_bits = sign_bf | (exp_combined << T.uint32(7)) | mant_bf
+                            KV_shared[bi_i, d_i] = T.reinterpret(BF16, T.Cast("uint16", bf16_bits))
 
                         for bi_i, j in T.Parallel(BI, D_tail):
                             abs_off = D + 2 * j
@@ -1800,14 +1738,10 @@ def dpsk_v4_fp8_partial_kernel(
                                 word & T.uint32(0xFFFF),
                                 (word >> T.uint32(16)) & T.uint32(0xFFFF),
                             )
-                            K_tail_shared[bi_i, j] = T.reinterpret(
-                                BF16, T.Cast("uint16", half_u32)
-                            )
+                            K_tail_shared[bi_i, j] = T.reinterpret(BF16, T.Cast("uint16", half_u32))
 
                         for h_i, bi_i in T.Parallel(H_per_block, BI):
-                            acc_s[h_i, bi_i] = T.if_then_else(
-                                mask[bi_i], 0, -T.infinity(acc_s.dtype)
-                            )
+                            acc_s[h_i, bi_i] = T.if_then_else(mask[bi_i], 0, -T.infinity(acc_s.dtype))
                         T.gemm(
                             Q_shared,
                             KV_shared,
@@ -1829,9 +1763,7 @@ def dpsk_v4_fp8_partial_kernel(
                         for h_i in T.Parallel(H_per_block):
                             alpha[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
                         for h_i, bi_i in T.Parallel(H_per_block, BI):
-                            acc_s[h_i, bi_i] = T.exp2(
-                                acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale
-                            )
+                            acc_s[h_i, bi_i] = T.exp2(acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale)
                         T.reduce_sum(acc_s, sumexp_i, dim=1)
                         for h_i in T.Parallel(H_per_block):
                             sumexp[h_i] = sumexp[h_i] * alpha[h_i] + sumexp_i[h_i]
@@ -1854,13 +1786,9 @@ def dpsk_v4_fp8_partial_kernel(
                         )
                     # ---- finalize phase 1 (active) ----
                     for h_i, d_i in T.Parallel(H_per_block, D):
-                        acc_o[h_i, d_i] = acc_o[h_i, d_i] / T.if_then_else(
-                            sumexp[h_i] == 0.0, 1.0, sumexp[h_i]
-                        )
+                        acc_o[h_i, d_i] = acc_o[h_i, d_i] / T.if_then_else(sumexp[h_i] == 0.0, 1.0, sumexp[h_i])
                     for h_i, d_i in T.Parallel(H_per_block, D_tail):
-                        acc_o_tail[h_i, d_i] = acc_o_tail[h_i, d_i] / T.if_then_else(
-                            sumexp[h_i] == 0.0, 1.0, sumexp[h_i]
-                        )
+                        acc_o_tail[h_i, d_i] = acc_o_tail[h_i, d_i] / T.if_then_else(sumexp[h_i] == 0.0, 1.0, sumexp[h_i])
                     for h_i in T.Parallel(H_per_block):
                         m_i[h_i] = T.if_then_else(
                             sumexp[h_i] == 0.0,
@@ -1893,9 +1821,7 @@ def dpsk_v4_fp8_partial_kernel(
                             page = page_idx_shared[bi_i]
                             block_id = page // BS_KV_2
                             t_in_block = page % BS_KV_2
-                            K_packed_shared[bi_i, w_i] = K_combined_2[
-                                block_id, t_in_block * PACKED_W4 + w_i
-                            ]
+                            K_packed_shared[bi_i, w_i] = K_combined_2[block_id, t_in_block * PACKED_W4 + w_i]
 
                         for bi_i, w_i in T.Parallel(BI, SCALE_W4):
                             page = page_idx_shared[bi_i]
@@ -1910,28 +1836,20 @@ def dpsk_v4_fp8_partial_kernel(
                             word_idx = ti // 4
                             byte_in_word = ti % 4
                             word = K_scale_shared[bi_i, word_idx]
-                            scale_byte_local[bi_i, ti] = (
-                                word >> T.Cast("uint32", byte_in_word * 8)
-                            ) & T.uint32(0xFF)
+                            scale_byte_local[bi_i, ti] = (word >> T.Cast("uint32", byte_in_word * 8)) & T.uint32(0xFF)
 
                         for bi_i, d_i in T.Parallel(BI, D):
                             word_idx = d_i // 4
                             byte_in_word = d_i % 4
                             word = K_packed_shared[bi_i, word_idx]
-                            b_u32 = (
-                                word >> T.Cast("uint32", byte_in_word * 8)
-                            ) & T.uint32(0xFF)
+                            b_u32 = (word >> T.Cast("uint32", byte_in_word * 8)) & T.uint32(0xFF)
                             sign_bf = (b_u32 & T.uint32(0x80)) * T.uint32(0x100)
                             exp_e4 = (b_u32 & T.uint32(0x78)) >> T.uint32(3)
                             mant_bf = (b_u32 & T.uint32(0x7)) * T.uint32(0x10)
                             scale_byte = scale_byte_local[bi_i, d_i // NOPE_TILE]
                             exp_combined = exp_e4 + scale_byte - T.uint32(7)
-                            bf16_bits = (
-                                sign_bf | (exp_combined << T.uint32(7)) | mant_bf
-                            )
-                            KV_shared[bi_i, d_i] = T.reinterpret(
-                                BF16, T.Cast("uint16", bf16_bits)
-                            )
+                            bf16_bits = sign_bf | (exp_combined << T.uint32(7)) | mant_bf
+                            KV_shared[bi_i, d_i] = T.reinterpret(BF16, T.Cast("uint16", bf16_bits))
 
                         for bi_i, j in T.Parallel(BI, D_tail):
                             abs_off = D + 2 * j
@@ -1943,14 +1861,10 @@ def dpsk_v4_fp8_partial_kernel(
                                 word & T.uint32(0xFFFF),
                                 (word >> T.uint32(16)) & T.uint32(0xFFFF),
                             )
-                            K_tail_shared[bi_i, j] = T.reinterpret(
-                                BF16, T.Cast("uint16", half_u32)
-                            )
+                            K_tail_shared[bi_i, j] = T.reinterpret(BF16, T.Cast("uint16", half_u32))
 
                         for h_i, bi_i in T.Parallel(H_per_block, BI):
-                            acc_s[h_i, bi_i] = T.if_then_else(
-                                mask[bi_i], 0, -T.infinity(acc_s.dtype)
-                            )
+                            acc_s[h_i, bi_i] = T.if_then_else(mask[bi_i], 0, -T.infinity(acc_s.dtype))
                         T.gemm(
                             Q_shared,
                             KV_shared,
@@ -1972,9 +1886,7 @@ def dpsk_v4_fp8_partial_kernel(
                         for h_i in T.Parallel(H_per_block):
                             alpha[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
                         for h_i, bi_i in T.Parallel(H_per_block, BI):
-                            acc_s[h_i, bi_i] = T.exp2(
-                                acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale
-                            )
+                            acc_s[h_i, bi_i] = T.exp2(acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale)
                         T.reduce_sum(acc_s, sumexp_i, dim=1)
                         for h_i in T.Parallel(H_per_block):
                             sumexp[h_i] = sumexp[h_i] * alpha[h_i] + sumexp_i[h_i]
@@ -1997,13 +1909,9 @@ def dpsk_v4_fp8_partial_kernel(
                         )
                     # ---- finalize phase 2 (active) ----
                     for h_i, d_i in T.Parallel(H_per_block, D):
-                        acc_o[h_i, d_i] = acc_o[h_i, d_i] / T.if_then_else(
-                            sumexp[h_i] == 0.0, 1.0, sumexp[h_i]
-                        )
+                        acc_o[h_i, d_i] = acc_o[h_i, d_i] / T.if_then_else(sumexp[h_i] == 0.0, 1.0, sumexp[h_i])
                     for h_i, d_i in T.Parallel(H_per_block, D_tail):
-                        acc_o_tail[h_i, d_i] = acc_o_tail[h_i, d_i] / T.if_then_else(
-                            sumexp[h_i] == 0.0, 1.0, sumexp[h_i]
-                        )
+                        acc_o_tail[h_i, d_i] = acc_o_tail[h_i, d_i] / T.if_then_else(sumexp[h_i] == 0.0, 1.0, sumexp[h_i])
                     for h_i in T.Parallel(H_per_block):
                         m_i[h_i] = T.if_then_else(
                             sumexp[h_i] == 0.0,
@@ -2036,9 +1944,7 @@ def dpsk_v4_fp8_partial_kernel(
         Each block processes `inner_iter_1` consecutive KV tiles and writes
         one (partial_o, partial_lse) entry.
         """
-        with T.Kernel(
-            seq_len * REPLICATE_H * n_groups, batch, kv_group, threads=threads
-        ) as (bx, by, bz):
+        with T.Kernel(seq_len * REPLICATE_H * n_groups, batch, kv_group, threads=threads) as (bx, by, bz):
             Q_shared = T.alloc_fragment([H_per_block, D], BF16)
             Q_tail_shared = T.alloc_fragment([H_per_block, D_tail], BF16)
             K_packed_shared = T.alloc_shared([BI, PACKED_W4], "uint32")
@@ -2092,9 +1998,7 @@ def dpsk_v4_fp8_partial_kernel(
                     page = page_idx_shared[bi_i]
                     block_id = page // BS_KV_1
                     t_in_block = page % BS_KV_1
-                    K_packed_shared[bi_i, w_i] = K_combined_1[
-                        block_id, t_in_block * PACKED_W4 + w_i
-                    ]
+                    K_packed_shared[bi_i, w_i] = K_combined_1[block_id, t_in_block * PACKED_W4 + w_i]
 
                 for bi_i, w_i in T.Parallel(BI, SCALE_W4):
                     page = page_idx_shared[bi_i]
@@ -2109,26 +2013,20 @@ def dpsk_v4_fp8_partial_kernel(
                     word_idx = ti // 4
                     byte_in_word = ti % 4
                     word = K_scale_shared[bi_i, word_idx]
-                    scale_byte_local[bi_i, ti] = (
-                        word >> T.Cast("uint32", byte_in_word * 8)
-                    ) & T.uint32(0xFF)
+                    scale_byte_local[bi_i, ti] = (word >> T.Cast("uint32", byte_in_word * 8)) & T.uint32(0xFF)
 
                 for bi_i, d_i in T.Parallel(BI, D):
                     word_idx = d_i // 4
                     byte_in_word = d_i % 4
                     word = K_packed_shared[bi_i, word_idx]
-                    b_u32 = (word >> T.Cast("uint32", byte_in_word * 8)) & T.uint32(
-                        0xFF
-                    )
+                    b_u32 = (word >> T.Cast("uint32", byte_in_word * 8)) & T.uint32(0xFF)
                     sign_bf = (b_u32 & T.uint32(0x80)) * T.uint32(0x100)
                     exp_e4 = (b_u32 & T.uint32(0x78)) >> T.uint32(3)
                     mant_bf = (b_u32 & T.uint32(0x7)) * T.uint32(0x10)
                     scale_byte = scale_byte_local[bi_i, d_i // NOPE_TILE]
                     exp_combined = exp_e4 + scale_byte - T.uint32(7)
                     bf16_bits = sign_bf | (exp_combined << T.uint32(7)) | mant_bf
-                    KV_shared[bi_i, d_i] = T.reinterpret(
-                        BF16, T.Cast("uint16", bf16_bits)
-                    )
+                    KV_shared[bi_i, d_i] = T.reinterpret(BF16, T.Cast("uint16", bf16_bits))
 
                 for bi_i, j in T.Parallel(BI, D_tail):
                     abs_off = D + 2 * j
@@ -2140,14 +2038,10 @@ def dpsk_v4_fp8_partial_kernel(
                         word & T.uint32(0xFFFF),
                         (word >> T.uint32(16)) & T.uint32(0xFFFF),
                     )
-                    K_tail_shared[bi_i, j] = T.reinterpret(
-                        BF16, T.Cast("uint16", half_u32)
-                    )
+                    K_tail_shared[bi_i, j] = T.reinterpret(BF16, T.Cast("uint16", half_u32))
 
                 for h_i, bi_i in T.Parallel(H_per_block, BI):
-                    acc_s[h_i, bi_i] = T.if_then_else(
-                        mask[bi_i], 0, -T.infinity(acc_s.dtype)
-                    )
+                    acc_s[h_i, bi_i] = T.if_then_else(mask[bi_i], 0, -T.infinity(acc_s.dtype))
                 T.gemm(
                     Q_shared,
                     KV_shared,
@@ -2169,9 +2063,7 @@ def dpsk_v4_fp8_partial_kernel(
                 for h_i in T.Parallel(H_per_block):
                     alpha[h_i] = T.exp2((m_i_prev[h_i] - m_i[h_i]) * sm_scale)
                 for h_i, bi_i in T.Parallel(H_per_block, BI):
-                    acc_s[h_i, bi_i] = T.exp2(
-                        acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale
-                    )
+                    acc_s[h_i, bi_i] = T.exp2(acc_s[h_i, bi_i] * sm_scale - m_i[h_i] * sm_scale)
                 T.reduce_sum(acc_s, sumexp_i, dim=1)
                 for h_i in T.Parallel(H_per_block):
                     sumexp[h_i] = sumexp[h_i] * alpha[h_i] + sumexp_i[h_i]
@@ -2181,18 +2073,12 @@ def dpsk_v4_fp8_partial_kernel(
                     acc_o_tail[h_i, d_i] *= alpha[h_i]
                 T.copy(acc_s, S_shared)
                 T.gemm(S_shared, KV_shared, acc_o, policy=T.GemmWarpPolicy.FullRow)
-                T.gemm(
-                    S_shared, K_tail_shared, acc_o_tail, policy=T.GemmWarpPolicy.FullRow
-                )
+                T.gemm(S_shared, K_tail_shared, acc_o_tail, policy=T.GemmWarpPolicy.FullRow)
 
             for h_i, d_i in T.Parallel(H_per_block, D):
-                acc_o[h_i, d_i] = acc_o[h_i, d_i] / T.if_then_else(
-                    sumexp[h_i] == 0.0, 1.0, sumexp[h_i]
-                )
+                acc_o[h_i, d_i] = acc_o[h_i, d_i] / T.if_then_else(sumexp[h_i] == 0.0, 1.0, sumexp[h_i])
             for h_i, d_i in T.Parallel(H_per_block, D_tail):
-                acc_o_tail[h_i, d_i] = acc_o_tail[h_i, d_i] / T.if_then_else(
-                    sumexp[h_i] == 0.0, 1.0, sumexp[h_i]
-                )
+                acc_o_tail[h_i, d_i] = acc_o_tail[h_i, d_i] / T.if_then_else(sumexp[h_i] == 0.0, 1.0, sumexp[h_i])
             for h_i in T.Parallel(H_per_block):
                 m_i[h_i] = T.if_then_else(
                     sumexp[h_i] == 0.0,
@@ -2319,14 +2205,10 @@ def dpsk_v4_combine_kernel(
                 T.fill(lse_sum, 0)
                 for k_c in T.serial(actual_n_groups):
                     for h_i in T.Parallel(H_per_block):
-                        lse_sum[h_i] = lse_sum[h_i] + T.exp2(
-                            shared_lse[k_c, h_i] - lse_max[h_i]
-                        )
+                        lse_sum[h_i] = lse_sum[h_i] + T.exp2(shared_lse[k_c, h_i] - lse_max[h_i])
                 for k_c in T.serial(actual_n_groups):
                     for h_i in T.Parallel(H_per_block):
-                        scale[h_i, k_c] = T.exp2(
-                            shared_lse[k_c, h_i] - lse_max[h_i] - T.log2(lse_sum[h_i])
-                        )
+                        scale[h_i, k_c] = T.exp2(shared_lse[k_c, h_i] - lse_max[h_i] - T.log2(lse_sum[h_i]))
 
                 T.fill(acc_o, 0)
                 for k_c in T.serial(actual_n_groups):
@@ -2336,9 +2218,7 @@ def dpsk_v4_combine_kernel(
                         n_groups_1 + (k_c - actual_n_groups_1),
                     )
                     for h_i, d_i in T.Parallel(H_per_block, DT):
-                        acc_o[h_i, d_i] = acc_o[h_i, d_i] + scale[h_i, k_c] * Partial_O[
-                            b_i, s_i, k, H0 + h_i, d_i
-                        ].astype(accum_dtype)
+                        acc_o[h_i, d_i] = acc_o[h_i, d_i] + scale[h_i, k_c] * Partial_O[b_i, s_i, k, H0 + h_i, d_i].astype(accum_dtype)
 
                 for h_i in T.Parallel(H_per_block):
                     empty = lse_max[h_i] <= -(2**29)
@@ -2356,11 +2236,7 @@ def dpsk_v4_combine_kernel(
                         o_scale_frag[h_i] = T.if_then_else(
                             empty,
                             0.0,
-                            1.0
-                            / (
-                                1.0
-                                + T.exp2((attn_sink_frag[h_i] - final_lse[h_i]) * log2e)
-                            ),
+                            1.0 / (1.0 + T.exp2((attn_sink_frag[h_i] - final_lse[h_i]) * log2e)),
                         )
                     for h_i, d_i in T.Parallel(H_per_block, DT):
                         acc_o[h_i, d_i] = acc_o[h_i, d_i] * o_scale_frag[h_i]
@@ -2405,21 +2281,15 @@ def dpsk_v4_combine_kernel(
             T.fill(lse_sum, 0)
             for k in T.serial(n_groups):
                 for h_i in T.Parallel(H_per_block):
-                    lse_sum[h_i] = lse_sum[h_i] + T.exp2(
-                        shared_lse[k, h_i] - lse_max[h_i]
-                    )
+                    lse_sum[h_i] = lse_sum[h_i] + T.exp2(shared_lse[k, h_i] - lse_max[h_i])
             for k in T.serial(n_groups):
                 for h_i in T.Parallel(H_per_block):
-                    scale[h_i, k] = T.exp2(
-                        shared_lse[k, h_i] - lse_max[h_i] - T.log2(lse_sum[h_i])
-                    )
+                    scale[h_i, k] = T.exp2(shared_lse[k, h_i] - lse_max[h_i] - T.log2(lse_sum[h_i]))
 
             T.fill(acc_o, 0)
             for k in T.serial(n_groups):
                 for h_i, d_i in T.Parallel(H_per_block, DT):
-                    acc_o[h_i, d_i] = acc_o[h_i, d_i] + scale[h_i, k] * Partial_O[
-                        b_i, s_i, k, H0 + h_i, d_i
-                    ].astype(accum_dtype)
+                    acc_o[h_i, d_i] = acc_o[h_i, d_i] + scale[h_i, k] * Partial_O[b_i, s_i, k, H0 + h_i, d_i].astype(accum_dtype)
 
             for h_i in T.Parallel(H_per_block):
                 empty = lse_max[h_i] <= -(2**29)
@@ -2437,10 +2307,7 @@ def dpsk_v4_combine_kernel(
                     o_scale_frag[h_i] = T.if_then_else(
                         empty,
                         0.0,
-                        1.0
-                        / (
-                            1.0 + T.exp2((attn_sink_frag[h_i] - final_lse[h_i]) * log2e)
-                        ),
+                        1.0 / (1.0 + T.exp2((attn_sink_frag[h_i] - final_lse[h_i]) * log2e)),
                     )
                 for h_i, d_i in T.Parallel(H_per_block, DT):
                     acc_o[h_i, d_i] = acc_o[h_i, d_i] * o_scale_frag[h_i]
@@ -2493,15 +2360,9 @@ def dpsk_v4_fp8_attention_fwd(
     k1, _, bs_kv_1 = _build_fp8_combined_view(k_cache)
     topk_1 = indices.shape[-1]
     ni_1 = topk_1 // block_I
-    tk_len_1 = (
-        topk_length
-        if topk_length is not None
-        else _topk_length_sentinel(q.device, batch)
-    )
+    tk_len_1 = topk_length if topk_length is not None else _topk_length_sentinel(q.device, batch)
     if attn_sink is None:
-        attn_sink = torch.full(
-            (num_heads,), float("-inf"), dtype=torch.float32, device=q.device
-        )
+        attn_sink = torch.full((num_heads,), float("-inf"), dtype=torch.float32, device=q.device)
 
     has_extra = extra_k_cache is not None
     if not has_extra:
@@ -2531,11 +2392,7 @@ def dpsk_v4_fp8_attention_fwd(
         inner_iter_2 = _pick_inner_iter(seq, ni_2, cu, block_per_cu)
         n_groups_1 = ni_1 // inner_iter_1
         n_groups_2 = ni_2 // inner_iter_2
-        tk_len_2 = (
-            extra_topk_length
-            if extra_topk_length is not None
-            else _topk_length_sentinel(q.device, batch)
-        )
+        tk_len_2 = extra_topk_length if extra_topk_length is not None else _topk_length_sentinel(q.device, batch)
         partial = dpsk_v4_fp8_partial_kernel(
             num_heads,
             topk_1,

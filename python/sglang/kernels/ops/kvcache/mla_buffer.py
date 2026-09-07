@@ -170,9 +170,7 @@ def _set_mla_kv_buffer_impl(
     if not has_rope:
         BLOCK = triton.next_power_of_2(nope_dim)
         grid = (n_loc, 1)
-        pdl_kwargs = (
-            {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
-        )
+        pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
         set_mla_kv_buffer_kernel_norope[grid](
             kv_buffer,
             cache_k_nope,
@@ -194,12 +192,7 @@ def _set_mla_kv_buffer_impl(
 
     nope_bytes = cache_k_nope.shape[-1] * cache_k_nope.element_size()
     rope_bytes = cache_k_rope.shape[-1] * cache_k_rope.element_size()
-    if (
-        n_loc >= _TMA_BULK_STORE_MIN_LOCS
-        and is_arch_support_pdl()
-        and can_use_set_mla_kv_buffer(nope_bytes, rope_bytes)
-        and dcp_world_size == 1
-    ):
+    if n_loc >= _TMA_BULK_STORE_MIN_LOCS and is_arch_support_pdl() and can_use_set_mla_kv_buffer(nope_bytes, rope_bytes) and dcp_world_size == 1:
         jit_set_mla_kv_buffer(
             kv_buffer,
             loc,
@@ -292,9 +285,15 @@ def set_mla_kv_buffer_fp8_quant_kernel(
     nope_dim: tl.constexpr,
     rope_dim: tl.constexpr,
     BLOCK: tl.constexpr,
+    DCP_RANK: tl.constexpr = 0,
+    DCP_WORLD_SIZE: tl.constexpr = 1,
     USE_GDC: tl.constexpr = False,
 ):
-    """Fuse BF16/FP16->FP8 cast with paged KV write."""
+    """Fuse BF16/FP16->FP8 cast with paged KV write.
+
+    Under DCP (DCP_WORLD_SIZE > 1) the incoming locs are global slot ids in
+    the widened space; each rank writes only the slots it owns
+    (loc % DCP_WORLD_SIZE == DCP_RANK) and collapses them to local rows."""
     pid_loc = tl.program_id(0)
     pid_blk = tl.program_id(1)
 
@@ -307,8 +306,9 @@ def set_mla_kv_buffer_fp8_quant_kernel(
         tl.extra.cuda.gdc_wait()
 
     loc = tl.load(loc_ptr + pid_loc).to(tl.int64)
-    is_valid = loc != reserved_skip_index
+    is_valid = (loc != reserved_skip_index) & (loc % DCP_WORLD_SIZE == DCP_RANK)
     safe_loc = tl.where(is_valid, loc, 0)
+    safe_loc = safe_loc // DCP_WORLD_SIZE
     dst_ptr = kv_buffer_fp8_ptr + safe_loc * buffer_stride + offs
 
     if base + BLOCK <= nope_dim:
@@ -353,10 +353,16 @@ def set_mla_kv_buffer_triton_fp8_quant(
     fp8_dtype: torch.dtype,
     *,
     reserved_skip_index: int = 0,
+    dcp_world_size: int = 1,
+    dcp_rank: int = 0,
 ):
     """Fuse BF16/FP16 MLA K quantization with paged KV write.
 
     Writes targeting ``reserved_skip_index`` are skipped. Pass -1 to disable.
+
+    With ``dcp_world_size > 1`` the locs are DCP-widened global slot ids and
+    only this rank's owned slots (loc % dcp_world_size == dcp_rank) are
+    written, collapsed to local rows.
     """
     kv_buffer_fp8 = kv_buffer.view(fp8_dtype)
 
@@ -381,7 +387,33 @@ def set_mla_kv_buffer_triton_fp8_quant(
         nope_dim,
         rope_dim,
         BLOCK=BLOCK,
+        DCP_RANK=dcp_rank,
+        DCP_WORLD_SIZE=dcp_world_size,
         **pdl_kwargs,
+    )
+
+
+def set_mla_kv_buffer_dcp_sharded_triton_fp8_quant(
+    kv_buffer: torch.Tensor,
+    loc: torch.Tensor,
+    cache_k_nope: torch.Tensor,
+    cache_k_rope: torch.Tensor,
+    fp8_dtype: torch.dtype,
+    *,
+    reserved_skip_index: int = 0,
+):
+    """Raw-fp8 DCP variant: scatter at DCP-widened locs, writing only this
+    rank's owned slots (see ``set_mla_kv_buffer_dcp_sharded_triton``)."""
+    parallel = get_parallel()
+    set_mla_kv_buffer_triton_fp8_quant(
+        kv_buffer,
+        loc,
+        cache_k_nope,
+        cache_k_rope,
+        fp8_dtype,
+        reserved_skip_index=reserved_skip_index,
+        dcp_world_size=parallel.attn_dcp_size,
+        dcp_rank=parallel.attn_dcp_rank,
     )
 
 
@@ -414,9 +446,7 @@ def set_mla_kv_scale_buffer_kernel(
 
     # Check each offs should read 'nope' or 'rope'
     is_nope = offs < nope_dim
-    src_nope = tl.load(
-        cache_k_nope_ptr + pid_loc * nope_stride + offs, mask=mask & is_nope, other=0.0
-    )
+    src_nope = tl.load(cache_k_nope_ptr + pid_loc * nope_stride + offs, mask=mask & is_nope, other=0.0)
     src_rope = tl.load(
         cache_k_rope_ptr + pid_loc * rope_stride + (offs - nope_dim),
         mask=mask & ~is_nope,
