@@ -231,14 +231,24 @@ class DefaultPoolConfigurator(MemoryPoolConfigurator):
                     )
 
                     target_kv_num_layers = get_glm_dsa_layer_split_effective_num_layers(kvc, num_layers)
-                    draft_kv_size = int(target_kv_size * draft_num_layers / target_kv_num_layers)
-                    draft_indexer_size = self._compute_dsa_indexer_cell_size(
-                        kvc=kvc,
-                        num_layers=draft_num_layers,
-                        allocate_all_layers=True,
+                    # Draft pools are DCP-replicated, not sharded: a draft
+                    # worker indexes the shared allocator's virtual locs raw
+                    # (loc_space_scale), so its KV and indexer pools span all
+                    # dcp_size copies per rank. Budget them here or the target
+                    # over-commits memory the draft will allocate.
+                    dcp_size = get_parallel().attn_dcp_size
+                    draft_kv_size = int(target_kv_size * draft_num_layers / target_kv_num_layers) * dcp_size
+                    draft_indexer_size = (
+                        self._compute_dsa_indexer_cell_size(
+                            kvc=kvc,
+                            num_layers=draft_num_layers,
+                            allocate_all_layers=True,
+                        )
+                        * dcp_size
                     )
                     self._cell_size += draft_kv_size + draft_indexer_size
                 else:
+                    draft_num_layers *= get_parallel().attn_dcp_size
                     self._cell_size = int(self._cell_size * (1 + draft_num_layers / int(num_layers)))
 
         # DFLASH/DSPARK: reserve the draft runner's *actual* per-token KV cost.
@@ -470,6 +480,13 @@ class HybridSWAPoolConfigurator(MemoryPoolConfigurator):
                     if draft_swa_layers is not None:
                         self._draft_swa_layers_num = min(max(int(draft_swa_layers), 0), draft_layers)
                 self._draft_full_layers_num = draft_layers - self._draft_swa_layers_num - self._draft_swa_full_layers_num
+                # Draft pools are DCP-replicated, not sharded: the draft worker
+                # spans the shared allocator's widened virtual loc space, so
+                # its full/SWA layer counts carry the same dcp_size factor.
+                dcp_size = get_parallel().attn_dcp_size
+                self._draft_swa_layers_num *= dcp_size
+                self._draft_swa_full_layers_num *= dcp_size
+                self._draft_full_layers_num *= dcp_size
 
         self._draft_cell_size = _dflash_draft_cell_size(kvc)
 
