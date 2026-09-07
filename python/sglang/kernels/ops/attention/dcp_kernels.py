@@ -67,9 +67,7 @@ def create_triton_kv_indices_for_dcp_triton(
             req_to_token_ptr + req_pool_index * req_to_token_ptr_stride + abs_pos,
             mask=mask,
         )
-        tl.store(
-            kv_indices_ptr + kv_indices_offset + offset, data // dcp_size, mask=mask
-        )
+        tl.store(kv_indices_ptr + kv_indices_offset + offset, data // dcp_size, mask=mask)
 
 
 # ---------------------------------------------------------------------------
@@ -240,9 +238,7 @@ def _correct_attn_cp_out_kernel(
 
     # Vectorized load of LSE values: shape = [N]
     num_n_offsets = tl.arange(0, N_ROUNDED)
-    lse_offsets = (
-        num_n_offsets * lses_stride_N + b_i32 * lses_stride_B + h_i32 * lses_stride_H
-    )
+    lse_offsets = num_n_offsets * lses_stride_N + b_i32 * lses_stride_B + h_i32 * lses_stride_H
 
     # Compute final LSE using online softmax algorithm (more numerically stable)
     lse = tl.load(lses_ptr + lse_offsets)
@@ -275,20 +271,16 @@ def _correct_attn_cp_out_kernel(
 
     # Load output with vectorized access: shape = [D]
     d_offsets = tl.arange(0, HEAD_DIM)
-    output_offsets = (
-        batch_idx * outputs_stride_B
-        + head_idx * outputs_stride_H
-        + d_offsets * outputs_stride_D
-    )
+    output_offsets = batch_idx * outputs_stride_B + head_idx * outputs_stride_H + d_offsets * outputs_stride_D
 
-    new_output_offsets = (
-        head_idx * new_outputs_stride_H
-        + batch_idx * new_outputs_stride_B
-        + d_offsets * new_outputs_stride_D
-    )
+    new_output_offsets = head_idx * new_outputs_stride_H + batch_idx * new_outputs_stride_B + d_offsets * new_outputs_stride_D
     # Apply correction and store
     output = tl.load(outputs_ptr + output_offsets)
     output = output * factor
+    # A zero-weight rank's raw output can be NaN (e.g. a degenerate DCP shard
+    # with no owned tokens); NaN * 0.0 == NaN, so guard explicitly rather than
+    # trust the multiply.
+    output = tl.where(factor == 0.0, 0.0, output)
     tl.store(new_output_ptr + new_output_offsets, output)
 
 
@@ -336,10 +328,7 @@ def correct_attn_out(
         lses = lses.squeeze(-1)
     if lses.ndim == 4 and lses.shape[1] == 1:
         lses = lses.squeeze(1)
-    assert lses.ndim == 3, (
-        f"expected lses [N,B,H] (optionally with a 1-sized extra dim), "
-        f"got {tuple(lses.shape)}"
-    )
+    assert lses.ndim == 3, f"expected lses [N,B,H] (optionally with a 1-sized extra dim), got {tuple(lses.shape)}"
 
     B, H, D = out.shape
     N = lses.shape[0]
@@ -352,9 +341,7 @@ def correct_attn_out(
     no_sH, no_sB, no_sD = new_output.stride()
     # Allocate LSE with the same B/H strides as `lses` so writes land correctly
     # even when `lses` is a non-contiguous view (e.g., 4-D to 3-D squeeze).
-    lse = torch.empty_strided(
-        (B, H), (l_sB, l_sH), device=lses.device, dtype=lses.dtype
-    )
+    lse = torch.empty_strided((B, H), (l_sB, l_sH), device=lses.device, dtype=lses.dtype)
 
     # Kernel launch config
     grid = (B, H, 1)
@@ -421,12 +408,7 @@ def _dcp_pack_a2a_send_kernel(
     h_local = h % H_PER_RANK
 
     src = out_ptr + b * out_stride_B + h * out_stride_H
-    dst = (
-        dst_o_ptr
-        + peer * dst_o_stride_N
-        + b * dst_o_stride_B
-        + h_local * dst_o_stride_H
-    )
+    dst = dst_o_ptr + peer * dst_o_stride_N + b * dst_o_stride_B + h_local * dst_o_stride_H
 
     for start in tl.range(0, WORDS, BLOCK):
         offs = start + tl.arange(0, BLOCK)
@@ -434,10 +416,7 @@ def _dcp_pack_a2a_send_kernel(
         tl.store(dst + offs, tl.load(src + offs, mask=mask), mask=mask)
 
     tl.store(
-        dst_lse_ptr
-        + peer * dst_lse_stride_N
-        + b * dst_lse_stride_B
-        + h_local * dst_lse_stride_H,
+        dst_lse_ptr + peer * dst_lse_stride_N + b * dst_lse_stride_B + h_local * dst_lse_stride_H,
         tl.load(lse_ptr + b * lse_stride_B + h * lse_stride_H),
     )
 
@@ -462,10 +441,7 @@ def dcp_pack_a2a_send(
     if D % lpd:
         raise ValueError(f"head dim {D} must be a multiple of the LSE pack dim {lpd}")
     if dst_o.shape != (N, B_max, H_per_rank, D) or H_per_rank * N != H or B > B_max:
-        raise ValueError(
-            f"destination {tuple(dst_o.shape)} / {tuple(dst_lse.shape)} does not "
-            f"match out {tuple(cp_attn_out.shape)}"
-        )
+        raise ValueError(f"destination {tuple(dst_o.shape)} / {tuple(dst_lse.shape)} does not match out {tuple(cp_attn_out.shape)}")
 
     out_words = cp_attn_out.view(torch.float32)
     dst_o_words = dst_o.view(torch.float32)
@@ -530,14 +506,10 @@ def _dcp_lse_combine_kernel(
 
     # Pass 1: find max LSE across N shards
     lse_max = tl.load(recv_lse_ptr + lse_base).to(tl.float32)
-    lse_max = tl.where(
-        (lse_max != lse_max) | (lse_max == float("inf")), -float("inf"), lse_max
-    )
+    lse_max = tl.where((lse_max != lse_max) | (lse_max == float("inf")), -float("inf"), lse_max)
     for i in tl.static_range(1, N):
         lse_i = tl.load(recv_lse_ptr + lse_base + i * recv_lse_stride_N).to(tl.float32)
-        lse_i = tl.where(
-            (lse_i != lse_i) | (lse_i == float("inf")), -float("inf"), lse_i
-        )
+        lse_i = tl.where((lse_i != lse_i) | (lse_i == float("inf")), -float("inf"), lse_i)
         lse_max = tl.where(lse_i > lse_max, lse_i, lse_max)
 
     lse_max = tl.where(lse_max == -float("inf"), 0.0, lse_max)
@@ -548,9 +520,7 @@ def _dcp_lse_combine_kernel(
 
     for i in tl.static_range(N):
         lse_i = tl.load(recv_lse_ptr + lse_base + i * recv_lse_stride_N).to(tl.float32)
-        lse_i = tl.where(
-            (lse_i != lse_i) | (lse_i == float("inf")), -float("inf"), lse_i
-        )
+        lse_i = tl.where((lse_i != lse_i) | (lse_i == float("inf")), -float("inf"), lse_i)
         centered = lse_i - lse_max
         if IS_BASE_E:
             w = tl.exp(centered)
@@ -558,20 +528,13 @@ def _dcp_lse_combine_kernel(
             w = tl.exp2(centered)
         weight_sum += w
 
-        o_offsets = (
-            i * recv_output_stride_N
-            + batch_idx * recv_output_stride_B
-            + head_idx * recv_output_stride_H
-            + d_offsets * recv_output_stride_D
-        )
+        o_offsets = i * recv_output_stride_N + batch_idx * recv_output_stride_B + head_idx * recv_output_stride_H + d_offsets * recv_output_stride_D
         partial_out = tl.load(recv_output_ptr + o_offsets).to(tl.float32)
         acc += partial_out * w
 
     acc = acc / weight_sum
 
-    out_offsets = (
-        batch_idx * out_stride_B + head_idx * out_stride_H + d_offsets * out_stride_D
-    )
+    out_offsets = batch_idx * out_stride_B + head_idx * out_stride_H + d_offsets * out_stride_D
     tl.store(out_ptr + out_offsets, acc.to(out_ptr.dtype.element_ty))
 
     if RETURN_LSE:
@@ -602,14 +565,8 @@ def dcp_lse_combine_triton(
         (combined_output [B, H_local, D], combined_lse [B, H_local] or None)
     """
     N, B, H_local, D = recv_output.shape
-    out = torch.empty(
-        (B, H_local, D), device=recv_output.device, dtype=recv_output.dtype
-    )
-    out_lse = (
-        torch.empty((B, H_local), device=recv_lse.device, dtype=recv_lse.dtype)
-        if return_lse
-        else recv_lse.new_empty(0)
-    )
+    out = torch.empty((B, H_local, D), device=recv_output.device, dtype=recv_output.dtype)
+    out_lse = torch.empty((B, H_local), device=recv_lse.device, dtype=recv_lse.dtype) if return_lse else recv_lse.new_empty(0)
 
     grid = (B, H_local)
     _dcp_lse_combine_kernel[grid](
