@@ -406,6 +406,20 @@ class DeepseekSparseAttnBackend(
         self.kv_lora_rank = model_runner.model_config.kv_lora_rank
         self.qk_rope_head_dim = model_runner.model_config.qk_rope_head_dim
 
+        # Pseudo-V3.2 mode (change flashmla-kv-glm53-scaled-fp8): rope-free
+        # scaled-FP8 model on a 656B/token pool (scaled 528B payload + 128B
+        # zeroed bf16 rope tail). _forward_flashmla_kv pads q's 512 latent
+        # columns to 576 so the FlashMLA V3.2 kernel branch accepts the pair.
+        _fm656_quant_block = (
+            getattr(model_runner.token_to_kv_pool, "quant_block_size", None) or 128
+        )
+        self.flashmla_kv_pseudo_v32 = (
+            self.qk_rope_head_dim == 0
+            and self.dsa_kv_cache_store_fp8
+            and self.kv_cache_dim
+            == self.kv_lora_rank + self.kv_lora_rank // _fm656_quant_block * 4 + 128
+        )
+
         assert model_runner.req_to_token_pool is not None
         self.req_to_token_pool = model_runner.req_to_token_pool
         self.token_to_kv_pool = model_runner.token_to_kv_pool
@@ -422,6 +436,21 @@ class DeepseekSparseAttnBackend(
             # so keep the one-shot MHA fast path off.
             self.supports_mha_one_shot = False
         self.dsa_topk_backend: DSATopKBackend = DSATopKBackend.resolve(model_runner)
+        # FlashMLA decode is only instantiated for 64/128 q-head variants; a
+        # wider effective head count (e.g. TP4+DCP4 = 256 heads) is
+        # fundamentally out of scope — fail fast at configuration time,
+        # before any pool sizing or graph capture.
+        if (
+            self.dsa_decode_impl == "flashmla_kv"
+            and self.num_q_heads * get_parallel().attn_dcp_size > 128
+        ):
+            raise ValueError(
+                f"--dsa-decode-backend flashmla_kv supports at most 128 effective "
+                f"q heads (FlashMLA kernel limit); got num_q_heads={self.num_q_heads} "
+                f"x attn_dcp_size={get_parallel().attn_dcp_size} = "
+                f"{self.num_q_heads * get_parallel().attn_dcp_size}. Reduce to "
+                "--dcp-size 1 or increase --tp-size so heads*x <= 128."
+            )
         if self.num_q_heads <= 64:
             self.flashmla_kv_num_q_heads = 64
         elif self.num_q_heads <= 128:
@@ -2935,6 +2964,16 @@ class DeepseekSparseAttnBackend(
             q_input[:, :, :num_q_heads, :] = q_all
         else:
             q_input = q_all
+
+        if self.flashmla_kv_pseudo_v32 and q_input.shape[-1] == self.kv_lora_rank:
+            # Pseudo-V3.2 (change flashmla-kv-glm53-scaled-fp8): the pool row is
+            # 656B and the kernel must dispatch its V3.2 branch (d_qk=576). Pad
+            # the 512 latent columns with 64 zero columns — lossless for
+            # rope_dim=0 (rope_term = sum 0*k = 0). Applied after the q-head pad
+            # above so both transforms compose.
+            q_input = torch.cat(
+                (q_input, q_input.new_zeros(*q_input.shape[:-1], 64)), dim=-1
+            )
 
         kv_cache = kv_cache.view(-1, self.real_page_size, 1, self.kv_cache_dim)
         assert self.real_page_size == 64, "only page size 64 is supported"

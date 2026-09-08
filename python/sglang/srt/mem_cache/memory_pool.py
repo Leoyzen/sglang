@@ -103,6 +103,13 @@ logger = logging.getLogger(__name__)
 # re-enable for debugging.
 _MAMBA_DEBUG_ASSERTS = os.environ.get("SGLANG_MAMBA_DEBUG_ASSERTS", "0") == "1"
 
+# Task 3.2 (change flashmla-kv-glm53-scaled-fp8): sample one written row per
+# scaled-FP8 MLA scatter and assert its 128B pseudo-V3.2 rope tail (bytes
+# [528:656] of the 656B row) stayed allocation-zeroed. Requires a device
+# sync per call — debug only, off by default.
+_FM656_DEBUG = os.environ.get("SGLANG_FM656_DEBUG", "0") == "1"
+_FM656_TAIL_ZERO_LOGGED = False
+GB = 1024 * 1024 * 1024
 GB = 1024 * 1024 * 1024
 _is_cuda = is_cuda()
 _is_npu = is_npu()
@@ -3686,6 +3693,32 @@ class HybridLinearKVPool(KVCache):
         )
 
 
+def _fm656_debug_check_tail_zero(dst_buffer: torch.Tensor, loc: torch.Tensor) -> None:
+    """Debug audit for the 656B pseudo-V3.2 pool (change flashmla-kv-glm53-scaled-fp8).
+
+    Samples one written row and asserts its rope tail (bytes [528:656])
+    is still all zero after the scatter. Graph-hostile ops (randint sync,
+    .item()) are illegal under CUDA graph capture, so the check is skipped
+    during capture/replay; gated by SGLANG_FM656_DEBUG=1, logs once.
+    """
+    global _FM656_TAIL_ZERO_LOGGED
+    if loc.numel() == 0:
+        return
+    from torch.cuda import is_current_stream_capturing
+
+    if is_current_stream_capturing():
+        return
+    if not _FM656_TAIL_ZERO_LOGGED:
+        logger.info("SGLANG_FM656_DEBUG: enabled; auditing 128B rope tail [528:656] zeroing on sampled rows.")
+        _FM656_TAIL_ZERO_LOGGED = True
+    sample = int(torch.randint(0, loc.numel(), (1,), device=loc.device).item())
+    tail = dst_buffer[loc[sample], 528:656].flatten().view(torch.uint8)
+    assert bool((tail == 0).all().item()), (
+        "SGLANG_FM656_DEBUG: rope tail bytes [528:656] of a written row are non-zero; "
+        "a write path is corrupting the pseudo-V3.2 zeroed tail."
+    )
+
+
 class MLATokenToKVPool(KVCache):
     def __init__(
         self,
@@ -3879,8 +3912,16 @@ class MLATokenToKVPool(KVCache):
 
             # Reuse existing two-tensor write kernel (works with FP8 byte layout)
             # cache_k_nope_fp8: (num_tokens, 1, 528) uint8 [nope_fp8(512) | scales(16)]
-            # cache_k_rope_fp8: (num_tokens, 1, 128) uint8 [rope_bf16_bytes(128)]
+            # cache_k_rope_fp8: (num_tokens, 1, 128) uint8 [rope_bf16_bytes(128)],
+            #                   or empty (num_tokens, 1, 0) for rope-free models.
+            # Pseudo-V3.2 (change flashmla-kv-glm53-scaled-fp8): when the pool is
+            # 656B wide, the rope-free scatter writes only the first 528B; bytes
+            # [528:656] are the zeroed rope tail the FlashMLA V3.2 branch expects,
+            # guaranteed by allocation-time zeroing (the norope scatter kernel
+            # never touches them). _fm656_debug_check_tail_zero audits this.
             self._scatter_mla_rows(dst_buffer, loc, cache_k_nope_fp8, cache_k_rope_fp8)
+            if _FM656_DEBUG and cache_k_rope_fp8.numel() == 0 and dst_buffer.shape[-1] == 656:
+                _fm656_debug_check_tail_zero(dst_buffer, loc)
         else:
             if cache_k_nope.dtype != self.dtype:
                 cache_k_nope = cache_k_nope.to(self.dtype)

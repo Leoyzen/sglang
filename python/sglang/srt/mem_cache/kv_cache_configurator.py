@@ -2206,6 +2206,27 @@ def calculate_mla_kv_cache_dim(*, model_config: ModelConfig, kv_cache_dtype: tor
 
     quant_block_size = DSATokenToKVPool.quant_block_size
     rope_storage_dtype = DSATokenToKVPool.rope_storage_dtype
+    # Pseudo-V3.2 layout for the FlashMLA sparse decode kernel on rope-free
+    # scaled-FP8 MLA (e.g. GLM-5.3-Flash): the kernel's V3.2 branch expects a
+    # 656B/token row = scaled 528B payload (nope fp8 + per-128 fp32 scales)
+    # plus a 128B zeroed bf16 rope tail. Size the pool accordingly whenever
+    # the flashmla_kv decode pair is resolved; the zeroed tail is guaranteed
+    # by allocation and preserved because no write path touches those bytes.
+    if (
+        not _is_hip
+        and kv_cache_dtype == torch.float8_e4m3fn
+        and qk_rope_head_dim == 0
+        and get_exec().kernel.dsa_decode_backend == "flashmla_kv"
+    ):
+        assert kv_lora_rank % quant_block_size == 0, (
+            f"kv_lora_rank {kv_lora_rank} must be multiple of quant_block_size {quant_block_size}"
+        )
+        return (
+            kv_lora_rank
+            + kv_lora_rank // quant_block_size * 4
+            + 128
+        )
+
     # Calculate override_kv_cache_dim for FP8 storage in backends that use scaled KV layout
     # (excluding TRTLLM and HIP raw-layout kernels).
     # kv_lora_rank + scale storage (kv_lora_rank // quant_block_size * 4 bytes) + rope dimension storage
