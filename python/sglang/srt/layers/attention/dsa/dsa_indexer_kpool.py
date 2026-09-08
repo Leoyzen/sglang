@@ -408,7 +408,10 @@ class IndexerKPool(MultiPlatformOp):
                 )
 
             pool_start_id = first_pos // kpool
-            page_size = get_token_to_kv_pool().page_size
+            # block_tables rows are 64-token pages (real page granularity);
+            # the pool's allocator page size (256 under spec x DCP draft) is a
+            # different axis and must not be used to slice these tables.
+            page_size = 64
             use_returned_compressed = return_compressed and (
                 not write_cache or pool_start_id == 0
             )
@@ -778,14 +781,19 @@ class IndexerKPool(MultiPlatformOp):
 
         pool = get_token_to_kv_pool()
         page_size = pool.page_size
-        # DeepGEMM paged-MQA requires 64-token pages.
-        assert page_size == 64, "only support page size 64"
-
-        block_tables = metadata.get_page_table_64()
-
-        kv_cache_fp8 = self._get_index_k_read_buffer(pool, layer_id)
-
-        blocksize = page_size
+        # DeepGEMM paged-MQA consumes pooled rows in 64-token pages
+        # (BLOCK_SIZE_K=64 pooled-row units). The pool's allocator paging is a
+        # separate axis: under spec×DCP the replicated draft pool pages the
+        # DCP-virtual space (page_size = 64 * dcp_size, e.g. 256 per #33348),
+        # so the allocator page must be a multiple of the 64-token kernel page,
+        # not equal to it.
+        assert page_size % 64 == 0, (
+            f"kpool paged-MQA requires the pool page size to be a multiple of "
+            f"64 (BLOCK_SIZE_K pooled-row units); got page_size={page_size}"
+        )
+        # The paged-MQA kernel's page granularity is always 64 pooled rows,
+        # regardless of the allocator's virtual-space paging.
+        blocksize = 64
         if (
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend_v2()
@@ -972,7 +980,9 @@ class IndexerKPool(MultiPlatformOp):
         )
 
         pool_size = self.index_kpool
-        page_size = get_token_to_kv_pool().page_size
+        # Table slicing below uses the 64-token row granularity of
+        # get_page_table_64() rows, not the pool allocator page size.
+        page_size = 64
         token_nums = q_fp8.shape[0]
         tail_pool = pool_size - 1
         topk_result = torch.empty(
@@ -1223,7 +1233,12 @@ class IndexerKPool(MultiPlatformOp):
         assert forward_batch.forward_mode.is_extend_without_speculative()
 
         page_size = get_token_to_kv_pool().page_size
-        assert page_size == 64, "only support page size 64"
+        # Pooled-row addressing here is in 64-token kernel pages; the pool's
+        # allocator page may be wider (spec x DCP draft: page 256 per #33348).
+        assert page_size % 64 == 0, (
+            f"kpool paged top-k requires the pool page size to be a multiple of "
+            f"64 (BLOCK_SIZE_K pooled-row units); got page_size={page_size}"
+        )
         assert len(weights.shape) == 3
         weights = weights.squeeze(-1)
         if metadata.attn_metadata.kpool_extend_plan is not None:

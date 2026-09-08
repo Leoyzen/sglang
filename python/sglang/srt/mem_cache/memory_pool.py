@@ -3950,6 +3950,17 @@ class MLATokenToKVPool(KVCache):
 
         tgt_loc_flat = tgt_loc.view(-1).long()
         src_loc_flat = src_loc.view(-1).long()
+
+        # Spec x DCP: accept-path relocation locs come from req_to_token in the
+        # DCP-widened virtual space, but this pool's rows are per-rank SHARDS
+        # addressed by the physical id (widened // dcp_size) — the same
+        # translation the write-side owner filter applies. Collapse both sides;
+        # replicated pools (draft) must NOT take this path (their locs are
+        # virtual-space-native).
+        if get_parallel().dcp_enabled and not self.write_loc_is_dcp_resolved:
+            dcp = get_parallel().attn_dcp_size
+            tgt_loc_flat = tgt_loc_flat // dcp
+            src_loc_flat = src_loc_flat // dcp
         for kv_cache in self.kv_buffer:
             kv_cache[tgt_loc_flat] = kv_cache[src_loc_flat]
 
