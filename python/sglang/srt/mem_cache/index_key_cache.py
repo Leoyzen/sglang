@@ -124,11 +124,15 @@ class IndexKeyCache:
 
     def cpu_copy(self, indices):
         # Retracted pages may be reused before resume, so offload index-K with KV.
-        page_indices = indices[:: self.pool.page_size] // self.pool.page_size
+        # Buffer rows are 64-token KERNEL pages; token locs (allocator virtual
+        # space) must be sampled/divided by the kernel page width, not the
+        # pool allocator page size (which is wider under spec x DCP drafts).
+        kpage = self.buffer[0].shape[1] // self.pool.index_head_dim if self.buffer and self.buffer[0].shape[0] else 64
+        page_indices = indices[::kpage] // kpage
         torch.cuda.synchronize()
         index_k_cpu = []
         chunk_size = self.pool.cpu_offloading_chunk_size
-        page_chunk_size = max(1, chunk_size // self.pool.page_size)
+        page_chunk_size = max(1, chunk_size // kpage)
         for layer_id in range(self.pool.layer_num):
             index_k_cpu.append([])
             if self.buffer[layer_id].shape[0] == 0:
@@ -143,10 +147,11 @@ class IndexKeyCache:
         return index_k_cpu
 
     def load_cpu_copy(self, index_k_cpu, indices) -> None:
-        page_indices = indices[:: self.pool.page_size] // self.pool.page_size
+        kpage = self.buffer[0].shape[1] // self.pool.index_head_dim if self.buffer and self.buffer[0].shape[0] else 64
+        page_indices = indices[::kpage] // kpage
         torch.cuda.synchronize()
         chunk_size = self.pool.cpu_offloading_chunk_size
-        page_chunk_size = max(1, chunk_size // self.pool.page_size)
+        page_chunk_size = max(1, chunk_size // kpage)
         for layer_id in range(self.pool.layer_num):
             if self.buffer[layer_id].shape[0] == 0:
                 continue

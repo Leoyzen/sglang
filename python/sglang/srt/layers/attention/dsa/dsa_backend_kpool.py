@@ -68,7 +68,11 @@ class DeepseekSparseAttnBackendKPoolMixin:
         return dsa_impl
 
     def _kpool_slots_per_page(self) -> int:
-        return getattr(self.token_to_kv_pool, "slots_per_page", self.real_page_size)
+        # KPool write-plan slot math addresses the index-K buffer in 64-token
+        # kernel-page units (the same axis the buffer is tiled in), not the
+        # pool allocator's page (which is wider under spec x DCP draft pools).
+        kpool = self.dsa_index_kpool
+        return 64 // kpool
 
     def _build_kpool_paged_mqa_schedule_metadata(self) -> bool:
         if self.device_sm_major == 9:
