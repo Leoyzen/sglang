@@ -794,6 +794,10 @@ class IndexerKPool(MultiPlatformOp):
         # The paged-MQA kernel's page granularity is always 64 pooled rows,
         # regardless of the allocator's virtual-space paging.
         blocksize = 64
+
+        block_tables = metadata.get_page_table_64()
+
+        kv_cache_fp8 = self._get_index_k_read_buffer(pool, layer_id)
         if (
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend_v2()
