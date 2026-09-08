@@ -14,7 +14,12 @@ if TYPE_CHECKING:
 class IndexKeyCache:
     def __init__(self, pool: DSATokenToKVPool, index_buf_size: int):
         self.pool = pool
-        num_pages = (index_buf_size + pool.page_size + 1) // pool.page_size
+        # Buffer rows are fixed 64-token kernel pages (BLOCK_SIZE_K pooled-row
+        # units consumed by the paged-MQA kpool path), NOT the pool's allocator
+        # page width — under spec×DCP the draft pool pages its virtual space at
+        # 64×dcp (e.g. 256, #33348), which would mis-shape this buffer.
+        KERNEL_PAGE_TOKENS = 64
+        num_pages = (index_buf_size + KERNEL_PAGE_TOKENS + 1) // KERNEL_PAGE_TOKENS
         with (
             torch.cuda.use_mem_pool(pool.custom_mem_pool)
             if pool.custom_mem_pool
@@ -31,9 +36,13 @@ class IndexKeyCache:
 
     def _buffer_shape(self, num_pages: int) -> tuple[int, int]:
         pool = self.pool
+        # Row width matches the 64-token kernel page (BLOCK_SIZE_K pooled-row
+        # units), not the pool's allocator page size (256 under spec x DCP
+        # draft per #33348) — the paged-MQA view requires 64-wide rows.
+        KERNEL_PAGE_TOKENS = 64
         return (
             num_pages,
-            pool.page_size
+            KERNEL_PAGE_TOKENS
             * (pool.index_head_dim + pool.index_head_dim // pool.quant_block_size * 4),
         )
 
