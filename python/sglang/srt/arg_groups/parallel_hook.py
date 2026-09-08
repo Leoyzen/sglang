@@ -109,7 +109,7 @@ def handle_dcp_validation(server_args: Any):
             "authoritative fabric probe runs at model-runner init; use 'a2a' "
             "or 'ag_rs' on clusters without MNNVL."
         )
-    if cfg.dcp_size > 1 and cfg.speculative_algorithm is not None and get_platform().is_cuda():
+    if cfg.dcp_size > 1 and cfg.speculative_algorithm is not None and get_platform().is_cuda:
         logger.warning(
             "Decode context parallel (--dcp-size > 1) with "
             "speculative decoding is experimental: validated for DSA "
