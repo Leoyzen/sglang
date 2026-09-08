@@ -3789,6 +3789,10 @@ class MLATokenToKVPool(KVCache):
     # `kernel_page_blocks`: that is `layer_num`, so a rank owning one
     # full-attention layer is translated with blocks_per_page 1.
     write_loc_is_dcp_resolved = False
+    # Loc-space kind for spec x DCP: None (no DCP / unified), 'sharded'
+    # (per-rank shard, widened locs collapsed on move) or 'virtual'
+    # (replicated pool spanning the DCP-virtual space, e.g. draft).
+    dcp_loc_space: Optional[str] = None
 
     @property
     def _write_loc_dcp_span(self) -> int:
@@ -3952,13 +3956,23 @@ class MLATokenToKVPool(KVCache):
         src_loc_flat = src_loc.view(-1).long()
 
         # Spec x DCP: accept-path relocation locs come from req_to_token in the
-        # DCP-widened virtual space, but this pool's rows are per-rank SHARDS
-        # addressed by the physical id (widened // dcp_size) — the same
-        # translation the write-side owner filter applies. Collapse both sides;
-        # replicated pools (draft) must NOT take this path (their locs are
-        # virtual-space-native).
-        if get_parallel().dcp_enabled and not self.write_loc_is_dcp_resolved:
+        # DCP-widened virtual space, but a SHARDED pool's rows are per-rank
+        # rows addressed by the physical id (widened // dcp_size) — the same
+        # translation the write-side owner filter applies. REPLICATED pools
+        # (draft, spanned over the virtual space per #33348) address rows by
+        # raw virtual loc and must NOT be collapsed. Structural flags below:
+        #   dcp_loc_space == 'sharded'  -> collapse widened locs
+        #   dcp_loc_space == 'virtual'  -> pass through (draft pools)
+        # Set in kv_cache_configurator._init_pools at construction time.
+        if get_parallel().dcp_enabled and not self.write_loc_is_dcp_resolved and getattr(self, "dcp_loc_space", None) == "sharded":
             dcp = get_parallel().attn_dcp_size
+            if not (tgt_loc_flat % dcp == src_loc_flat % dcp).all():
+                raise NotImplementedError(
+                    "EAGLE tree-mode (topk > 1) accept relocation under DCP "
+                    "moves KV across owner ranks, which requires cross-rank "
+                    "movement that is not implemented. Slot residues differ: "
+                    "refusing to move wrong data (silent corruption otherwise)."
+                )
             tgt_loc_flat = tgt_loc_flat // dcp
             src_loc_flat = src_loc_flat // dcp
         for kv_cache in self.kv_buffer:
@@ -4198,9 +4212,7 @@ class DSATokenToKVPool(MLATokenToKVPool):
             # allocator's virtual loc space (page_size = 64 * dcp_size; see
             # kv_cache_configurator.loc_space_scale). Any multiple of 64 keeps
             # the DSA 64-column paging invariant.
-            assert self.page_size % 64 == 0 and self.page_size >= 64, (
-                f"CUDA DSA requires page_size to be a multiple of 64, got {self.page_size}"
-            )
+            assert self.page_size % 64 == 0 and self.page_size >= 64, f"CUDA DSA requires page_size to be a multiple of 64, got {self.page_size}"
         self.index_key_cache = self._create_index_key_cache()
         self._init_kpool_compress_tail_buffers(
             index_kpool=index_kpool,
