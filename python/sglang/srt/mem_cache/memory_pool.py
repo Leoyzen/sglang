@@ -4183,7 +4183,13 @@ class DSATokenToKVPool(MLATokenToKVPool):
                 128,
             ), f"XPU DSA requires page_size 64 or 128, got {self.page_size}"
         else:
-            assert self.page_size == 64
+            # Under spec x DCP the replicated draft worker pages the shared
+            # allocator's virtual loc space (page_size = 64 * dcp_size; see
+            # kv_cache_configurator.loc_space_scale). Any multiple of 64 keeps
+            # the DSA 64-column paging invariant.
+            assert self.page_size % 64 == 0 and self.page_size >= 64, (
+                f"CUDA DSA requires page_size to be a multiple of 64, got {self.page_size}"
+            )
         self.index_key_cache = self._create_index_key_cache()
         self._init_kpool_compress_tail_buffers(
             index_kpool=index_kpool,
