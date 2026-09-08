@@ -608,26 +608,33 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if out_cache_loc is None:
             out_cache_loc = forward_batch.out_cache_loc
         pool = get_token_to_kv_pool()
-        page_size = pool.page_size
         if hasattr(pool, "invalidate_index_buffer_for_layer"):
             pool.invalidate_index_buffer_for_layer(layer_id)
         if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
             return
+        buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
+        # The fused-store kernel pages the index-K buffer in 64-token kernel
+        # pages (its loc addressing is loc // kpage, loc % kpage), matching the
+        # buffer's row layout (IndexKeyCache._buffer_shape) and the fallback
+        # SetKAndS accessor (page_size = buf row // per-token bytes). This is
+        # independent of the pool's ALLOCATOR page size, which is wider under
+        # spec x DCP draft pools (64 * dcp, e.g. 256 per #33348).
+        kpage = buf.shape[1] // (pool.index_head_dim + pool.index_head_dim // pool.quant_block_size * 4)
         if (
             not _is_fp8_fnuz
             and out_cache_loc is not None
-            and can_use_dsa_fused_store(torch.bfloat16, out_cache_loc.dtype, page_size)
+            and can_use_dsa_fused_store(torch.bfloat16, out_cache_loc.dtype, kpage)
         ):
             fused_k_indexer_norm_rope_store(
                 key_raw,
-                pool.get_index_k_with_scale_buffer(layer_id=layer_id),
+                buf,
                 out_cache_loc,
                 self.k_norm.weight,
                 self.k_norm.bias,
                 self.k_norm.variance_epsilon,
                 self._indexer_cos_sin_cache,
                 positions,
-                page_size,
+                kpage,
             )
             return
 
@@ -809,6 +816,13 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
 
         page_size = get_token_to_kv_pool().page_size
         # NOTE(dark): blocksize = 64 is hardcoded in deep_gemm
+        # Allocator page vs 64-token kernel page are independent axes: under
+        # spec x DCP the draft pool pages the DCP-virtual space at
+        # 64 * dcp (e.g. 256 per #33348), but the paged-MQA kernels below
+        # (deep_gemm / aiter / cutedsl) always consume 64-token buffer rows
+        # (see IndexKeyCache._buffer_shape) and hardcode blocksize = 64.
+        # The page tables (get_page_table_64) are also 64-token pages, so all
+        # sizes below derive from kpage = 64, not the allocator page_size.
         if _is_hip:
             if _use_aiter_preshuffle:
                 assert page_size % 16 == 0, (
@@ -824,17 +838,21 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 128,
             ), f"XPU DSA only supports page_size 64 or 128, got {page_size}"
         else:
-            assert page_size == 64, "only support page size 64"
+            assert page_size % 64 == 0, (
+                f"CUDA paged MQA requires the pool page size to be a multiple "
+                f"of 64 (BLOCK_SIZE_K pooled-row units); got page_size={page_size}"
+            )
+        kpage = 64
         # NOTE(dark): this support extend/decode/decode+graph
         if _is_hip and not _use_aiter_preshuffle:
             block_tables = metadata.get_page_table_1()
         else:
             block_tables = metadata.get_page_table_64()
 
-        max_seq_len = block_tables.shape[1] * page_size
+        max_seq_len = block_tables.shape[1] * kpage
         kv_cache_fp8 = self._get_index_k_read_buffer(get_token_to_kv_pool(), layer_id)
 
-        blocksize = page_size
+        blocksize = kpage
         if (
             forward_batch.forward_mode.is_target_verify()
             or forward_batch.forward_mode.is_draft_extend_v2()
@@ -902,7 +920,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                 )
 
         assert len(kv_cache_fp8.shape) == 2
-        block_kv = page_size
+        # Buffer rows are 64-token kernel pages (IndexKeyCache._buffer_shape);
+        # view by kpage, not the allocator page_size (which is wider under
+        # spec x DCP draft pools and would fail / misalign the view).
+        block_kv = kpage
         num_heads_kv = 1
         head_dim_with_sf = 132
         kv_cache_fp8 = kv_cache_fp8.view(
@@ -1135,7 +1156,12 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
                     128,
                 ), f"XPU DSA requires page_size 64 or 128, got {page_size}"
             else:
-                assert page_size == 64, "only support page size 64"
+                # page_size here is only asserted (all buffer access below derives
+                # the 64-token kernel-page width from the buffer row layout);
+                # under spec x DCP the draft pool pages at 64 * dcp (e.g. 256).
+                assert page_size % 64 == 0, (
+                    f"CUDA DSA requires page_size to be a multiple of 64, got {page_size}"
+                )
 
         assert len(weights.shape) == 3
         assert (
@@ -1444,22 +1470,27 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         if hasattr(pool, "_is_layer_owned") and not pool._is_layer_owned(layer_id):
             return
 
+        # Kernel-page width derived from the buffer row layout (64-token kernel
+        # pages), not the pool's allocator page size — see
+        # _fused_k_prepare_and_store for the full rationale.
+        buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
+        kpage = buf.shape[1] // (pool.index_head_dim + pool.index_head_dim // pool.quant_block_size * 4)
+
         if (
             _is_cuda
             and (not _is_fp8_fnuz)
             and can_use_dsa_fused_store(
                 key.dtype,
                 out_cache_loc.dtype,
-                pool.page_size,
+                kpage,
             )
         ):
             # NOTE: wrapper already normalizes shape/contiguity and asserts dtypes.
-            buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
             fused_store_index_k_cache(
                 key,
                 buf,
                 out_cache_loc,
-                pool.page_size,
+                kpage,
             )
             return
 
@@ -1469,9 +1500,10 @@ class Indexer(DSANPUIndexerMixin, BaseFusedOp):
         # layout with page_size=1; the same kv_cache.view works for both cases
         # because page_size is 1 there.
         if _use_aiter:
-            page_size = pool.page_size
-            buf = pool.get_index_k_with_scale_buffer(layer_id=layer_id)
-            kv_cache = buf.view(-1, page_size, 132).view(fp8_dtype)
+            # View the buffer by its actual 64-token kernel-page row width
+            # (see IndexKeyCache._buffer_shape), not the allocator page size.
+            kpage = buf.shape[1] // 132
+            kv_cache = buf.view(-1, kpage, 132).view(fp8_dtype)
             out_loc = forward_batch.out_cache_loc
             if not out_loc.is_contiguous():
                 out_loc = out_loc.contiguous()

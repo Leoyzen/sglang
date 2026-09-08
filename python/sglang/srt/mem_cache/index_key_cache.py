@@ -57,6 +57,10 @@ class IndexKeyCache:
     def move(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor) -> None:
         if tgt_loc.numel() == 0:
             return
+        # Index-K is GLOBAL-slot addressed (replicated buffer sized
+        # size*dcp under DCP, memory_pool.py:4190-4197): raw virtual locs
+        # index it directly, unlike the per-rank latent pool rows which
+        # collapse virtual->physical on the accept path. No collapse here.
         tgt_loc_flat = tgt_loc.view(-1).long()
         src_loc_flat = src_loc.view(-1).long()
         for index_k in self.buffer:
@@ -122,12 +126,26 @@ class IndexKeyCache:
             index_k_scale=index_k_scale,
         )
 
+    def _kernel_page_tokens(self) -> int:
+        """Token width of one buffer row (64-token kernel pages).
+
+        Divide row bytes by the PER-TOKEN byte count (index_head_dim + scale
+        bytes = 132), matching _buffer_shape. Dividing by index_head_dim
+        alone silently yields 66 on the 8448-wide rows (8448 % 128 == 0),
+        which mis-addresses every page access.
+        """
+        pool = self.pool
+        per_token_bytes = pool.index_head_dim + pool.index_head_dim // pool.quant_block_size * 4
+        if self.buffer and self.buffer[0].shape[0]:
+            return self.buffer[0].shape[1] // per_token_bytes
+        return 64
+
     def cpu_copy(self, indices):
         # Retracted pages may be reused before resume, so offload index-K with KV.
         # Buffer rows are 64-token KERNEL pages; token locs (allocator virtual
         # space) must be sampled/divided by the kernel page width, not the
         # pool allocator page size (which is wider under spec x DCP drafts).
-        kpage = self.buffer[0].shape[1] // self.pool.index_head_dim if self.buffer and self.buffer[0].shape[0] else 64
+        kpage = self._kernel_page_tokens()
         page_indices = indices[::kpage] // kpage
         torch.cuda.synchronize()
         index_k_cpu = []
@@ -147,7 +165,7 @@ class IndexKeyCache:
         return index_k_cpu
 
     def load_cpu_copy(self, index_k_cpu, indices) -> None:
-        kpage = self.buffer[0].shape[1] // self.pool.index_head_dim if self.buffer and self.buffer[0].shape[0] else 64
+        kpage = self._kernel_page_tokens()
         page_indices = indices[::kpage] // kpage
         torch.cuda.synchronize()
         chunk_size = self.pool.cpu_offloading_chunk_size

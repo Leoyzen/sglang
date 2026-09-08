@@ -99,7 +99,8 @@ class GetK:
             buf=buf,
             page_indices=page_indices,
             seq_len=seq_len,
-            page_size=buf.shape[1] // pool.index_head_dim,
+            page_size=buf.shape[1]
+            // (pool.index_head_dim + pool.index_head_dim // pool.quant_block_size * 4),
             index_head_dim=pool.index_head_dim,
         )
 
@@ -168,7 +169,8 @@ class GetS:
             buf=buf,
             page_indices=page_indices,
             seq_len=seq_len,
-            page_size=buf.shape[1] // pool.index_head_dim,
+            page_size=buf.shape[1]
+            // (pool.index_head_dim + pool.index_head_dim // pool.quant_block_size * 4),
             index_head_dim=pool.index_head_dim,
         )
 
@@ -252,7 +254,8 @@ class GetKAndS:
             seq_lens=seq_len_tensor,
             seq_len_sum=seq_len_sum,
             max_seq_len=max_seq_len,
-            page_size=buf.shape[1] // pool.index_head_dim,
+            page_size=buf.shape[1]
+            // (pool.index_head_dim + pool.index_head_dim // pool.quant_block_size * 4),
             index_head_dim=pool.index_head_dim,
         )
 
@@ -271,7 +274,8 @@ class SetKAndS:
             loc=loc,
             index_k=index_k,
             index_k_scale=index_k_scale,
-            page_size=buf.shape[1] // pool.index_head_dim,
+            page_size=buf.shape[1]
+            // (pool.index_head_dim + pool.index_head_dim // pool.quant_block_size * 4),
         )
 
 

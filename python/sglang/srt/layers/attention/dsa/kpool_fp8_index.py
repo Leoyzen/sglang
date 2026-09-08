@@ -11,8 +11,14 @@ def _kbuf_page_tokens(pool, buf) -> int:
 
     The buffer is tiled in 64-token kernel pages (BLOCK_SIZE_K pooled-row
     units); the pool's allocator page may be wider (spec x DCP draft pools
-    page the DCP-virtual space). Always derive from the buffer."""
-    return buf.shape[1] // INDEX_HEAD_DIM
+    page the DCP-virtual space). Always derive from the buffer.
+
+    Row width is 64 * (128B K + 4B scale) per token — derive by dividing by
+    the PER-TOKEN byte count (132), NOT by index_head_dim (128): 8448 is also
+    divisible by 128 (yielding a silent, wrong 66), so the divisor must be
+    the full per-token stride, matching IndexKeyCache._buffer_shape.
+    """
+    return buf.shape[1] // (INDEX_HEAD_DIM + INDEX_HEAD_DIM // pool.quant_block_size * 4)
 
 INDEX_HEAD_DIM = 128
 KPOOL_SCORE_DTYPES = (torch.float16, torch.bfloat16, torch.float32)
@@ -834,7 +840,11 @@ def kpool_decode_update_and_maybe_write_cache(
         S_OFFSET_NBYTES_IN_PAGE=_kbuf_page_tokens(pool, buf) * pool.index_head_dim,
         ROUND_SCALE=round_scale,
         BLOCK_D=triton.next_power_of_2(tail_k.shape[2]),
-        SLOTS_PER_PAGE=pool.slots_per_page,
+        # The kernel maps pool_id -> block_tables row with the 64-token
+        # kernel-page axis (see _kbuf_page_tokens), NOT the allocator page
+        # axis. pool.slots_per_page is 64*dcp for spec x DCP draft virtual
+        # pools, which would pick block_tables rows 4x too far apart.
+        SLOTS_PER_PAGE=_kbuf_page_tokens(pool, buf),
     )
 
 
@@ -1278,7 +1288,12 @@ def kpool_assemble_softmax_rotate_write_cache(
 
     buf_fp8 = buf.view(torch.float8_e4m3fn)
     buf_fp32 = buf.view(torch.float32)
-    slots_per_page = pool.slots_per_page
+    # 64-token kernel-page axis (buf-derived), matching the write_loc axis the
+    # plan builder emits (_kpool_slots_per_page=64). pool.slots_per_page is the
+    # ALLOCATOR page (64*dcp under spec x DCP) -- decomposing a 64-axis loc
+    # with it writes loc//256 rows and spills K/scale into neighbor rows
+    # (in-bounds: silent cross-token index-K corruption).
+    slots_per_page = _kbuf_page_tokens(pool, buf)
 
     _kpool_assemble_softmax_rotate_write_cache_kernel[(n_pools,)](
         buf_fp8,
@@ -1673,7 +1688,13 @@ def kpool_write_tail_and_maybe_compress(
     if effective_n_per_batch is not None:
         effective_n_per_batch = effective_n_per_batch.contiguous()
 
-    slots_per_page = pool.slots_per_page
+    # 64-token kernel-page axis (buf-derived), matching the write_loc axis the
+    # plan builder emits (_kpool_slots_per_page=64). pool.slots_per_page is the
+    # ALLOCATOR page (64*dcp under spec x DCP) -- decomposing a 64-axis loc
+    # with it lands on loc//256 rows and offsets up to 255 while the buffer
+    # row is only 64 tokens wide: silent in-bounds cross-token index-K
+    # corruption (the root cause of the MTP x DCP accuracy collapse).
+    slots_per_page = _kbuf_page_tokens(pool, buf)
     buf_fp8 = buf.view(torch.float8_e4m3fn)
     buf_fp32 = buf.view(torch.float32)
     _kpool_write_tail_and_maybe_compress_kernel[(bs,)](
