@@ -3943,27 +3943,19 @@ class MLATokenToKVPool(KVCache):
         get_mla_kv_buffer_triton(kv_buffer, loc, cache_k_nope, cache_k_rope)
         return cache_k_nope, cache_k_rope
 
-    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
-        """Relocate accepted-token combined MLA KV (latent + rope) per layer."""
-        size_limit = self.size + self.page_size
-        maybe_detect_oob(tgt_loc, 0, size_limit, "move_kv_cache tgt_loc")
-        maybe_detect_oob(src_loc, 0, size_limit, "move_kv_cache src_loc")
-
-        if tgt_loc.numel() == 0:
-            return
-
-        tgt_loc_flat = tgt_loc.view(-1).long()
-        src_loc_flat = src_loc.view(-1).long()
-
-        # Spec x DCP: accept-path relocation locs come from req_to_token in the
-        # DCP-widened virtual space, but a SHARDED pool's rows are per-rank
-        # rows addressed by the physical id (widened // dcp_size) — the same
-        # translation the write-side owner filter applies. REPLICATED pools
-        # (draft, spanned over the virtual space per #33348) address rows by
-        # raw virtual loc and must NOT be collapsed. Structural flags below:
-        #   dcp_loc_space == 'sharded'  -> collapse widened locs
-        #   dcp_loc_space == 'virtual'  -> pass through (draft pools)
-        # Set in kv_cache_configurator._init_pools at construction time.
+    def _collapse_spec_dcp_move_locs(
+        self, tgt_loc_flat: torch.Tensor, src_loc_flat: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Spec x DCP: accept-path relocation locs come from req_to_token in the
+        DCP-widened virtual space, but a SHARDED pool's rows are per-rank
+        rows addressed by the physical id (widened // dcp_size) — the same
+        translation the write-side owner filter applies. REPLICATED pools
+        (draft, spanned over the virtual space per #33348) address rows by
+        raw virtual loc and must NOT be collapsed. Structural flags below:
+          dcp_loc_space == 'sharded'  -> collapse widened locs
+          dcp_loc_space == 'virtual'  -> pass through (draft pools)
+        Set in kv_cache_configurator._init_pools at construction time.
+        """
         if get_parallel().dcp_enabled and not self.write_loc_is_dcp_resolved and getattr(self, "dcp_loc_space", None) == "sharded":
             dcp = get_parallel().attn_dcp_size
             if not (tgt_loc_flat % dcp == src_loc_flat % dcp).all():
@@ -3973,8 +3965,21 @@ class MLATokenToKVPool(KVCache):
                     "movement that is not implemented. Slot residues differ: "
                     "refusing to move wrong data (silent corruption otherwise)."
                 )
-            tgt_loc_flat = tgt_loc_flat // dcp
-            src_loc_flat = src_loc_flat // dcp
+            return tgt_loc_flat // dcp, src_loc_flat // dcp
+        return tgt_loc_flat, src_loc_flat
+
+    def move_kv_cache(self, tgt_loc: torch.Tensor, src_loc: torch.Tensor):
+        """Relocate accepted-token combined MLA KV (latent + rope) per layer."""
+        size_limit = self.size + self.page_size
+        maybe_detect_oob(tgt_loc, 0, size_limit, "move_kv_cache tgt_loc")
+        maybe_detect_oob(src_loc, 0, size_limit, "move_kv_cache src_loc")
+
+        if tgt_loc.numel() == 0:
+            return
+
+        tgt_loc_flat, src_loc_flat = self._collapse_spec_dcp_move_locs(
+            tgt_loc.view(-1).long(), src_loc.view(-1).long()
+        )
         for kv_cache in self.kv_buffer:
             kv_cache[tgt_loc_flat] = kv_cache[src_loc_flat]
 

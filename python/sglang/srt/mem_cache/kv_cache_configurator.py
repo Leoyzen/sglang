@@ -580,6 +580,17 @@ class KVCacheConfigurator:
                 "--disable-radix-cache, no context-parallel attention, no HiSparse, "
                 "and --kv-cache-dtype not in {nvfp4, fp4_mx_block16}."
             )
+
+        # Spec x DCP loc-space tagging (consumed by
+        # MLATokenToKVPool.move_kv_cache / IndexKeyCache.move): the target pool
+        # is per-rank sharded and must collapse DCP-widened accept-path locs;
+        # the replicated draft pool addresses rows by raw virtual loc and must
+        # not be collapsed. HybridLinearKVPool forwards move_kv_cache to its
+        # inner full-attention pool, so tag the leaf, not the wrapper.
+        if get_parallel().dcp_enabled:
+            leaf_pool = getattr(token_to_kv_pool, "full_kv_pool", token_to_kv_pool)
+            leaf_pool.dcp_loc_space = "virtual" if self.is_draft_worker else "sharded"
+
         return _InitializedPools(
             req_to_token_pool=req_to_token_pool,
             token_to_kv_pool=token_to_kv_pool,
