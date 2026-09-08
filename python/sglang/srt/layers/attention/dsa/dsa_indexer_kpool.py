@@ -39,7 +39,7 @@ from sglang.srt.model_executor.forward_context import (
     get_token_to_kv_pool,
 )
 from sglang.srt.model_executor.runner import get_is_capture_mode
-from sglang.srt.runtime_context import get_device
+from sglang.srt.runtime_context import get_device, get_parallel
 
 if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
@@ -861,6 +861,22 @@ class IndexerKPool(MultiPlatformOp):
             )
 
         page_table_1, topk_offsets, _ = self._kpool_fused_topk_mapping(metadata)
+        # Domain contract with the attention consumer (dsa_backend
+        # ._use_fused_topk_for_batch): under DCP on non-decode modes the
+        # consumer runs the unfused PAGED transform, which maps
+        # sequence-relative POSITIONS through page_table_1 itself (applying
+        # the DCP owner rule). Handing it this kernel's fused output would
+        # double-map: the kernel already resolved raw_token ->
+        # page_table_entry[raw_token] (virtual slot domain), and the consumer
+        # would index page_table_1 AGAIN with those slots, attending to a
+        # shifted/stale context. So under DCP>1 + verify/draft-extend, omit
+        # the page table here and emit the kernel's raw position domain.
+        if (
+            page_table_1 is not None
+            and get_parallel().attn_dcp_size > 1
+            and not forward_batch.forward_mode.is_decode_or_idle()
+        ):
+            page_table_1 = None
         topk_result = self._topk_from_kpool_logits(
             logits,
             pool_seqlens,
