@@ -223,7 +223,16 @@ def transform_index_page_table_prefill_fast(
     dcp_rank: int = 0,
 ) -> torch.Tensor:
     assert page_size == 1
-    assert topk_indices.shape[1] == 2048
+    # DSA prefill topk width is index_topk (2048) plus, for kpool indexers
+    # (e.g. GLM-5.3-Flash, index_kpool > 1), up to index_kpool - 1 appended
+    # live tail-token columns in the same physical-slot index space (see
+    # append_kpool_tail_to_topk in kpool_fp8_index.py). The triton kernel is
+    # variable-width (TOPK constexpr from shape[1]; grid axis 2 spans the full
+    # width), and downstream prefill impls (tilelang pads to 64-col blocks,
+    # fa3 clamps) already accept the widened table. Keep the >= 2048 floor to
+    # catch layout regressions; the DCP owner filter applies per column over
+    # the full width.
+    assert topk_indices.shape[1] >= 2048, f"expected prefill topk width >= 2048, got {topk_indices.shape[1]}"
     real_num_tokens = sum(extend_lens_cpu)
     result = _allocate_prefill_result(topk_indices, real_num_tokens, output_num_tokens)
     if real_num_tokens == 0:
