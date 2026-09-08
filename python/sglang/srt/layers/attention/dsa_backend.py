@@ -390,6 +390,15 @@ class DeepseekSparseAttnBackend(
         self.dsa_index_topk = get_dsa_index_topk(hf_config)
         self.dsa_index_kpool = get_dsa_index_kpool(hf_config)
         self.needs_cpu_seq_lens = self.dsa_index_kpool > 1
+        # KPool appends up to kpool - 1 live tail tokens to the topk_indices
+        # width. FlashMLA decode's tile scheduler sizes from a 64-column
+        # topk axis, so precompute the padded width (+ -1 sentinel columns,
+        # same contract as the tilelang padding in _forward_tilelang).
+        self.dsa_flashmla_padded_topk = (
+            ((self.dsa_index_topk + self.dsa_index_kpool - 1 + 63) // 64) * 64
+            if self.dsa_index_kpool > 1
+            else self.dsa_index_topk
+        )
         self.max_context_len = model_runner.model_config.context_len
         self.num_q_heads = model_runner.model_config.num_attention_heads // get_parallel().attn_tp_size
         self.kv_cache_dim = model_runner.token_to_kv_pool.kv_cache_dim
@@ -2934,8 +2943,24 @@ class DeepseekSparseAttnBackend(
             # inefficiently quantize the whole cache
             kv_cache = quantize_k_cache(kv_cache)
 
+        if self.dsa_index_kpool > 1 and page_table_1.shape[-1] == self.dsa_index_topk + self.dsa_index_kpool - 1:
+            # KPool tail-extended topk (topk + kpool - 1 columns, e.g. 2051 for
+            # topk=2048/kpool=4): pad to dsa_flashmla_padded_topk (next 64-col
+            # multiple) with -1 sentinels — the FlashMLA decode kernel masks
+            # invalid indices (same contract/pattern as _forward_tilelang).
+            pad = self.dsa_flashmla_padded_topk - page_table_1.shape[-1]
+            if pad:
+                page_table_1 = torch.cat(
+                    (
+                        page_table_1,
+                        page_table_1.new_full((*page_table_1.shape[:-1], pad), -1),
+                    ),
+                    dim=-1,
+                )
+
         indices = page_table_1.unsqueeze(1)
-        assert indices.shape[-1] == self.dsa_index_topk  # requirement of FlashMLA decode kernel
+        expected_topk = self.dsa_flashmla_padded_topk if self.dsa_index_kpool > 1 else self.dsa_index_topk
+        assert indices.shape[-1] == expected_topk  # requirement of FlashMLA decode kernel
 
         o, lse = flash_mla_with_kvcache(
             q=q_input,
@@ -3684,7 +3709,9 @@ class DeepseekSparseAttnBackend(
             num_heads_k=1,
             num_heads_q=num_heads_q,
             is_fp8_kvcache=True,
-            topk=self.dsa_index_topk,
+            # Match the (possibly kpool-tail-padded) topk width the decode
+            # kernel actually receives in _forward_flashmla_kv.
+            topk=self.dsa_flashmla_padded_topk,
         )
 
         return DSAFlashMLAMetadata(
