@@ -68,11 +68,12 @@ class DeepseekSparseAttnBackendKPoolMixin:
         return dsa_impl
 
     def _kpool_slots_per_page(self) -> int:
-        # KPool write-plan slot math addresses the index-K buffer in 64-token
-        # kernel-page units (the same axis the buffer is tiled in), not the
-        # pool allocator's page (which is wider under spec x DCP draft pools).
-        kpool = self.dsa_index_kpool
-        return 64 // kpool
+        # Pooled rows per paged-MQA block: the kpool plan and metadata builders
+        # tile pooled index-K rows into BLOCK_SIZE_K(=64)-row blocks, the same
+        # unit the DeepGEMM/tilelang paged-MQA kernels consume. This is the
+        # kernel paging axis, independent of the pool allocator's page size
+        # (which is wider under spec x DCP draft pools, 256 per #33348).
+        return 64
 
     def _build_kpool_paged_mqa_schedule_metadata(self) -> bool:
         if self.device_sm_major == 9:
