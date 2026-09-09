@@ -3,6 +3,12 @@ Configuration argument parser for command-line applications.
 Handles merging of YAML configuration files with command-line arguments.
 """
 
+from sglang.srt.arg_groups.argparse_actions import (
+    DeprecatedAliasStoreAction,
+    DeprecatedStoreConstAction,
+    DeprecatedStoreTrueAction,
+)
+
 import argparse
 import json
 import logging
@@ -47,6 +53,9 @@ class ConfigArgumentMerger:
                 and not isinstance(a, argparse._StoreTrueAction)
                 and not isinstance(a, argparse._StoreAction)
                 and a.dest not in self.store_actions
+                and not isinstance(a, DeprecatedAliasStoreAction)
+                and not isinstance(a, DeprecatedStoreConstAction)
+                and not isinstance(a, DeprecatedStoreTrueAction)
                 and "--config" not in a.option_strings
                 and "--help" not in a.option_strings
                 and "-h" not in a.option_strings
