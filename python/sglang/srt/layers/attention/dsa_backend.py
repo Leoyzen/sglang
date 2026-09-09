@@ -3668,6 +3668,12 @@ class DeepseekSparseAttnBackend(
             # Can't branch on seq_lens_cpu in graph replay, force MHA off to
             # guarantee correctness.
             self.use_mha = False
+        elif self.qk_rope_head_dim == 0:
+            # Rope-free (no-PE) MLA models have no MHA path: k_pe is empty by
+            # contract (_concat_and_cast_mha_k asserts shape[-1]==0), and the
+            # fp8 KV dequantize helper would slice the pseudo-V3.2 zeroed tail
+            # as a phantom rope segment. Absorbed MLA (DSA) only.
+            self.use_mha = False
         elif forward_batch and forward_batch.forward_mode.is_extend_without_speculative():
             # Check if sequence meets criteria for MHA_ONE_SHOT
             assert forward_batch.seq_lens_cpu is not None
