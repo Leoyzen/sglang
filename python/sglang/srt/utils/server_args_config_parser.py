@@ -31,12 +31,22 @@ class ConfigArgumentMerger:
                 for action in parser._actions
                 if isinstance(action, argparse._StoreTrueAction)
             ]
+            self.store_actions = {
+                a.dest
+                for a in parser._actions
+                if a.option_strings
+                and (
+                    isinstance(a, argparse._StoreTrueAction)
+                    or isinstance(a, argparse._StoreAction)
+                )
+            }
             self.unsupported_actions = {
                 a.dest: a
                 for a in parser._actions
                 if a.option_strings
                 and not isinstance(a, argparse._StoreTrueAction)
                 and not isinstance(a, argparse._StoreAction)
+                and a.dest not in self.store_actions
                 and "--config" not in a.option_strings
                 and "--help" not in a.option_strings
                 and "-h" not in a.option_strings
