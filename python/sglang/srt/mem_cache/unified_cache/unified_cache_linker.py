@@ -173,9 +173,7 @@ class UnifiedCacheLinkerWrapper:
 
         lookup_transfers = []
         for component in cache._components_tuple:
-            transfer = component.build_external_linker_transfer(
-                LinkerTransferPhase.LOOKUP, None, tail_hashes
-            )
+            transfer = component.build_external_linker_transfer(LinkerTransferPhase.LOOKUP, None, tail_hashes)
             if transfer is None:
                 return result
             lookup_transfers.append(transfer)
@@ -192,11 +190,7 @@ class UnifiedCacheLinkerWrapper:
         hit_tokens = hit_pages * page
 
         swa_transfer = by_pool.get(PoolName.SWA)
-        swa_host_hit_length = (
-            min(len(swa_transfer.keys), hit_pages) * page
-            if swa_transfer is not None
-            else 0
-        )
+        swa_host_hit_length = min(len(swa_transfer.keys), hit_pages) * page if swa_transfer is not None else 0
         # Mamba keeps a single state slot per node, so a hit is worth one slot.
         mamba_host_hit_length = 1 if PoolName.MAMBA in by_pool else 0
 
@@ -209,14 +203,10 @@ class UnifiedCacheLinkerWrapper:
             last_host_node=result.best_match_node,
             host_hit_length=hit_tokens,
             swa_host_hit_length=max(result.swa_host_hit_length, swa_host_hit_length),
-            mamba_host_hit_length=max(
-                result.mamba_host_hit_length, mamba_host_hit_length
-            ),
+            mamba_host_hit_length=max(result.mamba_host_hit_length, mamba_host_hit_length),
         )
 
-    def _sync_restorable_prefix(
-        self, restorable: list[int], *, num_pages: int, device_hit_pages: int
-    ) -> int:
+    def _sync_restorable_prefix(self, restorable: list[int], *, num_pages: int, device_hit_pages: int) -> int:
         """Intersect the per-rank sets of restorable prefix lengths and return the
         longest one, or 0 when the ranks share none beyond the device prefix.
 
@@ -234,9 +224,7 @@ class UnifiedCacheLinkerWrapper:
             return 0
         return int(common[-1].item())
 
-    def _tail_hashes(
-        self, key: RadixKey, result: MatchResult, device_hit_len: int
-    ) -> list[str]:
+    def _tail_hashes(self, key: RadixKey, result: MatchResult, device_hit_len: int) -> list[str]:
         """Per-page storage hashes for the device-uncached tail of the prefix."""
         last_hash = None
         if device_hit_len > 0:
@@ -271,9 +259,7 @@ class UnifiedCacheLinkerWrapper:
         # Build per-component linker transfers.
         component_transfers: list[tuple[TreeComponent, PoolTransfer]] = []
         for component in cache._components_tuple:
-            transfer = component.build_external_linker_transfer(
-                LinkerTransferPhase.LOAD, None, tail_hashes
-            )
+            transfer = component.build_external_linker_transfer(LinkerTransferPhase.LOAD, None, tail_hashes)
             if transfer is None:
                 self._update_load(
                     ExternalLinkerLoadPhase.ABORT,
@@ -310,43 +296,27 @@ class UnifiedCacheLinkerWrapper:
         )
 
         # Insert the newly loaded tail into the tree.
-        prefix_indices = torch.cat(
-            [req.prefix_indices.to(torch.int64), full_transfer.device_indices]
-        )
+        prefix_indices = torch.cat([req.prefix_indices.to(torch.int64), full_transfer.device_indices])
         mamba_transfer = next(
-            (
-                transfer
-                for _, transfer in component_transfers
-                if transfer.name == PoolName.MAMBA
-            ),
+            (transfer for _, transfer in component_transfers if transfer.name == PoolName.MAMBA),
             None,
         )
         insert_result = cache.insert(
             InsertParams(
                 key=hit.prefix_key,
                 value=prefix_indices,
-                mamba_value=(
-                    mamba_transfer.device_indices[:1]
-                    if mamba_transfer is not None
-                    else None
-                ),
+                mamba_value=(mamba_transfer.device_indices[:1] if mamba_transfer is not None else None),
                 prev_prefix_len=device_hit_len,
-                swa_evicted_seqlen=(
-                    req.kv.swa_evicted_seqlen if req.kv is not None else 0
-                ),
+                swa_evicted_seqlen=(req.kv.swa_evicted_seqlen if req.kv is not None else 0),
                 chunked=True,
                 priority=getattr(req, "priority", 0) or 0,
                 track_adopted_ranges=True,
             )
         )
         if mamba_transfer is not None and insert_result.mamba_exist:
-            cache.req_to_token_pool.mamba_allocator.free(
-                mamba_transfer.device_indices[:1]
-            )
+            cache.req_to_token_pool.mamba_allocator.free(mamba_transfer.device_indices[:1])
 
-        canonical_tail = cache.tree_core.collect_full_device_indices(
-            insert_result.last_device_node, req.last_node
-        )
+        canonical_tail = cache.tree_core.collect_full_device_indices(insert_result.last_device_node, req.last_node)
         assert canonical_tail.numel() == len(tail_hashes) * cache.page_size
         load_transfers = self._update_load(
             ExternalLinkerLoadPhase.COMMIT,
@@ -365,9 +335,7 @@ class UnifiedCacheLinkerWrapper:
             node = node.parent
         return canonical_tail, insert_result.last_device_node
 
-    def _queue_load(
-        self, rid: str, node_id: NodeId, transfers: list[PoolTransfer]
-    ) -> None:
+    def _queue_load(self, rid: str, node_id: NodeId, transfers: list[PoolTransfer]) -> None:
         if not transfers:
             return
         assert rid not in self.pending_loads
@@ -396,21 +364,32 @@ class UnifiedCacheLinkerWrapper:
             return []
         full = component_transfers[0][1]
         result = []
-        transfers = (
-            reversed(component_transfers)
-            if phase == ExternalLinkerLoadPhase.ABORT
-            else component_transfers
-        )
+        transfers = reversed(component_transfers) if phase == ExternalLinkerLoadPhase.ABORT else component_transfers
         for component, transfer in transfers:
             component_canonical = canonical_full
             if phase == ExternalLinkerLoadPhase.COMMIT:
+                if transfer.name == PoolName.MAMBA:
+                    # Mamba keeps one state slot per node, adopted whole: the
+                    # tree records no adopted ranges for it and its single
+                    # device index is not a token page, so the page-range
+                    # intersection below does not apply.
+                    transfer = component.update_external_linker_load(
+                        phase,
+                        req,
+                        full,
+                        transfer,
+                        prefix_len,
+                        insert_result=insert_result,
+                        canonical_full=component_canonical,
+                    )
+                    if transfer is not None:
+                        result.append(transfer)
+                    continue
                 assert insert_result.adopted_ranges is not None
                 coverage_start = prefix_len - len(transfer.device_indices)
                 ranges = [
                     (max(start, coverage_start), min(end, prefix_len))
-                    for start, end in insert_result.adopted_ranges.get(
-                        component.component_type, ()
-                    )
+                    for start, end in insert_result.adopted_ranges.get(component.component_type, ())
                     if max(start, coverage_start) < min(end, prefix_len)
                 ]
                 indices, keys = self._select_adopted_pages(
@@ -423,9 +402,7 @@ class UnifiedCacheLinkerWrapper:
                     continue
                 transfer.device_indices = indices
                 transfer.keys = keys
-                component_canonical, _ = self._select_adopted_pages(
-                    canonical_full, ranges, prefix_len
-                )
+                component_canonical, _ = self._select_adopted_pages(canonical_full, ranges, prefix_len)
             transfer = component.update_external_linker_load(
                 phase,
                 req,
@@ -485,9 +462,7 @@ class UnifiedCacheLinkerWrapper:
         node = cache.resolve_node_handle(node_id)
         transfers = []
         for component in cache._components_tuple:
-            transfer = component.build_external_linker_transfer(
-                LinkerTransferPhase.OFFLOAD, node, None
-            )
+            transfer = component.build_external_linker_transfer(LinkerTransferPhase.OFFLOAD, node, None)
             if transfer is not None:
                 transfers.append(transfer)
 
@@ -505,9 +480,7 @@ class UnifiedCacheLinkerWrapper:
         node.external_cache_stored = True
         self.pending_offloads.append(_PendingOffload(node_id, lock_params, [node_id]))
 
-    def replace_pending_offload_node(
-        self, ack_id: NodeId, old_node_id: NodeId, new_node_ids: list[NodeId]
-    ) -> None:
+    def replace_pending_offload_node(self, ack_id: NodeId, old_node_id: NodeId, new_node_ids: list[NodeId]) -> None:
         for index, pending in enumerate(self.pending_offloads):
             if pending.lock_node_id != ack_id:
                 continue
@@ -517,15 +490,11 @@ class UnifiedCacheLinkerWrapper:
                     publish_node_ids.extend(new_node_ids)
                 else:
                     publish_node_ids.append(node_id)
-            self.pending_offloads[index] = pending._replace(
-                publish_node_ids=publish_node_ids
-            )
+            self.pending_offloads[index] = pending._replace(publish_node_ids=publish_node_ids)
             return
 
     def num_completed_offloads(self) -> int:
-        return min(
-            self.cache_linker.num_completed_offloads(), len(self.pending_offloads)
-        )
+        return min(self.cache_linker.num_completed_offloads(), len(self.pending_offloads))
 
     def num_completed_loads(self) -> int:
         return self.cache_linker.num_completed_loads()

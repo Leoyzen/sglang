@@ -80,47 +80,25 @@ class DevicePoolEntry:
     def _rows(self, indices: torch.Tensor) -> list[int]:
         slots = indices.detach().to(device="cpu", dtype=torch.int64).flatten()
         if slots.numel() % self.page_size:
-            raise ValueError(
-                f"Pool {self.name} got {slots.numel()} indices, expected a "
-                f"multiple of page_size={self.page_size}."
-            )
+            raise ValueError(f"Pool {self.name} got {slots.numel()} indices, expected a multiple of page_size={self.page_size}.")
         if not slots.numel():
             return []
 
         pages = slots.reshape(-1, self.page_size)
         starts = pages[:, 0]
-        if torch.any(starts.remainder(self.page_size)) or not torch.equal(
-            pages, starts[:, None] + self._page_offsets
-        ):
+        if torch.any(starts.remainder(self.page_size)) or not torch.equal(pages, starts[:, None] + self._page_offsets):
             raise ValueError(f"Pool {self.name} requires aligned contiguous pages.")
-        rows = (
-            starts.div(self.page_size, rounding_mode="floor")
-            if self._row_span == 1
-            else starts
-        )
+        rows = starts.div(self.page_size, rounding_mode="floor") if self._row_span == 1 else starts
         first_row = int(rows.min())
         last_row = int(rows.max()) + self._row_span
         if first_row < 0 or last_row > self._row_count:
-            raise ValueError(
-                f"Pool {self.name} row range [{first_row}, {last_row}) exceeds "
-                f"buffer shapes {[tuple(buffer.shape) for buffer in self.kv_buffer]}."
-            )
+            raise ValueError(f"Pool {self.name} row range [{first_row}, {last_row}) exceeds buffer shapes {[tuple(buffer.shape) for buffer in self.kv_buffer]}.")
         return rows.tolist()
 
     def get_page_buffer_meta(self, indices: torch.Tensor):
         rows = self._rows(indices)
-        ptrs = [
-            base_ptr + row * row_stride
-            for row in rows
-            for component in self.buffer_meta
-            for base_ptr, row_stride, _ in component
-        ]
-        sizes = [
-            size
-            for _ in rows
-            for component in self.buffer_meta
-            for _, _, size in component
-        ]
+        ptrs = [base_ptr + row * row_stride for row in rows for component in self.buffer_meta for base_ptr, row_stride, _ in component]
+        sizes = [size for _ in rows for component in self.buffer_meta for _, _, size in component]
         return ptrs, sizes
 
     def prepare_locations(self, indices: torch.Tensor) -> list[int]:
@@ -138,9 +116,7 @@ class DevicePoolEntry:
 
         ptrs, sizes, offsets = [], [], []
         for row in locations:
-            row_ptrs = [
-                base_ptr + row * row_stride for base_ptr, row_stride, _, _ in items
-            ]
+            row_ptrs = [base_ptr + row * row_stride for base_ptr, row_stride, _, _ in items]
             row_sizes = [size for _, _, size, _ in items]
             row_offsets = [offset for _, _, _, offset in items]
             if self.packed:
@@ -202,17 +178,9 @@ class DevicePoolGroup:
                 replace(
                     source,
                     name=name,
-                    host_indices=(
-                        self.entry_map[name].translate_indices(indices)
-                        if indices is not None
-                        else None
-                    ),
+                    host_indices=(self.entry_map[name].translate_indices(indices) if indices is not None else None),
                     keys=list(source.keys),
-                    hit_policy=(
-                        PoolHitPolicy.ALL_PAGES
-                        if source_name == PoolName.KV
-                        else source.hit_policy
-                    ),
+                    hit_policy=(PoolHitPolicy.ALL_PAGES if source_name == PoolName.KV else source.hit_policy),
                     indices_from_pool=None,
                 )
             )
@@ -226,17 +194,11 @@ def _deepseek_v4_state_views(state_pools: list[Any], global_layers: list[int]):
         state = pool.kv_score_buffer.kv_score
         ring = int(pool.ring_size)
         usable = state.shape[0] // ring * ring
-        views.append(
-            state.view(torch.uint8)
-            .reshape(state.shape[0], -1)[:usable]
-            .reshape(usable // ring, -1)
-        )
+        views.append(state.view(torch.uint8).reshape(state.shape[0], -1)[:usable].reshape(usable // ring, -1))
     return views
 
 
-def _build_deepseek_v4_device_pool_group(
-    kvcache: Any, page_size: int
-) -> DevicePoolGroup:
+def _build_deepseek_v4_device_pool_group(kvcache: Any, page_size: int) -> DevicePoolGroup:
     from sglang.srt.mem_cache.deepseek_v4_memory_pool import HiSparseC4DevicePool
     from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
         _dsv4_indexer_regions,
@@ -244,17 +206,10 @@ def _build_deepseek_v4_device_pool_group(
     )
 
     mappings = _resolve_deepseek_v4_layer_mappings(kvcache)
-    if getattr(kvcache, "_unified_kv", False) or isinstance(
-        kvcache.c4_kv_pool, HiSparseC4DevicePool
-    ):
-        raise ValueError(
-            "The direct external linker does not support unified-KV or HiSparse."
-        )
+    if getattr(kvcache, "_unified_kv", False) or isinstance(kvcache.c4_kv_pool, HiSparseC4DevicePool):
+        raise ValueError("The direct external linker does not support unified-KV or HiSparse.")
     if kvcache.swa_page_size != page_size:
-        raise ValueError(
-            "DeepSeek V4 SWA page size must match the tree page size: "
-            f"{kvcache.swa_page_size} != {page_size}."
-        )
+        raise ValueError(f"DeepSeek V4 SWA page size must match the tree page size: {kvcache.swa_page_size} != {page_size}.")
 
     entries = [
         DevicePoolEntry(
@@ -334,10 +289,7 @@ def _build_deepseek_v4_device_pool_group(
 
 def _build_dsa_device_pool_group(kvcache: Any, page_size: int) -> DevicePoolGroup:
     if kvcache.page_size != page_size:
-        raise ValueError(
-            "DSA KV page size must match the tree page size: "
-            f"{kvcache.page_size} != {page_size}."
-        )
+        raise ValueError(f"DSA KV page size must match the tree page size: {kvcache.page_size} != {page_size}.")
     num_layers = kvcache.layer_num
     identity = {layer: layer for layer in range(num_layers)}
     entries = [
@@ -361,6 +313,173 @@ def _build_dsa_device_pool_group(kvcache: Any, page_size: int) -> DevicePoolGrou
         ),
     ]
     return DevicePoolGroup(entries, num_layers, page_size, rank_replicated=True)
+
+
+class MambaDevicePoolEntry(DevicePoolEntry):
+    """MAMBA device pool entry carrying the duck-typed host attributes that
+    ``MooncakeStore._get_hybrid_page_component_keys`` / ``_batch_io_v2`` read
+    off a :class:`MambaPoolHost` in direct-linker mode."""
+
+    def __init__(
+        self,
+        *,
+        temporal_state_elem_size: int,
+        conv_buffers: Sequence[torch.Tensor],
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.temporal_state_elem_size = temporal_state_elem_size
+        self.conv_buffer = list(conv_buffers)
+
+
+def _build_mamba_device_pool_group(kvcache: Any, page_size: int, params: Any) -> DevicePoolGroup:
+    if page_size != 1:
+        raise ValueError(f"The Mamba direct external linker requires page_size=1 (mamba state is token-granular), got page_size={page_size}.")
+
+    mamba_pool = params.req_to_token_pool.mamba_pool
+    mamba_layer_mapping = dict(params.req_to_token_pool.mamba_map)
+    full_layer_mapping = dict(kvcache.full_attention_layer_id_mapping)
+    union_layers = sorted(set(full_layer_mapping) | set(mamba_layer_mapping))
+
+    state_components, conv_buffers, temporal_state_elem_size = _build_mamba_state_components(mamba_pool)
+
+    kv_entry = DevicePoolEntry(
+        name=PoolName.KV,
+        indices_from_pool=PoolName.KV,
+        device_pool=kvcache,
+        components=_mamba_kv_components(kvcache),
+        layer_mapping=full_layer_mapping,
+        page_size=page_size,
+        rows_are_pages=False,
+    )
+    mamba_entry = MambaDevicePoolEntry(
+        name=PoolName.MAMBA,
+        indices_from_pool=PoolName.MAMBA,
+        device_pool=mamba_pool,
+        components=state_components,
+        layer_mapping=_sorted_union_remapping(mamba_layer_mapping, union_layers),
+        page_size=1,
+        rows_are_pages=True,
+        packed=False,
+        temporal_state_elem_size=temporal_state_elem_size,
+        conv_buffers=conv_buffers,
+    )
+    return DevicePoolGroup(
+        [kv_entry, mamba_entry],
+        len(union_layers),
+        page_size,
+        rank_replicated=False,
+    )
+
+
+def _mamba_kv_components(kvcache: Any) -> list[Sequence[torch.Tensor]]:
+    """Full-attention buffers of a HybridLinearKVPool in component-group form."""
+    pool = kvcache.full_kv_pool
+    k_buffer = getattr(pool, "k_buffer", None)
+    if k_buffer is not None:
+        return [k_buffer, pool.v_buffer]
+    return [pool.kv_buffer]
+
+
+def _sorted_union_remapping(pool_mapping: dict[int, int], union_layers: Sequence[int]) -> dict[int, int]:
+    """Map transfer-layer ranks to pool-side layer indices.
+
+    Transfer layers are numbered over the sorted union of component global
+    layer ids; remap each global id to its rank in that union so
+    ``get_prepared_layer_range_meta`` resolves it per transfer layer.
+    """
+    return {local: pool_mapping[gid] for local, gid in enumerate(union_layers) if gid in pool_mapping}
+
+
+def _build_mamba_state_components(
+    mamba_pool: Any,
+) -> tuple[list[list[torch.Tensor]], list[torch.Tensor], int]:
+    """Assemble the MAMBA device entry from the device MambaPool buffers."""
+    state = mamba_pool.mamba_cache
+    # Slot-first component order must match
+    # MooncakeStore._get_hybrid_page_component_keys: temporal first, then
+    # conv_0..conv_n; MambaPoolHost.get_page_buffer_meta drops the temporal
+    # object for conv-only models (0-size state), mirror that here.
+    temporal_state_elem_size = int(state.temporal.numel() // state.temporal.shape[0] // max(1, state.temporal.shape[1])) if state.temporal.numel() else 0
+    components: list[list[torch.Tensor]] = []
+    conv_buffers: list[torch.Tensor] = []
+    if temporal_state_elem_size > 0:
+        components.append([state.temporal[l] for l in range(state.temporal.shape[0])])
+    for conv in state.conv:
+        conv_buffers.append(conv)
+        components.append([conv[l] for l in range(conv.shape[0])])
+    if not components:
+        raise ValueError("Mamba pool has neither temporal nor conv state buffers.")
+    return (
+        components,
+        conv_buffers,
+        temporal_state_elem_size,
+    )
+
+
+def _build_mamba_swa_device_pool_group(kvcache: Any, page_size: int, params: Any) -> DevicePoolGroup:
+    """Defensive variant for SWA + Mamba hybrid stacks (KV + SWA + MAMBA)."""
+    if page_size != 1:
+        raise ValueError(f"The Mamba direct external linker requires page_size=1 (mamba state is token-granular), got page_size={page_size}.")
+
+    from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+        _swa_layer_mappings,
+    )
+
+    mamba_pool = params.req_to_token_pool.mamba_pool
+    mamba_layer_mapping = dict(params.req_to_token_pool.mamba_map)
+    full_layer_mapping, swa_layer_mapping = _swa_layer_mappings(kvcache)
+    union_layers = sorted(set(full_layer_mapping) | set(swa_layer_mapping) | set(mamba_layer_mapping))
+
+    state_components, conv_buffers, temporal_state_elem_size = _build_mamba_state_components(mamba_pool)
+
+    full_pool = kvcache.full_kv_pool
+    swa_pool = kvcache.swa_kv_pool
+
+    def kv_components(pool: Any) -> list[Sequence[torch.Tensor]]:
+        k_buffer = getattr(pool, "k_buffer", None)
+        if k_buffer is not None:
+            return [k_buffer, pool.v_buffer]
+        return [pool.kv_buffer]
+
+    entries = [
+        DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=full_pool,
+            components=kv_components(full_pool),
+            layer_mapping=full_layer_mapping,
+            page_size=page_size,
+            rows_are_pages=False,
+        ),
+        DevicePoolEntry(
+            name=PoolName.SWA,
+            indices_from_pool=PoolName.SWA,
+            device_pool=swa_pool,
+            components=kv_components(swa_pool),
+            layer_mapping=swa_layer_mapping,
+            page_size=page_size,
+            rows_are_pages=False,
+        ),
+        MambaDevicePoolEntry(
+            name=PoolName.MAMBA,
+            indices_from_pool=PoolName.MAMBA,
+            device_pool=mamba_pool,
+            components=state_components,
+            layer_mapping=_sorted_union_remapping(mamba_layer_mapping, union_layers),
+            page_size=1,
+            rows_are_pages=True,
+            packed=False,
+            temporal_state_elem_size=temporal_state_elem_size,
+            conv_buffers=conv_buffers,
+        ),
+    ]
+    return DevicePoolGroup(
+        entries,
+        len(union_layers),
+        page_size,
+        rank_replicated=False,
+    )
 
 
 def resolve_hybrid_device_pool_group(

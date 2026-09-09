@@ -45,11 +45,7 @@ class TestDevicePoolEntry(CustomTestCase):
         pointers, sizes = pool.get_page_buffer_meta(indices)
         self.assertEqual(
             pointers,
-            [
-                buffer[row].data_ptr()
-                for row in locations
-                for buffer in (k0, k2, v0, v2)
-            ],
+            [buffer[row].data_ptr() for row in locations for buffer in (k0, k2, v0, v2)],
         )
         self.assertEqual(sizes, [6, 10, 14, 22] * 2)
         self.assertIsNone(pool.get_prepared_layer_range_meta(locations, 1))
@@ -123,14 +119,10 @@ class TestDevicePoolGroup(CustomTestCase):
 
         resolved = group.resolve_transfers([transfer])
 
-        self.assertEqual(
-            [item.name for item in resolved], [PoolName.KV, PoolName.INDEXER]
-        )
+        self.assertEqual([item.name for item in resolved], [PoolName.KV, PoolName.INDEXER])
         self.assertEqual(resolved[0].host_indices.tolist(), [0, 1, 4, 5])
         self.assertEqual(resolved[1].host_indices.tolist(), [100, 101, 104, 105])
-        self.assertTrue(
-            all(item.hit_policy == PoolHitPolicy.ALL_PAGES for item in resolved)
-        )
+        self.assertTrue(all(item.hit_policy == PoolHitPolicy.ALL_PAGES for item in resolved))
 
     def test_partial_side_pool_requires_explicit_opt_in(self):
         entry = SimpleNamespace(
@@ -147,9 +139,7 @@ class TestDevicePoolGroup(CustomTestCase):
         )
 
         self.assertEqual(group.resolve_transfers([transfer]), [])
-        resolved = group.resolve_transfers(
-            [transfer], allow_partial=True, allow_missing_kv=True
-        )
+        resolved = group.resolve_transfers([transfer], allow_partial=True, allow_missing_kv=True)
 
         self.assertEqual(len(resolved), 1)
         self.assertEqual(resolved[0].name, PoolName.SWA)
@@ -176,20 +166,10 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         kvcache.start_layer = 1
         kvcache.end_layer = 4
         kvcache.swa_page_size = 2
-        kvcache.swa_kv_pool = SimpleNamespace(
-            kv_buffer=[torch.zeros((8, 3), dtype=torch.uint8) for _ in range(3)]
-        )
-        kvcache.c4_kv_pool = SimpleNamespace(
-            kv_buffer=[torch.zeros((8, 5), dtype=torch.uint8) for _ in range(2)]
-        )
-        kvcache.c4_indexer_kv_pool = SimpleNamespace(
-            index_k_with_scale_buffer=[
-                torch.zeros((8, 7), dtype=torch.uint8) for _ in range(2)
-            ]
-        )
-        kvcache.c128_kv_pool = SimpleNamespace(
-            kv_buffer=[torch.zeros((8, 11), dtype=torch.uint8)]
-        )
+        kvcache.swa_kv_pool = SimpleNamespace(kv_buffer=[torch.zeros((8, 3), dtype=torch.uint8) for _ in range(3)])
+        kvcache.c4_kv_pool = SimpleNamespace(kv_buffer=[torch.zeros((8, 5), dtype=torch.uint8) for _ in range(2)])
+        kvcache.c4_indexer_kv_pool = SimpleNamespace(index_k_with_scale_buffer=[torch.zeros((8, 7), dtype=torch.uint8) for _ in range(2)])
+        kvcache.c128_kv_pool = SimpleNamespace(kv_buffer=[torch.zeros((8, 11), dtype=torch.uint8)])
         kvcache.layer_mapping = [
             DeepSeekV4LayerItem(0, -1),
             DeepSeekV4LayerItem(4, 0),
@@ -271,18 +251,27 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
             },
         )
 
-    def test_unsupported_strategy_fails_with_context(self):
+    def test_mamba_requires_page_size_one(self):
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
         kvcache = HybridLinearKVPool.__new__(HybridLinearKVPool)
-        with self.assertRaisesRegex(
-            ValueError,
-            "does not support the direct external linker: _MambaStrategy",
-        ):
+        kvcache.full_attention_layer_id_mapping = {0: 0}
+        params = SimpleNamespace(
+            req_to_token_pool=SimpleNamespace(
+                mamba_pool=SimpleNamespace(
+                    mamba_cache=SimpleNamespace(
+                        temporal=torch.zeros((1, 4, 2), dtype=torch.uint8),
+                        conv=[torch.zeros((1, 4, 3), dtype=torch.uint8)],
+                    )
+                ),
+                mamba_map={0: 0},
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "requires page_size=1"):
             resolve_hybrid_device_pool_group(
                 kvcache=kvcache,
                 page_size=2,
-                params=SimpleNamespace(),
+                params=params,
                 components={ComponentType.FULL, ComponentType.MAMBA},
             )
 
