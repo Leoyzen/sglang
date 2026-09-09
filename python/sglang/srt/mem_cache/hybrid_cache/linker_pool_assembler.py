@@ -3,6 +3,9 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+import logging
+
+logger = logging.getLogger(__name__)
 from dataclasses import replace
 from typing import Any
 
@@ -184,6 +187,10 @@ class DevicePoolGroup:
                     keys=list(source.keys),
                     hit_policy=(PoolHitPolicy.ALL_PAGES if source_name == PoolName.KV else source.hit_policy),
                     indices_from_pool=None,
+                    # Keep the key-space identity: transfers sourced from a
+                    # pool other than KV address their own keys (e.g. MAMBA
+                    # node-boundary keys), not the KV page-hash array.
+                    probe_source=source_name,
                 )
             )
         return resolved
@@ -375,7 +382,10 @@ class MambaDevicePoolEntry(DevicePoolEntry):
 
 def _build_mamba_device_pool_group(kvcache: Any, page_size: int, params: Any) -> DevicePoolGroup:
     if page_size != 1:
-        raise ValueError(f"The Mamba direct external linker requires page_size=1 (mamba state is token-granular), got page_size={page_size}.")
+        # The MAMBA entry addresses slots by node-boundary keys (page-aligned
+        # node ends) and keeps page_size=1 rows internally, so any tree
+        # page size works; the KV entry carries the tree page granularity.
+        logger.warning("Mamba direct linker running with tree page_size=%d (mamba slots stay slot-granular).", page_size)
 
     mamba_pool = params.req_to_token_pool.mamba_pool
     mamba_layer_mapping = dict(params.req_to_token_pool.mamba_map)
@@ -461,7 +471,7 @@ def _build_mamba_state_components(
 def _build_mamba_swa_device_pool_group(kvcache: Any, page_size: int, params: Any) -> DevicePoolGroup:
     """Defensive variant for SWA + Mamba hybrid stacks (KV + SWA + MAMBA)."""
     if page_size != 1:
-        raise ValueError(f"The Mamba direct external linker requires page_size=1 (mamba state is token-granular), got page_size={page_size}.")
+        logger.warning("Mamba(SWA) direct linker running with tree page_size=%d (mamba slots stay slot-granular).", page_size)
 
     from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
         _swa_layer_mappings,

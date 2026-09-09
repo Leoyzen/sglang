@@ -2866,6 +2866,7 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                 decode_attention_backend=None,
                 enable_prefill_cp=False,
                 dcp_size=1,
+                page_size=None,
             )
             defaults.update(kw)
             return SimpleNamespace(**defaults)
@@ -2881,6 +2882,17 @@ class TestGoldenModelOverrides(_IsolatedPublish):
                             _deepseek_family_overrides(_args(), None),
                             {"attention_backend": "dsa", "page_size": 64},
                         )
+                        # An operator-pinned page size (CLI or config file)
+                        # is kept; the DSA default no longer stomps it.
+                        with self.subTest(case="explicit_page_size_kept"):
+                            self.assertNotIn(
+                                "page_size",
+                                _deepseek_family_overrides(_args(page_size=1), None),
+                            )
+                            self.assertNotIn(
+                                "page_size",
+                                _deepseek_family_overrides(_args(page_size=64), None),
+                            )
                         for arch in ("HYV4ForCausalLM", "HYV4ForCausalLMNextN"):
                             hf_config = SimpleNamespace(architectures=[arch])
                             with self.subTest(arch=arch, prefill_cp=True):

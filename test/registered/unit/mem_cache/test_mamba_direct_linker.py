@@ -331,6 +331,119 @@ class TestUpdateLoadCommitKeepsMamba(CustomTestCase):
         self.assertEqual(by_name[PoolName.KV].hit_policy, PoolHitPolicy.ALL_PAGES)
         self.assertEqual(by_name[PoolName.MAMBA].hit_policy, PoolHitPolicy.TRAILING_PAGES)
         self.assertEqual(by_name[PoolName.MAMBA].host_indices.tolist(), [3])
+        # Self-keyed identity: the resolved MAMBA transfer probes its own key
+        # space, not the KV page-hash array.
+        self.assertEqual(by_name[PoolName.MAMBA].probe_source, PoolName.MAMBA)
+        self.assertEqual(by_name[PoolName.KV].probe_source, PoolName.KV)
+
+
+class TestSelfKeyedBatchExists(CustomTestCase):
+    """batch_exists_v2 evaluates a self-keyed TRAILING_PAGES transfer over its
+    own boundary keys, independent of the KV page count."""
+
+    def _store_stub(self, mamba_entry):
+        from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
+            MooncakeStore,
+        )
+
+        exist_calls = []
+
+        def fake_batch_exist(keys):
+            exist_calls.append(list(keys))
+            # KV page keys ("page{i}_...") always exist; a self-keyed slot
+            # exists iff its boundary key names the hit boundary ("boundary_hit").
+            return [1 if (k.startswith("boundary_hit_") or not k.startswith("boundary_")) else 0 for k in keys]
+
+        kv_entry = SimpleNamespace(
+            page_size=64,
+            conv_buffer=None,
+            temporal_state_elem_size=0,
+        )
+        store = MooncakeStore.__new__(MooncakeStore)
+        store.registered_pools = {PoolName.MAMBA: mamba_entry, PoolName.KV: kv_entry}
+        store.mha_suffix = "r0_tp0"
+        store.mla_suffix = "r0_tp0"
+        store.config_prefix = None
+        store._use_group_semantics = False
+        store.mem_pool_host = SimpleNamespace(kv_buffer=None)
+        store._batch_exist = fake_batch_exist
+        store._exist_calls = exist_calls
+        return store
+
+    def test_self_keyed_probe_uses_transfer_keys(self):
+        group = _build_mamba_device_pool_group(
+            _fake_hybrid_kvcache(), page_size=64, params=_fake_params()
+        )
+        mamba = group.entry_map[PoolName.MAMBA]
+
+        store = self._store_stub(mamba)
+        kv_keys = [f"page{i}" for i in range(5)]
+        transfers = [
+            PoolTransfer(
+                name=PoolName.KV,
+                keys=kv_keys,
+                hit_policy=PoolHitPolicy.ALL_PAGES,
+            ),
+            PoolTransfer(
+                name=PoolName.MAMBA,
+                keys=["boundary_hit"],  # one node-boundary slot, exists
+                hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                probe_source=PoolName.MAMBA,
+            ),
+        ]
+        result = type(store).batch_exists_v2(store, kv_keys, transfers)
+        # MAMBA was probed with its own key, not the 5 KV page keys.
+        self.assertIn(
+            ["boundary_hit_r0_tp0_temporal", "boundary_hit_r0_tp0_conv_0"],
+            store._exist_calls,
+        )
+        # Boundary present -> final KV page is restorable.
+        self.assertIn(5, result.restorable_prefix_pages)
+
+    def test_self_keyed_miss_caps_restorable_prefix(self):
+        group = _build_mamba_device_pool_group(
+            _fake_hybrid_kvcache(), page_size=64, params=_fake_params()
+        )
+        mamba = group.entry_map[PoolName.MAMBA]
+
+        store = self._store_stub(mamba)
+        kv_keys = [f"page{i}" for i in range(5)]
+        transfers = [
+            PoolTransfer(
+                name=PoolName.KV,
+                keys=kv_keys,
+                hit_policy=PoolHitPolicy.ALL_PAGES,
+            ),
+            PoolTransfer(
+                name=PoolName.MAMBA,
+                keys=["boundary_miss"],  # mamba state absent
+                hit_policy=PoolHitPolicy.TRAILING_PAGES,
+                probe_source=PoolName.MAMBA,
+            ),
+        ]
+        result = type(store).batch_exists_v2(store, kv_keys, transfers)
+        self.assertEqual(result.restorable_prefix_pages, [])
+
+    def test_offload_lookup_key_parity(self):
+        """The OFFLOAD key (node.hash_value[-1]) and the LOOKUP boundary key
+        (last tail hash) must be the identical string for the same boundary."""
+        component = TestMambaComponentTransfers._component(self, _FakeAllocator())
+        node = SimpleNamespace(
+            hash_value=["h0", "h1", "h2"],
+            component_data={
+                ComponentType.MAMBA: SimpleNamespace(value=torch.tensor([7], dtype=torch.int64))
+            },
+        )
+        offload = component.build_external_linker_transfer(
+            LinkerTransferPhase.OFFLOAD, node, None
+        )
+        # A request whose device-uncached tail ends at this node's boundary
+        # carries the same page-hash chain, so its last tail hash == h2.
+        lookup = component.build_external_linker_transfer(
+            LinkerTransferPhase.LOOKUP, None, ["h0", "h1", "h2"]
+        )
+        self.assertEqual(offload.keys, ["h2"])
+        self.assertEqual(lookup.keys, offload.keys)
 
 
 if __name__ == "__main__":

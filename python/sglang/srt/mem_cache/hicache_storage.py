@@ -111,6 +111,11 @@ class PoolTransfer:
     hit_policy: PoolHitPolicy = PoolHitPolicy.ALL_PAGES
     nodes_to_load: Optional[List[Any]] = None
     indices_from_pool: Optional[PoolName] = None
+    # Which pool's key space the transfer addresses. Transfers sourced from a
+    # pool other than KV (e.g. MAMBA node-boundary keys) probe their own keys
+    # instead of the KV page-hash array. Resolved transfers carry this; raw
+    # logical transfers may leave it None (defaults to own name).
+    probe_source: Optional["PoolName"] = None
 
 
 @dataclass(frozen=True)
