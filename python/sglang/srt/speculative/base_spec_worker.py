@@ -42,18 +42,8 @@ def _can_pack_hicache_mtp(
     spec_algorithm: SpeculativeAlgorithm,
     draft_runners: tuple[ModelRunner, ...],
 ) -> bool:
-    is_nextn_mtp = (
-        spec_algorithm.is_eagle()
-        and not spec_algorithm.is_eagle3()
-        and all(
-            runner.model_config.num_nextn_predict_layers for runner in draft_runners
-        )
-    )
-    is_dspark_dsv4 = (
-        spec_algorithm.is_dspark()
-        and draft_runners[0].model_config.hf_config.architectures[0]
-        == "DeepseekV4ForCausalLMDSpark"
-    )
+    is_nextn_mtp = spec_algorithm.is_eagle() and not spec_algorithm.is_eagle3() and all(runner.model_config.num_nextn_predict_layers for runner in draft_runners)
+    is_dspark_dsv4 = spec_algorithm.is_dspark() and draft_runners[0].model_config.hf_config.architectures[0] == "DeepseekV4ForCausalLMDSpark"
     return is_nextn_mtp or is_dspark_dsv4
 
 
@@ -125,16 +115,11 @@ class EagleDraftWorkerBase(ABC):
         # _override_worker_state can set both directly, bypassing the hook that
         # pins this relation; the fast path is only valid when it holds.
         assert self.speculative_num_draft_tokens == self.speculative_num_steps + 1, (
-            "topk=1 requires speculative_num_draft_tokens == speculative_num_steps + 1, "
-            f"got {self.speculative_num_draft_tokens} and {self.speculative_num_steps}"
+            f"topk=1 requires speculative_num_draft_tokens == speculative_num_steps + 1, got {self.speculative_num_draft_tokens} and {self.speculative_num_steps}"
         )
         num_steps = self.speculative_num_steps
         sa = self.server_args
-        decode_max_bs = (
-            get_exec().graph.cuda_graph_config.decode.max_bs
-            if get_exec().graph.cuda_graph_config is not None
-            else None
-        )
+        decode_max_bs = get_exec().graph.cuda_graph_config.decode.max_bs if get_exec().graph.cuda_graph_config is not None else None
         max_bs = max(
             decode_max_bs or 0,
             get_schedule().max_running_requests or 0,
@@ -143,12 +128,8 @@ class EagleDraftWorkerBase(ABC):
         # A single-step chain has no parent entries (slow path drops the last
         # step). repeat (not expand): the kernel reads these as contiguous.
         parent_width = num_steps if num_steps > 1 else 0
-        self._topk1_parents_prealloc = torch.arange(
-            -1, parent_width - 1, dtype=torch.long, device=self.device
-        ).repeat(max_bs, 1)
-        self._topk1_score_indices_prealloc = torch.arange(
-            num_steps, dtype=torch.long, device=self.device
-        ).repeat(max_bs, 1)
+        self._topk1_parents_prealloc = torch.arange(-1, parent_width - 1, dtype=torch.long, device=self.device).repeat(max_bs, 1)
+        self._topk1_score_indices_prealloc = torch.arange(num_steps, dtype=torch.long, device=self.device).repeat(max_bs, 1)
 
 
 class BaseSpecWorker(ABC):
@@ -165,11 +146,7 @@ class BaseSpecWorker(ABC):
     def _draft_model_runners(self) -> tuple[ModelRunner, ...]:
         spec_algorithm = self.target_worker.model_runner.spec_algorithm
         draft_worker = self.draft_worker
-        if (
-            draft_worker is None
-            or spec_algorithm.is_ngram()
-            or spec_algorithm.is_frozen_kv_mtp()
-        ):
+        if draft_worker is None or spec_algorithm.is_ngram() or spec_algorithm.is_frozen_kv_mtp():
             return ()
         if spec_algorithm.is_dflash_family():
             return (draft_worker.model_runner,)
@@ -251,23 +228,15 @@ class BaseSpecWorker(ABC):
         target_model_runner = self.target_worker.model_runner
         target_model_runner.mtp_draft_device_pools = ()
         spec_algorithm = target_model_runner.spec_algorithm
-        if not (
-            get_memory().enable_hierarchical_cache
-            or get_disagg().disaggregation_decode_retraction_backup == "host_pool"
-        ):
+        if not (get_memory().enable_hierarchical_cache or get_memory().enable_unified_cache_external_linker or get_disagg().disaggregation_decode_retraction_backup == "host_pool"):
             return HiCacheDraftPlan()
 
         draft_runners = self._draft_model_runners()
         if not draft_runners:
             return HiCacheDraftPlan()
         draft_pools = tuple(runner.token_to_kv_pool for runner in draft_runners)
-        if (
-            "InklingForConditionalGenerationMTP"
-            in draft_runners[0].model_config.hf_config.architectures
-        ):
-            raise NotImplementedError(
-                "HiCache does not support Inkling MTP draft state yet."
-            )
+        if "InklingForConditionalGenerationMTP" in draft_runners[0].model_config.hf_config.architectures:
+            raise NotImplementedError("HiCache does not support Inkling MTP draft state yet.")
 
         if _can_pack_hicache_mtp(spec_algorithm, draft_runners):
             target_model_runner.mtp_draft_device_pools = draft_pools
@@ -275,6 +244,9 @@ class BaseSpecWorker(ABC):
                 mode=HiCacheDraftMode.PACKED,
                 device_pools=draft_pools,
             )
+
+        if get_memory().enable_unified_cache_external_linker:
+            raise NotImplementedError("The external linker only supports packed draft KV caches.")
 
         return HiCacheDraftPlan(
             mode=HiCacheDraftMode.SIDECAR,
@@ -327,9 +299,7 @@ class BaseSpecWorker(ABC):
                 return success, message
         return True, "Succeeded to update model weights."
 
-    def on_verify_complete_cpu(
-        self, num_correct_drafts_per_req: list[int], batch_size: int = 0
-    ) -> None:
+    def on_verify_complete_cpu(self, num_correct_drafts_per_req: list[int], batch_size: int = 0) -> None:
         """Hook called after verify finishes and accept counts are on CPU.
 
         Default no-op. Adaptive-aware workers override this to feed the
