@@ -1351,6 +1351,14 @@ class Envs:
     # CUDA graphs and execution buffers
     # ===================================================================
     SGLANG_USE_BREAKABLE_CUDA_GRAPH = EnvBool(False)
+    # Debug-only: wrap torch.distributed collectives during prefill CUDA graph
+    # capture and raise if any is recorded inside a captured graph segment.
+    # Guards the DCP × prefill-CUDA-graph invariant that DCP attention
+    # collectives (KV all-gather, LSE reduce) run as eager break points, never
+    # inside captured segments (openspec enable-dcp-bcg-prefill-cudagraph
+    # 1.1). Adds a Python frame + stream-capture query per distributed call,
+    # so it must stay off in production.
+    SGLANG_DEBUG_CAPTURE_COLLECTIVE_AUDIT = EnvBool(False)
     # Guards CUDA graph executable dedup via cudaGraphExecUpdate.
     SGLANG_ENABLE_CUDA_GRAPH_DEDUP = EnvBool(False)
     SGLANG_MEMORY_SAVER_CUDA_GRAPH = EnvBool(False)
