@@ -19,6 +19,7 @@ The tree only needs a handful of guarded hooks:
 
 from __future__ import annotations
 
+import logging
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from typing import TYPE_CHECKING, NamedTuple
@@ -27,6 +28,7 @@ import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import (
     DecLockRefParams,
+    EvictParams,
     InsertParams,
     MatchResult,
 )
@@ -35,6 +37,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
 )
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components import (
     ExternalLinkerLoadPhase,
     LinkerTransferPhase,
@@ -46,6 +49,8 @@ if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.unified_cache.unified_tree_core_interface import NodeId
     from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
+
+logger = logging.getLogger(__name__)
 
 
 class UnifiedCacheLinker(ABC):
@@ -150,6 +155,39 @@ class UnifiedCacheLinkerWrapper:
 
         cache.tree_core.enable_external_cache_linker = True
         cache.write_through_threshold = 1
+        # Correctness guard (upstream #30057 analogue): DSA sparse-attention
+        # pools keep a persistent per-page index sidecar (DSATokenToKVPool /
+        # IndexKeyCache) written at prefill time. The direct-linker KV pool
+        # entry only carries k/v buffers, so a restored prefix would attend
+        # through stale/zero index rows and silently corrupt output (observed:
+        # gsm8k 0.94 -> 0.44 on pure L3 restore). Until the index sidecar is
+        # either restored or rebuilt on load-back, degrade every external
+        # lookup to a plain miss for such pools: recompute is always correct.
+        self._match_disabled = False
+        try:
+            kvcache = cache.token_to_kv_pool_allocator.get_kvcache()
+            pool_group = getattr(cache_linker, "pool_group", None)
+            if getattr(kvcache, "use_dsa", False) and pool_group is not None:
+                # Any non-KV/MAMBA entry (e.g. INDEXER) means the sidecar is
+                # covered; only the bare {KV, MAMBA} group is unsafe.
+                sidecar_names = set(pool_group.entry_map) - {
+                    PoolName.KV,
+                    PoolName.MAMBA,
+                }
+                if not sidecar_names:
+                    self._match_disabled = True
+                    logger.warning(
+                        "External linker match disabled: DSA index sidecar is not "
+                        "covered by the linker pool group (%s); L3 hits would "
+                        "restore KV without index rows and corrupt output. "
+                        "Degrading to cache misses (recompute) until sidecar "
+                        "support lands.",
+                        sorted(pool_group.entry_map),
+                    )
+        except Exception:
+            # The guard must never take the scheduler down; on any doubt allow
+            # matching (previous behavior).
+            self._match_disabled = False
 
     @property
     def layer_done_counter(self) -> object:
@@ -163,6 +201,10 @@ class UnifiedCacheLinkerWrapper:
     def match(self, key: RadixKey, req: Req, result: MatchResult) -> MatchResult:
         cache = self.cache
         page = cache.page_size
+        if self._match_disabled:
+            # Correctness guard: unsafe pool coverage (see __init__); degrade
+            # to a plain miss so the prefix is recomputed.
+            return result
         device_hit_len = int(result.device_indices.numel())
         if device_hit_len >= len(key):
             return result
@@ -275,9 +317,7 @@ class UnifiedCacheLinkerWrapper:
         # then fail the async layer-wise session fatally. Re-check existence
         # here so the request degrades to a plain cache miss instead.
         revalidate = getattr(self.cache_linker, "revalidate_load", None)
-        if revalidate is not None and not revalidate(
-            [transfer for _, transfer in component_transfers]
-        ):
+        if revalidate is not None and not revalidate([transfer for _, transfer in component_transfers]):
             self._update_load(
                 ExternalLinkerLoadPhase.ABORT,
                 req,
@@ -315,6 +355,42 @@ class UnifiedCacheLinkerWrapper:
         )
         if mamba_transfer is not None and insert_result.mamba_exist:
             cache.req_to_token_pool.mamba_allocator.free(mamba_transfer.device_indices[:1])
+
+        # Bind the restored mamba state to the request's active recursion
+        # seed. Without this, the request's linear-attention layers start
+        # from a fresh zero slot while the attention layers read the restored
+        # KV — the two state tracks diverge and output corrupts (observed:
+        # gsm8k 0.94 -> 0.45 on pure-L3 restore). Mirrors the HiCache
+        # prepare_load_back binding (mamba_component.py prepare_load_back).
+        # COW semantics (like finalize_match_result_in_cache): the request
+        # must own a PRIVATE slot seeded from the restored one — binding the
+        # tree's slot directly double-manages it (leak/double-free, observed
+        # as "pool memory leak detected [full]" crash).
+        if mamba_transfer is not None and req.kv is not None:
+            if insert_result.mamba_exist:
+                src_index = cache.tree_core.get_component_device_value(insert_result.last_device_node, ComponentType.MAMBA)
+            else:
+                src_index = mamba_transfer.device_indices
+            if src_index is not None:
+                if not req.kv.holds_mamba:
+                    dst_index = cache.req_to_token_pool.mamba_allocator.alloc(1)
+                    if dst_index is None:
+                        lock_result = cache.inc_lock_ref(insert_result.last_device_node)
+                        cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
+                        dst_index = cache.req_to_token_pool.mamba_allocator.alloc(1)
+                        cache.dec_lock_ref(
+                            insert_result.last_device_node,
+                            lock_result.to_dec_params(),
+                        )
+                    if dst_index is not None:
+                        req.kv.mamba_pool_idx = dst_index[0]
+                if req.kv.holds_mamba:
+                    # mamba_cow_src_index must stay shape-(1,) like the
+                    # device-match path (finalize_match_result_in_cache);
+                    # a 0-d scalar breaks torch.cat in
+                    # _collect_deferred_mamba_cow_and_clear.
+                    req.kv.mamba_cow_src_index = src_index[:1]
+                    req.kv.mamba_needs_clear = False
 
         canonical_tail = cache.tree_core.collect_full_device_indices(insert_result.last_device_node, req.last_node)
         assert canonical_tail.numel() == len(tail_hashes) * cache.page_size

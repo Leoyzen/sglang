@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import os as _os
 import threading
 from concurrent.futures import Future
 from queue import Empty, Queue
@@ -31,9 +32,7 @@ logger = logging.getLogger(__name__)
 device_module = get_device_module()
 
 
-def _storage_suffix(
-    *, rank_replicated: bool, tp_rank: int, attn_cp_rank: int, pp_rank: int
-) -> str:
+def _storage_suffix(*, rank_replicated: bool, tp_rank: int, attn_cp_rank: int, pp_rank: int) -> str:
     parts = []
     if not rank_replicated:
         parts.append(f"tp{tp_rank}")
@@ -113,9 +112,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             tp_size = torch.distributed.get_world_size(group=tp_group)
         rank_replicated = self.pool_group.rank_replicated
         self.offload_owner = not rank_replicated or tp_rank == 0
-        extra_config, *_ = HybridCacheController.parse_storage_backend_extra_config(
-            get_memory().hicache_storage_backend_extra_config
-        )
+        extra_config, *_ = HybridCacheController.parse_storage_backend_extra_config(get_memory().hicache_storage_backend_extra_config)
         storage_config = HiCacheStorageConfig(
             tp_rank=tp_rank,
             tp_size=tp_size,
@@ -148,8 +145,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.storage.mla_suffix = storage_suffix
         self.storage.mha_suffix = storage_suffix
         logger.info(
-            "Mooncake direct linker storage topology: "
-            "rank_replicated=%s, tp_rank=%d/%d, offload_owner=%s, suffix=%s",
+            "Mooncake direct linker storage topology: rank_replicated=%s, tp_rank=%d/%d, offload_owner=%s, suffix=%s",
             rank_replicated,
             tp_rank,
             tp_size,
@@ -160,18 +156,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.register_buffers()
         self.layer_done_counter = LayerWiseLoadCounter(self.num_layers)
         if PoolName.MAMBA in self.pools:
-            params.req_to_token_pool.register_layer_transfer_counter(
-                self.layer_done_counter
-            )
+            params.req_to_token_pool.register_layer_transfer_counter(self.layer_done_counter)
         self.pending_loads: dict[str, list[PoolTransfer]] = {}
         self.gc_frozen = False
-        self.load_queue: Queue[
-            tuple[int, dict[str, list[PoolTransfer]], object] | None
-        ] = Queue()
+        self.load_queue: Queue[tuple[int, dict[str, list[PoolTransfer]], object] | None] = Queue()
         self.completed_loads: Queue[list[str]] = Queue()
-        self.offload_queue: Queue[tuple[list[PoolTransfer], int, object] | None] = (
-            Queue()
-        )
+        self.offload_queue: Queue[tuple[list[PoolTransfer], int, object] | None] = Queue()
         self.offload_results: Queue[bool] = Queue()
         self.stats = {"lookup": 0, "load": 0, "offload": 0}
         self.load_thread = threading.Thread(
@@ -198,10 +188,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 seen.add(allocation)
                 result = self.storage.store.register_buffer(*allocation)
                 if result not in (0, None):
-                    raise RuntimeError(
-                        "Failed to register GPU KV buffer with Mooncake, "
-                        f"error code: {result}."
-                    )
+                    raise RuntimeError(f"Failed to register GPU KV buffer with Mooncake, error code: {result}.")
 
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
         expanded = self.pool_group.resolve_transfers(transfers)
@@ -211,9 +198,26 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         page_keys = list(kv.keys)
         if not page_keys:
             return []
+        import os as _os
+
+        if _os.environ.get("SGLANG_LINKER_DEBUG_KEY"):
+            logger.info(
+                "LINKER-DBG lookup rid=%s n_keys=%d first2=%s expanded=%s",
+                rid,
+                len(page_keys),
+                [str(k) for k in page_keys[:2]],
+                [(t.name, t.hit_policy, len(t.keys or ()), len(t.host_indices or []) if t.host_indices is not None else None) for t in expanded],
+            )
         result = self.storage.batch_exists_v2(page_keys, expanded)
         restorable = result.restorable_prefix_pages or []
         self.stats["lookup"] += 1
+        if _os.environ.get("SGLANG_LINKER_DEBUG_KEY"):
+            logger.info(
+                "LINKER-DBG lookup-result rid=%s restorable=%s page_exists_head=%s",
+                rid,
+                restorable[-5:],
+                getattr(result, "page_exists", None)[:5] if getattr(result, "page_exists", None) is not None else None,
+            )
         if restorable:
             logger.info(
                 "Mooncake direct linker lookup hit: rid=%s pages=%d candidates=%d",
@@ -237,16 +241,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         "validated" and the async load path retains its own semantics.
         """
         try:
-            resolved = self.pool_group.resolve_transfers(
-                transfers, allow_partial=True, allow_missing_kv=True
-            )
+            resolved = self.pool_group.resolve_transfers(transfers, allow_partial=True, allow_missing_kv=True)
             if not resolved:
                 return True
             key_strs: list[str] = []
             for transfer in resolved:
-                component_keys, _ = self.storage._get_hybrid_page_component_keys(
-                    list(transfer.keys), transfer
-                )
+                component_keys, _ = self.storage._get_hybrid_page_component_keys(list(transfer.keys), transfer)
                 key_strs.extend(self.storage._tag_keys(component_keys))
             if not key_strs:
                 return True
@@ -257,9 +257,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         missing = [key for key, state in zip(key_strs, exist) if state != 1]
         if missing:
             logger.warning(
-                "Mooncake direct linker load revalidation failed: "
-                "missing=%d/%d keys (master eviction race), "
-                "degrading request to cache miss",
+                "Mooncake direct linker load revalidation failed: missing=%d/%d keys (master eviction race), degrading request to cache miss",
                 len(missing),
                 len(key_strs),
             )
@@ -273,9 +271,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         # Query establishes a boundary at which every component is restorable;
         # insert then removes pages already resident in L1. Loading is therefore
         # intentionally partial and may contain only a side pool such as SWA.
-        expanded = self.pool_group.resolve_transfers(
-            transfers, allow_partial=True, allow_missing_kv=True
-        )
+        expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True, allow_missing_kv=True)
         if not expanded:
             return False
         if rid in self.pending_loads:
@@ -333,24 +329,16 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             finally:
                 self.load_queue.task_done()
 
-    def load_layer_wise(
-        self, counter_index: int, request_transfers: list[list[PoolTransfer]]
-    ) -> None:
+    def load_layer_wise(self, counter_index: int, request_transfers: list[list[PoolTransfer]]) -> None:
         started = []
         try:
             batches: dict[PoolName, tuple[list[str], list[int]]] = {}
             for transfers in request_transfers:
                 for transfer in transfers:
                     keys, locations = batches.setdefault(transfer.name, ([], []))
-                    component_keys, _ = self.storage._get_hybrid_page_component_keys(
-                        list(transfer.keys), transfer
-                    )
+                    component_keys, _ = self.storage._get_hybrid_page_component_keys(list(transfer.keys), transfer)
                     keys.extend(self.storage._tag_keys(component_keys))
-                    locations.extend(
-                        self.pools[transfer.name].prepare_locations(
-                            transfer.host_indices
-                        )
-                    )
+                    locations.extend(self.pools[transfer.name].prepare_locations(transfer.host_indices))
             for keys, _ in batches.values():
                 result = self.storage.store.batch_get_session_start(keys)
                 failed = [key for key, code in zip(keys, result) if code != 0]
@@ -360,8 +348,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     # Session start re-queries the master, so retry the batch
                     # once before giving up.
                     logger.warning(
-                        "Mooncake get session start partial failure "
-                        "(keys=%d, failed=%d), retrying once: results=%s",
+                        "Mooncake get session start partial failure (keys=%d, failed=%d), retrying once: results=%s",
                         len(keys),
                         len(failed),
                         result,
@@ -372,17 +359,12 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     failed_get_cache = getattr(self.storage, "failed_get_cache", None)
                     if failed_get_cache is not None:
                         failed_get_cache.update_batch([], failed)
-                    raise RuntimeError(
-                        f"Mooncake get session start failed: keys={len(keys)}, "
-                        f"failed={len(failed)}, results={result}"
-                    )
+                    raise RuntimeError(f"Mooncake get session start failed: keys={len(keys)}, failed={len(failed)}, results={result}")
                 started.append(keys)
 
             for layer in range(self.num_layers):
                 for name, (keys, locations) in batches.items():
-                    meta = self.pools[name].get_prepared_layer_range_meta(
-                        locations, layer
-                    )
+                    meta = self.pools[name].get_prepared_layer_range_meta(locations, layer)
                     if meta is None:
                         continue
                     ptrs, sizes, offsets = meta
@@ -393,16 +375,31 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         offsets,
                     )
                     expected = [sum(item) for item in sizes]
-                    if (
-                        result is None
-                        or isinstance(result, int)
-                        or list(result) != expected
-                    ):
-                        raise RuntimeError(
-                            f"Mooncake range get failed for pool={name}, "
-                            f"layer={layer}: transferred={result}, "
-                            f"expected={expected}"
-                        )
+                    if result is None or isinstance(result, int) or list(result) != expected:
+                        raise RuntimeError(f"Mooncake range get failed for pool={name}, layer={layer}: transferred={result}, expected={expected}")
+                    # Checksum probe: after an INDEXER layer lands, sum the
+                    # restored rows. Zero-sum rows mean the DMA wrote nothing
+                    # (or the remote object was zero/stale) — the smoking gun
+                    # for restore-side index corruption. Gated by
+                    # SGLANG_LINKER_DEBUG_KEY.
+                    if name == PoolName.INDEXER and _os.environ.get("SGLANG_LINKER_DEBUG_KEY"):
+                        try:
+                            entry = self.pools[name]
+                            mapped = entry.layer_mapping.get(layer)
+                            if mapped is not None:
+                                buf = entry.components[0][mapped if isinstance(mapped, int) else mapped[0]]
+                                if buf.shape[0]:
+                                    rows = torch.as_tensor(locations, dtype=torch.long)
+                                    rows = rows.clamp_max(buf.shape[0] - 1)
+                                    cs = buf[rows].view(torch.uint8).to(torch.int64).sum().item()
+                                    logger.info(
+                                        "LINKER-DBG idx-checksum layer=%d rows=%d checksum=%d",
+                                        layer,
+                                        len(locations),
+                                        cs,
+                                    )
+                        except BaseException:
+                            logger.exception("idx-checksum probe failed")
                 self.layer_done_counter.complete(counter_index, layer)
         except BaseException as error:
             self.layer_done_counter.fail(counter_index, error)
@@ -438,6 +435,15 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     return
                 expanded, tokens, ready_event = task
                 ready_event.synchronize()
+                import os as _os
+
+                if _os.environ.get("SGLANG_LINKER_DEBUG_KEY"):
+                    logger.info(
+                        "LINKER-DBG offload tokens=%d pools=%s first_keys=%s",
+                        tokens,
+                        {name: (t.keys[:2], t.hit_policy) for name, t in ((x.name, x) for x in expanded)},
+                        [str(k) for k in next(iter(expanded)).keys[:2]],
+                    )
                 results = self.storage.batch_set_v2(expanded)
                 success = all(all(pool_results) for pool_results in results.values())
                 if success:
