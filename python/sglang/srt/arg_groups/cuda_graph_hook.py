@@ -45,7 +45,9 @@ logger = logging.getLogger(__name__)
 # rank-divergence audit) — until that lands, treat entries as pending
 # validation. Rollback lever: clear this set to restore the blanket
 # dcp_size > 1 auto-disable (migration-plan step 4).
-DCP_PREFILL_CG_ATTENTION_BACKEND_ALLOWLIST = frozenset({"trtllm_mla"})
+DCP_PREFILL_CG_ATTENTION_BACKEND_ALLOWLIST = frozenset(
+    {"trtllm_mla", "flashmla_sparse"}
+)
 
 
 def _resolved_prefill_attention_backend(server_args: Any) -> Any:
