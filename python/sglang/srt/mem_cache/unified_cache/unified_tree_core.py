@@ -946,11 +946,31 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self, node: UnifiedTreeNode, chunked: bool = False
     ) -> bool:
         """Increment hit count; check whether a write backup should be fired."""
-        if node.evicted or chunked:
+        if node.evicted:
             return False
         if self.is_write_back:
             return False
         node.hit_count += 1
+
+        # Eager mamba checkpoint offload: with the external linker enabled, a
+        # node that carries a live (donated) mamba snapshot but was never
+        # persisted must fire immediately, bypassing both the chunked gate and
+        # the hit-count threshold. Otherwise the snapshot only reaches remote
+        # storage via later hit-driven write-throughs (or never, if evicted
+        # first), leaving the mamba key supply too sparse for TRAILING_PAGES
+        # intersection to restore any meaningful prefix.
+        # The caller still builds the usual backup chain from this node, but
+        # only unstored ancestors join it, so the fan-out is bounded by real
+        # unsupplied spans rather than whole finished-prefill chains.
+        if (
+            self.enable_external_cache_linker
+            and not node.external_cache_stored
+            and ComponentType.MAMBA in self.components_by_type
+            and self.components_by_type[ComponentType.MAMBA].should_eager_offload(node)
+        ):
+            return True
+        if chunked:
+            return False
 
         if self.enable_external_cache_linker:
             return (

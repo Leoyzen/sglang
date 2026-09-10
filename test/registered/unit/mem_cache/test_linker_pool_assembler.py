@@ -362,20 +362,40 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                         plan.device_pools if nextn_layers else (),
                     )
 
-    def test_unsupported_strategy_fails_with_context(self):
+    def test_mamba_accepts_tree_page_size(self):
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
         kvcache = HybridLinearKVPool.__new__(HybridLinearKVPool)
-        with self.assertRaisesRegex(
-            ValueError,
-            "does not support the direct external linker: _MambaStrategy",
-        ):
-            resolve_hybrid_device_pool_group(
-                kvcache=kvcache,
-                page_size=2,
-                params=SimpleNamespace(),
-                components={ComponentType.FULL, ComponentType.MAMBA},
-            )
+        kvcache.full_attention_layer_id_mapping = {0: 0}
+        kvcache.full_kv_pool = SimpleNamespace(
+            kv_buffer=[torch.zeros((16, 5), dtype=torch.uint8)]
+        )
+        params = SimpleNamespace(
+            req_to_token_pool=SimpleNamespace(
+                mamba_pool=SimpleNamespace(
+                    mamba_cache=SimpleNamespace(
+                        temporal=torch.zeros((1, 4, 2), dtype=torch.uint8),
+                        conv=[torch.zeros((1, 4, 3), dtype=torch.uint8)],
+                    )
+                ),
+                mamba_map={0: 0},
+            ),
+            mtp_draft_device_pools=(),
+        )
+        group = resolve_hybrid_device_pool_group(
+            kvcache=kvcache,
+            page_size=2,
+            params=params,
+            components={ComponentType.FULL, ComponentType.MAMBA},
+        )
+        # The tree page size is carried by the KV entry; the MAMBA entry
+        # stays slot-granular regardless.
+        self.assertEqual(group.entry_map[PoolName.KV].page_size, 2)
+        mamba = group.entry_map[PoolName.MAMBA]
+        self.assertEqual(mamba.page_size, 1)
+        # slot-granular rows: internal page_size==1 while the KV entry carries
+        # the tree page size; _row_span == 1 means rows_are_pages semantics.
+        self.assertEqual(mamba._row_span, 1)
 
 
 if __name__ == "__main__":

@@ -29,6 +29,7 @@ from sglang.srt.mem_cache.unified_cache.components.tree_component import (
     CacheTransferPhase,
     ComponentType,
     EvictLayer,
+    ExternalLinkerLoadPhase,
     LinkerTransferPhase,
     LRURefreshPhase,
     PrepareLoadBackResult,
@@ -300,6 +301,13 @@ class MambaComponent(TreeComponent):
             )
             self.tree_core._cascade_evict(node, self, tracker, device_frees, host_frees)
             excess -= 1
+
+    def should_eager_offload(self, node: UnifiedTreeNode) -> bool:
+        """True when the node carries a live mamba snapshot not yet persisted
+        to the external store; the tree core fires the write-through for it
+        immediately instead of waiting for hit-count/chunked gating."""
+        cd = node.component_data[self.component_type]
+        return cd.value is not None
 
     def redistribute_on_node_split(
         self, new_parent: UnifiedTreeNode, child: UnifiedTreeNode
@@ -651,9 +659,77 @@ class MambaComponent(TreeComponent):
         node: Optional[UnifiedTreeNode],
         keys: Optional[Sequence[str]],
     ) -> Optional[PoolTransfer]:
-        raise AssertionError(
-            "MambaComponent does not support external linker mode, will support soon"
-        )
+        # Mamba keeps ONE state slot per tree node, keyed by the node's last
+        # page hash (same key space as build_hicache_transfers BACKUP_STORAGE),
+        # so every phase reduces the page-granular tail to its trailing hash.
+        if phase == LinkerTransferPhase.OFFLOAD:
+            if node is None or not node.hash_value:
+                return None
+            value = node.component_data[self.component_type].value
+            if value is None:
+                return None
+            # One mamba state covers the whole node span, but the lookup
+            # side probes per-PAGE hashes (it has no tree after a flush).
+            # The state is valid ONLY at the node's END boundary; resuming
+            # from any interior page would pair KV pages 1..P' with a state
+            # computed at the node end (depth mismatch = corrupted output).
+            # So only the LAST page hash advertises the slot. Lookup still
+            # probes every tail page hash because any page can be some
+            # node's end.
+            keys = [node.hash_value[-1]]
+            return PoolTransfer(
+                name=PoolName.MAMBA,
+                device_indices=value.to(torch.int64),
+                keys=keys,
+                hit_policy=PoolHitPolicy.TRAILING_PAGES,
+            )
+
+        if not keys:
+            return None
+
+        if phase == LinkerTransferPhase.LOOKUP:
+            # Probe EVERY tail page hash: each is a candidate node boundary
+            # with a potentially offloaded mamba state. Probing only the
+            # request-end hash misses every earlier offloaded node.
+            return PoolTransfer(
+                name=PoolName.MAMBA,
+                keys=list(keys),
+                hit_policy=PoolHitPolicy.TRAILING_PAGES,
+            )
+
+        if phase == LinkerTransferPhase.LOAD:
+            dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
+            if dst is None:
+                self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
+                dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
+                if dst is None:
+                    return None
+
+            return PoolTransfer(
+                name=PoolName.MAMBA,
+                device_indices=dst.to(torch.int64),
+                keys=[keys[-1]],
+                hit_policy=PoolHitPolicy.TRAILING_PAGES,
+            )
+
+        return None
+
+    def update_external_linker_load(
+        self,
+        phase: ExternalLinkerLoadPhase,
+        req: Req,
+        full_transfer: PoolTransfer,
+        transfer: PoolTransfer,
+        prefix_len: int,
+        *,
+        insert_result: Optional[InsertResult] = None,
+        canonical_full: Optional[torch.Tensor] = None,
+    ) -> Optional[PoolTransfer]:
+        # The slot was allocated in the LOAD build; the wrapper owns the
+        # COMMIT insert (mamba_value) and the mamba_exist free, and the
+        # adopted-range filtering does not apply (one slot per node, always
+        # adopted) -- see UnifiedCacheLinkerWrapper._update_load.
+        return transfer
 
     # ---- HiCache Hooks ----
 

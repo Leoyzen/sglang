@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Callable, Sequence
 from dataclasses import replace
 from typing import Any
@@ -14,6 +15,8 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+
+logger = logging.getLogger(__name__)
 
 
 class DevicePoolEntry:
@@ -216,6 +219,10 @@ class DevicePoolGroup:
                         else source.hit_policy
                     ),
                     indices_from_pool=None,
+                    # Keep the key-space identity: transfers sourced from a
+                    # pool other than KV address their own keys (e.g. MAMBA
+                    # node-boundary keys), not the KV page-hash array.
+                    probe_source=source_name,
                 )
             )
         return resolved
@@ -413,6 +420,255 @@ def _build_dsa_device_pool_group(
         ),
     ]
     return DevicePoolGroup(entries, num_layers, page_size, rank_replicated=True)
+
+
+class MambaDevicePoolEntry(DevicePoolEntry):
+    """MAMBA device pool entry carrying the duck-typed host attributes that
+    ``MooncakeStore._get_hybrid_page_component_keys`` / ``_batch_io_v2`` read
+    off a :class:`MambaPoolHost` in direct-linker mode."""
+
+    def __init__(
+        self,
+        *,
+        temporal_state_elem_size: int,
+        conv_buffers: Sequence[torch.Tensor],
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.temporal_state_elem_size = temporal_state_elem_size
+        self.conv_buffer = list(conv_buffers)
+
+
+def _is_hybrid_linear_kv_pool(pool: Any) -> bool:
+    """Duck check for the HybridLinearKVPool wrapper (lazy import avoids a
+    circular dependency with memory_pool)."""
+    try:
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+        if isinstance(pool, HybridLinearKVPool):
+            return True
+    except ImportError:
+        pass
+    return hasattr(pool, "full_kv_pool") and hasattr(
+        pool, "full_attention_layer_id_mapping"
+    )
+
+
+def _mamba_kv_components(kvcache: Any) -> list[Sequence[torch.Tensor]]:
+    """Full-attention buffers of a HybridLinearKVPool in component-group form."""
+    pool = kvcache.full_kv_pool
+    k_buffer = getattr(pool, "k_buffer", None)
+    if k_buffer is not None:
+        return [k_buffer, pool.v_buffer]
+    return [pool.kv_buffer]
+
+
+def _sorted_union_remapping(
+    pool_mapping: dict[int, int], union_layers: Sequence[int]
+) -> dict[int, int]:
+    """Map transfer-layer ranks to pool-side layer indices.
+
+    Transfer layers are numbered over the sorted union of component global
+    layer ids; remap each global id to its rank in that union so
+    ``get_prepared_layer_range_meta`` resolves it per transfer layer.
+    """
+    return {
+        local: pool_mapping[gid]
+        for local, gid in enumerate(union_layers)
+        if gid in pool_mapping
+    }
+
+
+def _build_mamba_state_components(
+    mamba_pool: Any,
+) -> tuple[list[list[torch.Tensor]], list[torch.Tensor], int]:
+    """Assemble the MAMBA device entry from the device MambaPool buffers."""
+    state = mamba_pool.mamba_cache
+    # Slot-first component order must match
+    # MooncakeStore._get_hybrid_page_component_keys: temporal first, then
+    # conv_0..conv_n; MambaPoolHost.get_page_buffer_meta drops the temporal
+    # object for conv-only models (0-size state), mirror that here.
+    temporal_state_elem_size = (
+        int(
+            state.temporal.numel()
+            // state.temporal.shape[0]
+            // max(1, state.temporal.shape[1])
+        )
+        if state.temporal.numel()
+        else 0
+    )
+    components: list[list[torch.Tensor]] = []
+    conv_buffers: list[torch.Tensor] = []
+    if temporal_state_elem_size > 0:
+        components.append([state.temporal[l] for l in range(state.temporal.shape[0])])
+    for conv in state.conv:
+        conv_buffers.append(conv)
+        components.append([conv[l] for l in range(conv.shape[0])])
+    if not components:
+        raise ValueError("Mamba pool has neither temporal nor conv state buffers.")
+    return (
+        components,
+        conv_buffers,
+        temporal_state_elem_size,
+    )
+
+
+def _build_mamba_device_pool_group(
+    kvcache: Any,
+    page_size: int,
+    params: Any,
+) -> DevicePoolGroup:
+    if page_size != 1:
+        # The MAMBA entry addresses slots by node-boundary keys (page-aligned
+        # node ends) and keeps page_size=1 rows internally, so any tree
+        # page size works; the KV entry carries the tree page granularity.
+        logger.warning(
+            "Mamba direct linker running with tree page_size=%d (mamba slots stay slot-granular).",
+            page_size,
+        )
+
+    mamba_pool = params.req_to_token_pool.mamba_pool
+    mamba_layer_mapping = dict(params.req_to_token_pool.mamba_map)
+    full_layer_mapping = dict(kvcache.full_attention_layer_id_mapping)
+    union_layers = sorted(set(full_layer_mapping) | set(mamba_layer_mapping))
+
+    state_components, conv_buffers, temporal_state_elem_size = (
+        _build_mamba_state_components(mamba_pool)
+    )
+    entries = [
+        DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=kvcache,
+            components=_mamba_kv_components(kvcache),
+            layer_mapping=full_layer_mapping,
+            page_size=page_size,
+            rows_are_pages=False,
+        ),
+        MambaDevicePoolEntry(
+            name=PoolName.MAMBA,
+            indices_from_pool=PoolName.MAMBA,
+            device_pool=mamba_pool,
+            components=state_components,
+            layer_mapping=_sorted_union_remapping(mamba_layer_mapping, union_layers),
+            page_size=1,
+            rows_are_pages=True,
+            packed=False,
+            temporal_state_elem_size=temporal_state_elem_size,
+            conv_buffers=conv_buffers,
+        ),
+    ]
+    num_layers = len(union_layers)
+
+    # DSA full-attention layers carry a persistent per-page index sidecar
+    # (DSATokenToKVPool.index_k_with_scale_buffer). Without an INDEXER entry
+    # here, an L3 restore would land latent KV rows on freshly allocated
+    # slots whose index rows are zero/stale, and dsa_topk would then pick
+    # wrong pages over the whole restored prefix (upstream #30057 form).
+    # Mirror the pure-DSA group: the INDEXER entry is KV-sourced
+    # (ALL_PAGES), so batch_exists_v2 intersects restorable prefixes with
+    # index availability at lookup time. Index rows live in fixed
+    # 64-token kernel pages (IndexKeyCache), so the entry only pages 1:1
+    # with the tree when page_size == 64.
+    full_kv_pool = kvcache.full_kv_pool
+    index_buffers = getattr(full_kv_pool, "index_k_with_scale_buffer", None)
+    if index_buffers and getattr(full_kv_pool, "use_dsa", False) and page_size == 64:
+        entries.append(
+            DevicePoolEntry(
+                name=PoolName.INDEXER,
+                indices_from_pool=PoolName.KV,
+                device_pool=full_kv_pool,
+                components=[index_buffers],
+                layer_mapping=full_layer_mapping,
+                page_size=page_size,
+                rows_are_pages=True,
+            )
+        )
+    elif index_buffers and getattr(full_kv_pool, "use_dsa", False):
+        logger.warning(
+            "Mamba direct linker: DSA index sidecar present but tree page_size=%d != IndexKeyCache kernel page 64; INDEXER entry skipped (L3 restores would be unsafe).",
+            page_size,
+        )
+    return DevicePoolGroup(
+        entries,
+        num_layers,
+        page_size,
+        rank_replicated=False,
+    )
+
+
+def _build_mamba_swa_device_pool_group(
+    kvcache: Any, page_size: int, params: Any
+) -> DevicePoolGroup:
+    """Defensive variant for SWA + Mamba hybrid stacks (KV + SWA + MAMBA)."""
+    if page_size != 1:
+        logger.warning(
+            "Mamba(SWA) direct linker running with tree page_size=%d (mamba slots stay slot-granular).",
+            page_size,
+        )
+
+    from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+        _swa_layer_mappings,
+    )
+
+    mamba_pool = params.req_to_token_pool.mamba_pool
+    mamba_layer_mapping = dict(params.req_to_token_pool.mamba_map)
+    full_layer_mapping, swa_layer_mapping = _swa_layer_mappings(kvcache)
+    union_layers = sorted(
+        set(full_layer_mapping) | set(swa_layer_mapping) | set(mamba_layer_mapping)
+    )
+
+    state_components, conv_buffers, temporal_state_elem_size = (
+        _build_mamba_state_components(mamba_pool)
+    )
+
+    full_pool = kvcache.full_kv_pool
+    swa_pool = kvcache.swa_kv_pool
+
+    def kv_components(pool: Any) -> list[Sequence[torch.Tensor]]:
+        k_buffer = getattr(pool, "k_buffer", None)
+        if k_buffer is not None:
+            return [k_buffer, pool.v_buffer]
+        return [pool.kv_buffer]
+
+    entries = [
+        DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=full_pool,
+            components=kv_components(full_pool),
+            layer_mapping=full_layer_mapping,
+            page_size=page_size,
+            rows_are_pages=False,
+        ),
+        DevicePoolEntry(
+            name=PoolName.SWA,
+            indices_from_pool=PoolName.SWA,
+            device_pool=swa_pool,
+            components=kv_components(swa_pool),
+            layer_mapping=swa_layer_mapping,
+            page_size=page_size,
+            rows_are_pages=False,
+        ),
+        MambaDevicePoolEntry(
+            name=PoolName.MAMBA,
+            indices_from_pool=PoolName.MAMBA,
+            device_pool=mamba_pool,
+            components=state_components,
+            layer_mapping=_sorted_union_remapping(mamba_layer_mapping, union_layers),
+            page_size=1,
+            rows_are_pages=True,
+            packed=False,
+            temporal_state_elem_size=temporal_state_elem_size,
+            conv_buffers=conv_buffers,
+        ),
+    ]
+    return DevicePoolGroup(
+        entries,
+        len(union_layers),
+        page_size,
+        rank_replicated=False,
+    )
 
 
 def resolve_hybrid_device_pool_group(

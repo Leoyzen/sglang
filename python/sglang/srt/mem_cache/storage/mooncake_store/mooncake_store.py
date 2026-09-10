@@ -851,21 +851,52 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         for transfer in pool_transfers or []:
             if not restorable:
                 break
+            # Self-keyed transfers (e.g. MAMBA) address their own key space —
+            # one key (× multiplier) per slot at that pool's granularity — not
+            # a chunk of the KV page-hash array. Evaluate them against their
+            # own keys; the result still intersects the whole-page restorable
+            # domain via the TRAILING_PAGES window below.
+            self_keyed = (
+                transfer.probe_source is not None
+                and transfer.probe_source != PoolName.KV
+                and transfer.name != PoolName.KV
+            )
+            probe_keys = list(transfer.keys) if self_keyed else keys
             component_keys, key_multiplier = self._get_hybrid_page_component_keys(
-                keys, transfer
+                probe_keys, transfer
             )
             component_keys = self._tag_keys(component_keys)
             ex = self._batch_exist(component_keys)
             if key_multiplier > 0:
-                page_exists = [
-                    all(
-                        r == 1
-                        for r in ex[i * key_multiplier : (i + 1) * key_multiplier]
-                    )
-                    for i in range(kv_pages)
-                ]
+                if self_keyed:
+                    # One hit element per probed slot (not per KV page). A
+                    # self-keyed slot stores its OWN absolute hash (a node
+                    # boundary), so slot i of the transfer maps to page i of
+                    # the probe domain: the probe keys ARE the tail hashes
+                    # starting at device_hit_len. Right-aligning to the KV
+                    # domain would assume the written slots end exactly at
+                    # this conversation tail, which scattered write-through
+                    # chains do not satisfy.
+                    n_slots = len(probe_keys)
+                    item_exists = [
+                        all(
+                            r == 1
+                            for r in ex[i * key_multiplier : (i + 1) * key_multiplier]
+                        )
+                        for i in range(n_slots)
+                    ]
+                    item_exists += [False] * max(0, kv_pages - n_slots)
+                else:
+                    item_exists = [
+                        all(
+                            r == 1
+                            for r in ex[i * key_multiplier : (i + 1) * key_multiplier]
+                        )
+                        for i in range(kv_pages)
+                    ]
             else:
-                page_exists = [False] * kv_pages
+                item_exists = [False] * kv_pages
+            page_exists = item_exists
             boundary = 0
             pool_restorable = []
             if transfer.hit_policy == PoolHitPolicy.ALL_PAGES:
@@ -877,7 +908,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
                 # A stop point works when the window ending there is complete,
                 # so scan every one instead of stopping at the longest.
-                trailing = max(1, len(transfer.keys) if transfer.keys else 1)
+                # A self-keyed pool stores ONE object per boundary hash, so
+                # each probed slot is its own stop point: the window is a
+                # single slot, not the whole probe-key array.
+                trailing = (
+                    1
+                    if self_keyed
+                    else max(1, len(transfer.keys) if transfer.keys else 1)
+                )
                 for prefix_len in range(kv_pages, 0, -1):
                     if all(
                         page_exists[i]

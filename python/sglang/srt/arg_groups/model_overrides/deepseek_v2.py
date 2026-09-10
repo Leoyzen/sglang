@@ -140,9 +140,18 @@ def _deepseek_family_overrides(server_args: Any, hf_config: Any) -> dict:
                     "(aiter preshuffle paged-MQA path unavailable: "
                     "needs Triton>=3.5.0 or AITER_ENABLE_AOT_GLUON_PA_MQA_LOGITS=1)."
                 )
-            else:
+            elif cfg.page_size is None:
                 overrides["page_size"] = 64
                 logger.warning("Setting page size to 64 for DeepSeek DSA.")
+            else:
+                # The operator pinned a page size explicitly (CLI or config
+                # file); keep it. DSA kernels that require the 64-column
+                # kpage axis must validate it downstream.
+                logger.warning(
+                    "Keeping operator-set page size %s for DeepSeek DSA "
+                    "(default would be 64).",
+                    cfg.page_size,
+                )
         elif get_platform().is_xpu:
             overrides["page_size"] = 128
             logger.warning("Setting page size to 128 for DeepSeek DSA on XPU.")
