@@ -1132,6 +1132,30 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         forward_batch.mha_return_lse = False
         forward_batch.set_attn_attend_prefix_cache(False)
 
+    def _prepare_capture_dcp_metadata(
+        self, forward_batch: ForwardBatch
+    ) -> Optional[object]:
+        """Bind real prefill DCP metadata onto the capture dummy (opsx 2.2).
+
+        When decode context parallelism is active, the dummy extend must be
+        built through the same metadata preparation path as a real extend —
+        the captured segments read the DCP tensors (indptr/indices, the KV
+        gather buffer, the rank-local prefix indices), so binding ``None``
+        would bake a DCP-less forward into the graph (design D1/D4, spec
+        'DCP metadata present at capture').
+
+        The shared builder runs inside the active forward context (the
+        caller holds one), so it resolves the req/token pools exactly like
+        the eager path.
+        """
+        if self.model_runner.ps.attn_dcp_size <= 1:
+            return None
+        from sglang.srt.model_executor.model_runner_components.dcp_prefill_metadata import (
+            prepare_dcp_extend_metadata,
+        )
+
+        return prepare_dcp_extend_metadata(self.model_runner, forward_batch)
+
     def can_replay_locally(
         self,
         *,
@@ -1406,6 +1430,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
             )
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
+        # Bind real DCP metadata onto the dummy extend before any metadata
+        # init or capture: the shared builder is the same path a real extend
+        # takes (design D1/D4). Needs the forward context the way eager has
+        # it, so enter one around the builder call.
+        if self.model_runner.ps.attn_dcp_size > 1:
+            with forward_context(
+                ForwardContext(attn_backend=self.model_runner.attn_backend)
+            ):
+                self._prepare_capture_dcp_metadata(forward_batch)
         return forward_batch, self.model_runner.attn_backend
 
     def capture(self) -> None:
@@ -1532,18 +1565,42 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 post_warmup_hook()
         else:
             post_warmup_hook = getattr(attn_backend, "on_after_cuda_graph_warmup", None)
-        self.backend.capture_one(
-            shape_key,
-            run_once,
-            # DP padding can install capture-only tensors on this dummy batch;
-            # BCG retains it so their recorded addresses remain valid.
-            capture_inputs=(
-                forward_batch
-                if forward_batch.global_num_tokens_gpu is not None
-                else None
-            ),
-            post_warmup_hook=post_warmup_hook,
-        )
+        # Debug-mode capture audit (opsx 2.2, design D2): when DCP is enabled
+        # and SGLANG_DEBUG_CAPTURE_COLLECTIVE_AUDIT is set, wrap the per-shape
+        # capture in the Section-1 auditor so any NCCL/symm-mem collective
+        # invoked while the stream is capturing (BCG segments / compiled
+        # pieces) aborts capture with a named failure. No-op when the audit
+        # is off; harmless during warmup iterations because the auditor only
+        # records when the stream actually is capturing.
+        if self.model_runner.ps.attn_dcp_size > 1:
+            from sglang.srt.model_executor.model_runner_components.graph_capture_collective_audit import (
+                instrumented_capture_scope,
+            )
+
+            scope = instrumented_capture_scope(f"prefill-bucket-{num_tokens}")
+        else:
+            import contextlib
+
+            scope = contextlib.nullcontext()
+        with scope:
+            self.backend.capture_one(
+                shape_key,
+                run_once,
+                # DP padding can install capture-only tensors on this dummy batch;
+                # BCG retains it so their recorded addresses remain valid.
+                capture_inputs=(
+                    forward_batch
+                    if forward_batch.global_num_tokens_gpu is not None
+                    else None
+                ),
+                post_warmup_hook=post_warmup_hook,
+            )
+            if self.model_runner.ps.attn_dcp_size > 1:
+                from sglang.srt.model_executor.model_runner_components.graph_capture_collective_audit import (
+                    audit_active_capture_segment,
+                )
+
+                audit_active_capture_segment(f"prefill bucket {num_tokens}")
 
     def load_batch(self, forward_batch: ForwardBatch, **kwargs) -> ForwardBatch:
         """Pad, populate static buffers, and build the static_forward_batch
