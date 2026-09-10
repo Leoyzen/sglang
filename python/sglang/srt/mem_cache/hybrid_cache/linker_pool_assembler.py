@@ -212,13 +212,18 @@ def _with_packed_draft_mapping(
     *,
     target_device_layer_num: int,
     draft_layer_num: int,
-) -> dict[int, int | tuple[int, ...]]:
+) -> dict[int, int | Sequence[int]]:
     """Attach draft depth N to the same transfer layer as target layer N."""
     if draft_layer_num > len(layer_mapping):
         raise ValueError(f"Packed draft layers exceed the target transfer layer count: {draft_layer_num} > {len(layer_mapping)}.")
-    result: dict[int, int | tuple[int, ...]] = dict(layer_mapping)
+    # layer_mapping keys may be global layer ids (e.g. the mamba-hybrid
+    # full_attention_layer_id_mapping interleaves with mamba layers), so pair
+    # each draft depth with the Nth target component by enumeration order,
+    # keyed back by its actual mapping key.
+    mapping_keys = sorted(layer_mapping)
+    result: dict[int, int | Sequence[int]] = dict(layer_mapping)
     for depth in range(draft_layer_num):
-        result[depth] = (layer_mapping[depth], target_device_layer_num + depth)
+        result[mapping_keys[depth]] = (layer_mapping[mapping_keys[depth]], target_device_layer_num + depth)
     return result
 
 
