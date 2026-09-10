@@ -902,13 +902,34 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 probe_keys, transfer
             )
             component_keys = self._tag_keys(component_keys)
+            if os.environ.get("SGLANG_LINKER_DEBUG_KEY"):
+                logger.info(
+                    "LINKER-DBG batch_exists pool=%s self_keyed=%s n_comp=%d "
+                    "mult=%d comp_first2=%s",
+                    transfer.name,
+                    self_keyed,
+                    len(component_keys),
+                    key_multiplier,
+                    component_keys[:2],
+                )
             ex = self._batch_exist(component_keys)
+            if os.environ.get("SGLANG_LINKER_DEBUG_KEY"):
+                logger.info(
+                    "LINKER-DBG batch_exists ex_total=%d ex_head=%s ex_true=%d",
+                    len(ex),
+                    list(ex[:2]),
+                    sum(1 for r in ex if r == 1),
+                )
             if key_multiplier > 0:
                 if self_keyed:
-                    # One hit element per probed slot (not per KV page). The
-                    # slots are tail-aligned: slot i of the transfer maps to
-                    # the i-th-from-last whole-page position of the KV
-                    # domain (each boundary is a page-aligned node end).
+                    # One hit element per probed slot (not per KV page). A
+                    # self-keyed slot stores its OWN absolute hash (a node
+                    # boundary), so slot i of the transfer maps to page i of
+                    # the probe domain: the probe keys ARE the tail hashes
+                    # starting at device_hit_len. Right-aligning to the KV
+                    # domain would assume the written slots end exactly at
+                    # this conversation tail, which scattered write-through
+                    # chains do not satisfy.
                     n_slots = len(probe_keys)
                     slot_exists = [
                         all(
@@ -917,7 +938,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                         )
                         for i in range(n_slots)
                     ]
-                    item_exists = [False] * (kv_pages - n_slots) + slot_exists
+                    item_exists = slot_exists + [False] * max(0, kv_pages - n_slots)
                 else:
                     item_exists = [
                         all(
@@ -940,7 +961,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
                 # A stop point works when the window ending there is complete,
                 # so scan every one instead of stopping at the longest.
-                trailing = max(1, len(transfer.keys) if transfer.keys else 1)
+                # A self-keyed pool stores ONE object per boundary hash, so
+                # each probed slot is its own stop point: the window is a
+                # single slot, not the whole probe-key array.
+                trailing = (
+                    1
+                    if self_keyed
+                    else max(1, len(transfer.keys) if transfer.keys else 1)
+                )
                 for prefix_len in range(kv_pages, 0, -1):
                     if all(
                         page_exists[i]
