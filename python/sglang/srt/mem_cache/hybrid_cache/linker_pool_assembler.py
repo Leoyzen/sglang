@@ -568,7 +568,12 @@ def _build_mamba_device_pool_group(
                 rows_are_pages=True,
             )
         )
-        num_layers = max(num_layers, len(full_layer_mapping) + draft_layer_num)
+        # num_layers stays len(union_layers): every entry's mapping keys are
+        # drawn from that same union, and consumers iterate range(num_layers)
+        # tolerating per-pool None mappings (mooncake_direct_linker.py
+        # load_layer_wise: `meta is None -> continue`). The KV/INDEXER packed
+        # mapping never exceeds len(full_layer_mapping)+draft layers, which
+        # union (full keys + all mamba layers) always covers.
     elif index_buffers and getattr(full_kv_pool, "use_dsa", False):
         logger.warning(
             "Mamba direct linker: DSA index sidecar present but tree page_size=%d != IndexKeyCache kernel page 64; INDEXER entry skipped (L3 restores would be unsafe).",

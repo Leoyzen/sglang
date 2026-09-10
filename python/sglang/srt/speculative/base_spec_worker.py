@@ -228,6 +228,9 @@ class BaseSpecWorker(ABC):
         target_model_runner = self.target_worker.model_runner
         target_model_runner.mtp_draft_device_pools = ()
         spec_algorithm = target_model_runner.spec_algorithm
+        # The external-linker gate term (and the linker's packed-only draft
+        # restriction below) follow PR #37914; upstream main's gate is
+        # hicache/host_pool only.
         if not (get_memory().enable_hierarchical_cache or get_memory().enable_unified_cache_external_linker or get_disagg().disaggregation_decode_retraction_backup == "host_pool"):
             return HiCacheDraftPlan()
 

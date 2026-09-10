@@ -664,6 +664,172 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         params = captured["ctx"].params
         self.assertEqual(params.mtp_draft_device_pools, (draft_pool,))
 
+    def test_linker_and_hicache_stack_consume_same_draft_pools(self):
+        """When BOTH the external linker and the hicache host stack are
+        configured, the SAME mtp_draft_device_pools must reach BOTH consumers:
+        (i) the direct linker pool group (KV entry packs the draft buffers
+        flattened, per a2ecd408fa) and (ii) the hicache host stack
+        (build_hybrid_mamba_stack unwraps the HybridLinearKVPool wrapper at
+        hybrid_pool_assembler.py:740 and extends transfer layers via
+        _with_mtp_layer_mapping). Driving both builders with one shared fake
+        draft pool pins the dual consumption.
+        """
+        import mmap as _pymmap
+        import threading
+        from unittest import mock
+
+        _PROT_RW = _pymmap.PROT_READ | _pymmap.PROT_WRITE
+
+        def _darwin_mmap(fileno, alloc_bytes, flags):
+            # Strip Linux-only MAP_POPULATE (darwin rejects the bit).
+            return _pymmap.mmap(fileno, alloc_bytes, flags=flags & ~0x08000, prot=_PROT_RW)
+
+        class _FakeCudart:
+            def cudaHostRegister(self, ptr, size, flags):
+                return 0
+
+            def cudaHostUnregister(self, ptr):
+                return 0
+
+            def cudaGetErrorString(self, rc):
+                return "x"
+
+        from sglang.srt.environ import envs
+        from sglang.srt.mem_cache.hicache_storage import PoolName
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+        from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+            build_hybrid_mamba_stack,
+        )
+        from sglang.srt.runtime_context import get_memory, reset_context
+        from sglang.srt.server_args import (
+            ServerArgs,
+            set_global_server_args_for_scheduler,
+        )
+
+        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy", page_size=1))
+        self.addCleanup(reset_context)
+
+        # Shared fakes: latent-per-layer mamba-hybrid target + wrapper draft
+        # pool (the HybridLinearKVPool WRAPPER, mirroring mamba-family NextN).
+        target = HybridLinearKVPool.__new__(HybridLinearKVPool)
+        target.full_attention_layer_id_mapping = {0: 0, 2: 1, 4: 2}
+        target.use_mla = True
+        target.full_kv_pool = SimpleNamespace(
+            layer_num=3,
+            device="cpu",
+            size=16,
+            start_layer=0,
+            end_layer=2,
+            layer_shard_enabled=False,
+            store_dtype=torch.uint8,
+            register_layer_transfer_counter=lambda c: None,
+            kv_lora_rank=4,
+            qk_rope_head_dim=1,
+            data_ptrs=torch.tensor([1, 2, 3], dtype=torch.uint64),
+            kv_buffer=[torch.zeros((16, 5), dtype=torch.uint8) for _ in range(3)],
+        )
+        draft_inner_kv_buffer = torch.zeros((16, 9), dtype=torch.uint8)
+        wrapper_draft_pool = HybridLinearKVPool.__new__(HybridLinearKVPool)
+        wrapper_draft_pool.full_kv_pool = SimpleNamespace(
+            layer_num=1,
+            device="cpu",
+            size=16,
+            start_layer=0,
+            end_layer=0,
+            layer_shard_enabled=False,
+            store_dtype=torch.uint8,
+            data_ptrs=torch.tensor([999], dtype=torch.uint64),
+            register_layer_transfer_counter=lambda c: None,
+            kv_buffer=[draft_inner_kv_buffer],
+        )
+        mamba_pool = SimpleNamespace(
+            size=8,
+            device="cpu",
+            num_mamba_layers=2,
+            mamba_cache=SimpleNamespace(
+                temporal=torch.zeros((2, 9, 4), dtype=torch.uint8),
+                conv=[torch.zeros((2, 9, 3), dtype=torch.uint8)],
+            ),
+        )
+
+        with (
+            envs.SGLANG_HUGEPAGE_SIZE.override(""),
+            patch("sglang.srt.mem_cache.storage.mmap.mmap_allocator._mmap_prefaulted", side_effect=_darwin_mmap),
+            mock.patch.object(torch.cuda, "cudart", return_value=_FakeCudart()),
+            # The machines' psutil free-RAM budget: the fakes ask for KBs, but
+            # a CI box may report negative free memory — stub the gate out.
+            patch("sglang.srt.mem_cache.pool_host.base.host_memory_budget_bytes", return_value=1 << 30),
+            get_memory().override(
+                hicache_ratio=2.0,
+                hicache_mem_layout="page_first",
+                hicache_write_policy="write_through_selective",
+                hicache_io_backend="",
+                hicache_host_memory_mode="cache",
+            ),
+        ):
+            # --- Consumer (i): the direct-linker pool group ---
+            linker_group = resolve_hybrid_device_pool_group(
+                kvcache=target,
+                page_size=1,
+                params=SimpleNamespace(
+                    req_to_token_pool=SimpleNamespace(
+                        mamba_pool=mamba_pool,
+                        mamba_map={1: 0, 3: 1},
+                    ),
+                    mtp_draft_device_pools=(wrapper_draft_pool,),
+                ),
+                components={ComponentType.FULL, ComponentType.MAMBA},
+            )
+            # (a) the linker KV entry packs the draft's UNWRAPPED inner buffer.
+            self.assertIn(PoolName.KV, linker_group.entry_map)
+            self.assertIs(linker_group.entry_map[PoolName.KV].kv_buffer[3], draft_inner_kv_buffer)
+
+            # --- Consumer (ii): the hicache host stack ---
+            host_group, controller = build_hybrid_mamba_stack(
+                params=SimpleNamespace(
+                    page_size=1,
+                    tp_cache_group=None,
+                    attn_cp_cache_group=None,
+                    attn_tp_cache_group=None,
+                    pp_cache_group=None,
+                    token_to_kv_pool_allocator=SimpleNamespace(get_kvcache=lambda: target),
+                    req_to_token_pool=SimpleNamespace(
+                        mamba_pool=mamba_pool,
+                        mamba_map={1: 0, 3: 1},
+                        mamba_allocator=SimpleNamespace(
+                            alloc=lambda n: torch.zeros(n, dtype=torch.int64),
+                            free=lambda s: None,
+                        ),
+                    ),
+                    mtp_draft_device_pools=(wrapper_draft_pool,),
+                    pp_rank=0,
+                    pp_size=1,
+                    attn_cp_rank=0,
+                    attn_cp_size=1,
+                ),
+                kv_pool=target.full_kv_pool,
+                mamba_pool=mamba_pool,
+                full_layer_mapping=dict(target.full_attention_layer_id_mapping),
+                mamba_layer_mapping={1: 0, 3: 1},
+                load_cache_event=threading.Event(),
+                storage_backend=None,
+                use_mla=True,
+            )
+            # (b) the host stack received the UNWRAPPED full_kv_pool (1 draft
+            # layer) and transfer layers grew by the draft count. The KV entry
+            # transfers transfer_layer_num(=|full|+|mamba| keys = 5) + 1 draft
+            # = 6 layers; the controller reflects the full union (5).
+            host_kv = host_group.entry_map[PoolName.KV]
+            self.assertEqual(len(host_kv.host_pool.mtp_draft_device_pools), 1)
+            self.assertIs(host_kv.host_pool.packed_device_kv_buffers[3], draft_inner_kv_buffer)
+            self.assertEqual(host_kv.host_pool.layer_num, 4)  # 3 target + 1 draft
+            self.assertEqual(controller.layer_num, 5)  # full union (no draft)
+            # The layer mapper resolves the draft depth at transfer id
+            # transfer_layer_start(5) + 0 to the first packed DRAFT layer of
+            # the host pool (3 target layers + depth 0 -> pool layer 3).
+            self.assertEqual(host_kv.layer_mapper(5), 3)
+            self.assertIsNone(host_kv.layer_mapper(6))  # out of domain
+
 
 if __name__ == "__main__":
     unittest.main()
