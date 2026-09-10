@@ -205,10 +205,23 @@ class TestMambaComponentTransfers(CustomTestCase):
         self.assertEqual(transfer.device_indices.tolist(), [5])
         self.assertEqual(transfer.hit_policy, PoolHitPolicy.TRAILING_PAGES)
 
-    def test_lookup_reduces_to_trailing_hash(self):
+    def test_lookup_probes_every_tail_page_hash(self):
+        """LOOKUP probes EVERY tail page hash: after a flush the probe side has
+        no tree, so any tail page can be some previously-offloaded node's end.
+        OFFLOAD, in contrast, advertises the slot only under the node's LAST
+        page hash (terminal-key semantics) — the two sides are intentionally
+        asymmetric."""
         component = self._component(_FakeAllocator())
+        node = SimpleNamespace(
+            hash_value=["h0", "h1", "h2"],
+            component_data={ComponentType.MAMBA: SimpleNamespace(value=torch.tensor([5], dtype=torch.int64))},
+        )
+        # OFFLOAD broadcasts only the node-end (trailing) hash...
+        offload = component.build_external_linker_transfer(LinkerTransferPhase.OFFLOAD, node, None)
+        self.assertEqual(offload.keys, ["h2"])
+        # ...while LOOKUP probes the full tail-hash chain.
         transfer = component.build_external_linker_transfer(LinkerTransferPhase.LOOKUP, None, ["h0", "h1", "h2"])
-        self.assertEqual(transfer.keys, ["h2"])
+        self.assertEqual(transfer.keys, ["h0", "h1", "h2"])
         self.assertIsNone(transfer.device_indices)
         self.assertEqual(transfer.hit_policy, PoolHitPolicy.TRAILING_PAGES)
 
@@ -395,8 +408,14 @@ class TestSelfKeyedBatchExists(CustomTestCase):
             ["boundary_hit_r0_tp0_temporal", "boundary_hit_r0_tp0_conv_0"],
             store._exist_calls,
         )
-        # Boundary present -> final KV page is restorable.
-        self.assertIn(5, result.restorable_prefix_pages)
+        # Terminal-key semantics: the single offloaded slot exists only at the
+        # boundary its own key names. batch_exists_v2 maps self-keyed slot i to
+        # probe-domain page i+1, so "boundary_hit" (slot 0, the offloaded
+        # node's END hash) makes the trailing-1 window ending at KV page 1
+        # complete: page 1 is restorable, and ONLY page 1 — pages 2..5 end at
+        # boundaries with no offloaded state (interior-hash aliasing is gone).
+        self.assertIn(1, result.restorable_prefix_pages)
+        self.assertEqual(result.restorable_prefix_pages, [1])
 
     def test_self_keyed_miss_caps_restorable_prefix(self):
         group = _build_mamba_device_pool_group(_fake_hybrid_kvcache(), page_size=64, params=_fake_params())
@@ -420,9 +439,12 @@ class TestSelfKeyedBatchExists(CustomTestCase):
         result = type(store).batch_exists_v2(store, kv_keys, transfers)
         self.assertEqual(result.restorable_prefix_pages, [])
 
-    def test_offload_lookup_key_parity(self):
-        """The OFFLOAD key (node.hash_value[-1]) and the LOOKUP boundary key
-        (last tail hash) must be the identical string for the same boundary."""
+    def test_offload_lookup_key_asymmetry(self):
+        """OFFLOAD and LOOKUP are intentionally asymmetric under terminal-key
+        semantics: OFFLOAD advertises the slot ONLY under the node's LAST page
+        hash (pairing KV pages 1..P' with a state computed at an interior
+        boundary would corrupt output), while LOOKUP probes EVERY tail page
+        hash because any page can be some previously-offloaded node's end."""
         component = TestMambaComponentTransfers._component(self, _FakeAllocator())
         node = SimpleNamespace(
             hash_value=["h0", "h1", "h2"],
@@ -432,8 +454,10 @@ class TestSelfKeyedBatchExists(CustomTestCase):
         # A request whose device-uncached tail ends at this node's boundary
         # carries the same page-hash chain, so its last tail hash == h2.
         lookup = component.build_external_linker_transfer(LinkerTransferPhase.LOOKUP, None, ["h0", "h1", "h2"])
+        # Supply side: single terminal key. Probe side: the full chain.
         self.assertEqual(offload.keys, ["h2"])
-        self.assertEqual(lookup.keys, offload.keys)
+        self.assertEqual(lookup.keys, ["h0", "h1", "h2"])
+        self.assertEqual(lookup.keys[-1], offload.keys[0])
 
 
 def _fake_draft_pool():
