@@ -441,8 +441,18 @@ class _GenerationStreamAccumulator:
                     # check_match_stop_str_prefix if  tail_str's suffix match stop_str prefix
                     should_output &= not req.check_match_stop_str_prefix()
             else:
+                # Emit once the number of unsent tokens crosses the interval,
+                # not when the cumulative length is an exact multiple of it.
+                # Speculative decoding emits multiple tokens per step, so the
+                # cumulative length can skip over the multiples entirely; the
+                # modulo check would then never fire mid-decode and the request
+                # would only be reported at finish, collapsing first_token_time
+                # onto finished_time and producing a bogus decode_throughput.
+                # The n_unsent == 0 case preserves the legacy empty-batch
+                # emission (retract flush, prefill-only first logprob).
+                n_unsent = len(req.output_ids_through_stop) - req.send_token_offset
                 should_output = (
-                    len(req.output_ids) % self.default_force_stream_interval == 0
+                    n_unsent == 0 or n_unsent >= self.default_force_stream_interval
                 )
 
         if not should_output:
