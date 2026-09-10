@@ -248,16 +248,24 @@ def _with_packed_draft_mapping(
     *,
     target_device_layer_num: int,
     draft_layer_num: int,
-) -> dict[int, int | tuple[int, ...]]:
+) -> dict[int, int | Sequence[int]]:
     """Attach draft depth N to the same transfer layer as target layer N."""
     if draft_layer_num > len(layer_mapping):
         raise ValueError(
             "Packed draft layers exceed the target transfer layer count: "
             f"{draft_layer_num} > {len(layer_mapping)}."
         )
-    result: dict[int, int | tuple[int, ...]] = dict(layer_mapping)
+    # layer_mapping keys may be global layer ids (e.g. the mamba-hybrid
+    # full_attention_layer_id_mapping interleaves with mamba layers), so pair
+    # each draft depth with the Nth target component by enumeration order,
+    # keyed back by its actual mapping key.
+    mapping_keys = sorted(layer_mapping)
+    result: dict[int, int | Sequence[int]] = dict(layer_mapping)
     for depth in range(draft_layer_num):
-        result[depth] = (layer_mapping[depth], target_device_layer_num + depth)
+        result[mapping_keys[depth]] = (
+            layer_mapping[mapping_keys[depth]],
+            target_device_layer_num + depth,
+        )
     return result
 
 
@@ -517,6 +525,7 @@ def _build_mamba_device_pool_group(
     kvcache: Any,
     page_size: int,
     params: Any,
+    mtp_draft_device_pools: tuple[Any, ...] = (),
 ) -> DevicePoolGroup:
     if page_size != 1:
         # The MAMBA entry addresses slots by node-boundary keys (page-aligned
@@ -535,13 +544,126 @@ def _build_mamba_device_pool_group(
     state_components, conv_buffers, temporal_state_elem_size = (
         _build_mamba_state_components(mamba_pool)
     )
+
+    # Pack the speculative draft pools alongside the target so restores cover
+    # the draft's KV and index rows too. Without this, an L3 store hit gives
+    # the target model the restored context while the draft has never seen it:
+    # speculative acceptance collapses toward token-by-token decoding after
+    # every restore. Draft pools arrive as runner.token_to_kv_pool, whose
+    # flat-buffer shape depends on the draft's OWN pool family:
+    #   - DSA/MLA drafts (e.g. GLM-5.3-Flash NextN): DSATokenToKVPool with
+    #     flat .kv_buffer (+ .index_k_with_scale_buffer sidecar).
+    #   - Mamba-family drafts (Qwen3Next / NemotronH / Kimi / Bailing NextN):
+    #     the HybridLinearKVPool WRAPPER, which exposes no .kv_buffer — the
+    #     flat latent rows live on wrapper.full_kv_pool.kv_buffer (component
+    #     groups are unwrapped into flat per-layer lists), and the wrapper
+    #     carries no index sidecar.
+    def _draft_flat_kv_buffers(pool: Any) -> list[torch.Tensor]:
+        kv_buffers = getattr(pool, "kv_buffer", None)
+        if kv_buffers is None and _is_hybrid_linear_kv_pool(pool):
+            inner_kv = getattr(pool.full_kv_pool, "kv_buffer", None)
+            if inner_kv is not None:
+                kv_buffers = [
+                    buffer
+                    for group in inner_kv
+                    for buffer in (group if isinstance(group, list) else (group,))
+                ]
+        if kv_buffers is None:
+            raise ValueError(
+                f"Mamba-hybrid MTP draft pool exposes no flat KV buffers "
+                f"(neither .kv_buffer nor .full_kv_pool.kv_buffer): "
+                f"{type(pool).__name__}."
+            )
+        return list(kv_buffers)
+
+    def _validate_draft_row_coverage(
+        target_buffers: Sequence[torch.Tensor],
+        draft_buffers: Sequence[torch.Tensor],
+        target_label: str,
+        draft_label: str,
+    ) -> None:
+        """Reject undersized draft pools AT ASSEMBLY.
+
+        The packed entry's row budget is the MINIMUM across its buffers, so a
+        draft pool with fewer rows than the target would pass startup and only
+        fail MID-FLIGHT (row-range ValueError during an offload/load burst at
+        high concurrency). Fail loudly here instead, naming pools and shapes.
+        """
+        if not draft_buffers or not target_buffers:
+            return
+        target_rows = min(buffer.shape[0] for buffer in target_buffers)
+        draft_rows = min(buffer.shape[0] for buffer in draft_buffers)
+        if draft_rows < target_rows:
+            raise ValueError(
+                f"Packed {draft_label} rows ({draft_rows}) must cover "
+                f"{target_label} rows ({target_rows}); "
+                f"target shapes={[tuple(buffer.shape) for buffer in target_buffers]}, "
+                f"draft shapes={[tuple(buffer.shape) for buffer in draft_buffers]}."
+            )
+
+    draft_kv_buffers = [
+        buffer
+        for pool in mtp_draft_device_pools
+        for buffer in _draft_flat_kv_buffers(pool)
+    ]
+    draft_indexer_buffers = [
+        buffer
+        for pool in mtp_draft_device_pools
+        for buffer in getattr(pool, "index_k_with_scale_buffer", ())
+    ]
+    # A non-DSA draft legitimately has no index sidecar: requiring parity
+    # would reject every mamba-family draft whose full pool is plain MHA/MLA.
+    # Only enforce parity when BOTH buffer lists exist.
+    if (
+        draft_kv_buffers
+        and draft_indexer_buffers
+        and len(draft_kv_buffers) != len(draft_indexer_buffers)
+    ):
+        raise ValueError(
+            "Mamba-hybrid MTP KV and indexer draft layer counts must match."
+        )
+    draft_layer_num = len(draft_kv_buffers)
+
+    # Flatten the target's component groups BEFORE building the packed
+    # mapping: the packed tuple indexes the flat [*target, *draft] buffer
+    # list, so the draft domain must start at len(_target_kv_buffers). The
+    # layer count coincides only for 1-latent-per-layer (MLA/DSA) targets;
+    # an MHA-layout target (separate k/v groups) would flatten to 2*N buffers
+    # and the packed tuple would index v-buffers instead of draft buffers.
+    _target_kv_buffers = [
+        buffer for group in _mamba_kv_components(kvcache) for buffer in group
+    ]
+    if draft_kv_buffers and len(_target_kv_buffers) != len(full_layer_mapping):
+        raise NotImplementedError(
+            "MHA-layout mamba-hybrid targets with the direct linker packed-draft "
+            "mapping are not supported yet (k/v split buffers)"
+        )
+    kv_layer_mapping = (
+        _with_packed_draft_mapping(
+            dict(full_layer_mapping),
+            target_device_layer_num=len(_target_kv_buffers),
+            draft_layer_num=draft_layer_num,
+        )
+        if draft_kv_buffers
+        else full_layer_mapping
+    )
+
+    # Pack target + draft per-layer buffers into ONE component group so the
+    # packed mapping tuple (target_comp, N + depth) resolves both indices
+    # inside the same group (same scheme as the pure-DSA KV entry).
+    _validate_draft_row_coverage(
+        _target_kv_buffers,
+        draft_kv_buffers,
+        target_label=PoolName.KV.value,
+        draft_label="MTP draft KV",
+    )
     entries = [
         DevicePoolEntry(
             name=PoolName.KV,
             indices_from_pool=PoolName.KV,
             device_pool=kvcache,
-            components=_mamba_kv_components(kvcache),
-            layer_mapping=full_layer_mapping,
+            components=[[*_target_kv_buffers, *draft_kv_buffers]],
+            layer_mapping=kv_layer_mapping,
             page_size=page_size,
             rows_are_pages=False,
         ),
@@ -573,17 +695,27 @@ def _build_mamba_device_pool_group(
     full_kv_pool = kvcache.full_kv_pool
     index_buffers = getattr(full_kv_pool, "index_k_with_scale_buffer", None)
     if index_buffers and getattr(full_kv_pool, "use_dsa", False) and page_size == 64:
+        _validate_draft_row_coverage(
+            index_buffers,
+            draft_indexer_buffers,
+            target_label=PoolName.INDEXER.value,
+            draft_label="MTP draft indexer",
+        )
         entries.append(
             DevicePoolEntry(
                 name=PoolName.INDEXER,
                 indices_from_pool=PoolName.KV,
                 device_pool=full_kv_pool,
-                components=[index_buffers],
-                layer_mapping=full_layer_mapping,
+                components=[[*index_buffers, *draft_indexer_buffers]],
+                layer_mapping=kv_layer_mapping,
                 page_size=page_size,
                 rows_are_pages=True,
             )
         )
+        # num_layers stays len(union_layers): every entry's mapping keys are
+        # drawn from that same union, and consumers iterate range(num_layers)
+        # tolerating per-pool None mappings (mooncake_direct_linker.py
+        # load_layer_wise: `meta is None -> continue`).
     elif index_buffers and getattr(full_kv_pool, "use_dsa", False):
         logger.warning(
             "Mamba direct linker: DSA index sidecar present but tree page_size=%d != IndexKeyCache kernel page 64; INDEXER entry skipped (L3 restores would be unsafe).",

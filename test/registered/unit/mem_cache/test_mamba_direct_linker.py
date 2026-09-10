@@ -61,6 +61,23 @@ def _fake_hybrid_kvcache():
     return kvcache
 
 
+def _fake_latent_hybrid_kvcache():
+    """Latent-per-layer (MLA/DSA-shaped) target: ONE flat buffer per mapped
+    full-attention layer — the only layout the packed-draft mapping supports
+    (flattened buffer count == len(full_attention_layer_id_mapping))."""
+
+    class _FullPool:
+        kv_buffer = [
+            torch.zeros((16, 5), dtype=torch.uint8) for _ in range(_NUM_FULL_LAYERS)
+        ]
+
+    kvcache = SimpleNamespace(
+        full_attention_layer_id_mapping={gid: i for i, gid in enumerate([0, 2, 4])},
+        full_kv_pool=_FullPool(),
+    )
+    return kvcache
+
+
 def _fake_params():
     return SimpleNamespace(
         req_to_token_pool=SimpleNamespace(
@@ -534,6 +551,84 @@ class UnifiedCacheLinkerWrapperShim:
 
         self.__class__ = UnifiedCacheLinkerWrapper
         self.cache = cache
+
+
+class _FakeDraftPool:
+    """MTP draft pool with DSA-shaped flat buffers: ONE latent buffer per
+    draft layer, 1:1 with the index sidecar (GLM-5.3-Flash NextN form)."""
+
+    def __init__(self, draft_layer_num=1, rows=16, kv_width=9, index_width=11):
+        self.page_size = 1
+        self.kv_buffer = [
+            torch.zeros((rows, kv_width), dtype=torch.uint8)
+            for _ in range(draft_layer_num)
+        ]
+        self.index_k_with_scale_buffer = [
+            torch.zeros((4, index_width), dtype=torch.uint8)
+            for _ in range(draft_layer_num)
+        ]
+
+
+class TestMambaPackedDraftMapping(CustomTestCase):
+    """The packed-draft path must key draft depths by ACTUAL mapping keys.
+
+    Regression: _with_packed_draft_mapping assumed contiguous local keys
+    (0..N-1) and crashed with KeyError: 0 on the mamba-hybrid path, where
+    full_attention_layer_id_mapping is keyed by interleaved global layer ids
+    (layer 0 is a mamba layer). It also flattened component GROUPS as single
+    buffers, crashing _row_count with AttributeError ('list' has no shape).
+    """
+
+    def test_packed_draft_group_resolves_all_layers(self):
+        params = _fake_params()
+        draft_pool = _FakeDraftPool()
+        params.mtp_draft_device_pools = (draft_pool,)
+        group = _build_mamba_device_pool_group(
+            _fake_latent_hybrid_kvcache(),
+            page_size=1,
+            params=params,
+            mtp_draft_device_pools=(draft_pool,),
+        )
+
+        kv = group.entry_map[PoolName.KV]
+        # All flattened components must be real tensors (not nested lists).
+        for buffer in kv.kv_buffer:
+            self.assertIsInstance(buffer, torch.Tensor)
+
+        # Target full layers are global ids {0, 2, 4}; the single draft layer
+        # attaches to the first (lowest-id) target layer. Device layer 3 is
+        # the draft latent (3 target latents + depth 0), NOT a target v-buffer
+        # (this target has no k/v split; the MHA layout refuses packed drafts).
+        mapping = kv.layer_mapping
+        self.assertIn(0, mapping)
+        self.assertEqual(mapping[0], (0, 3))  # (target comp 0, device layer 3)
+        self.assertEqual(mapping[2], 1)
+        self.assertEqual(mapping[4], 2)
+
+        # Every mapping key (global layer ids; the packed key resolves both its
+        # target and draft buffers) must resolve to non-zero pointer views.
+        locations = kv.prepare_locations(torch.tensor([2]))
+        for key in kv.layer_mapping:
+            meta = kv.get_prepared_layer_range_meta(locations, key)
+            self.assertIsNotNone(meta, f"transfer layer {key} unresolved")
+            ptrs, sizes, offsets = meta
+            self.assertTrue(all(p != 0 for p in [x for row in ptrs for x in row]))
+
+        # The packed depth resolves the DRAFT buffer itself.
+        self.assertIs(kv.kv_buffer[3], draft_pool.kv_buffer[0])
+
+    def test_identity_key_path_unchanged(self):
+        """Pure-DSA-style identity mappings must keep their key space."""
+        from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+            _with_packed_draft_mapping,
+        )
+
+        mapping = _with_packed_draft_mapping(
+            {l: l for l in range(4)},
+            target_device_layer_num=4,
+            draft_layer_num=1,
+        )
+        self.assertEqual(mapping, {0: (0, 4), 1: 1, 2: 2, 3: 3})
 
 
 if __name__ == "__main__":

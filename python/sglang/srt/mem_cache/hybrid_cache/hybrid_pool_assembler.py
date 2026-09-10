@@ -1385,7 +1385,9 @@ class _MambaStrategy(StackStrategy):
             _build_mamba_device_pool_group,
         )
 
-        return _build_mamba_device_pool_group(kvcache, page_size, params)
+        return _build_mamba_device_pool_group(
+            kvcache, page_size, params, params.mtp_draft_device_pools
+        )
 
     def build(
         self,
