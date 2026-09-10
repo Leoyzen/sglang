@@ -17,6 +17,7 @@ cache for cache-level logic, but the TreeCore itself never touches it.
 from __future__ import annotations
 
 import logging
+import os
 import sys
 from array import array
 from collections import defaultdict
@@ -90,6 +91,9 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.cache_init_params import CacheInitParams
 
 logger = logging.getLogger(__name__)
+
+# Set to enable LINKER-DBG eager-offload instrumentation on the write path.
+_LINKER_DEBUG = bool(os.environ.get("SGLANG_LINKER_DEBUG_KEY"))
 
 # 42 bits: digest * 1000003 (< 2^20) stays under 2^62, so the update never
 # overflows int64 with plain (non-wrapping) arithmetic in the Rust port, and
@@ -1040,7 +1044,33 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
         self, node: UnifiedTreeNode, chunked: bool = False
     ) -> bool:
         """Increment hit count; check whether a write backup should be fired."""
-        if node.evicted or chunked:
+        if node.evicted:
+            return False
+        # Eager mamba checkpoint offload: with the external linker enabled, a
+        # node that carries a live (donated) mamba snapshot but was never
+        # persisted must fire immediately, bypassing both the chunked gate and
+        # the hit-count threshold. Otherwise the snapshot only reaches remote
+        # storage via later hit-driven write-throughs (or never, if evicted
+        # first), leaving the mamba key supply too sparse for TRAILING_PAGES
+        # intersection to restore any meaningful prefix.
+        # The caller still builds the usual backup chain from this node, but
+        # only unstored ancestors join it, so the fan-out is bounded by real
+        # unsupplied spans rather than whole finished-prefill chains.
+        if (
+            self.enable_external_cache_linker
+            and not node.external_cache_stored
+            and ComponentType.MAMBA in self.components_by_type
+            and self.components_by_type[ComponentType.MAMBA].should_eager_offload(node)
+        ):
+            if _LINKER_DEBUG:
+                logger.info(
+                    "LINKER-DBG eager-offload fire node_id=%s hit_count=%d chunked=%s",
+                    node.id,
+                    node.hit_count,
+                    chunked,
+                )
+            return True
+        if chunked:
             return False
         if self.is_write_back:
             return False

@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import logging
+import os
 from collections import defaultdict
 from typing import TYPE_CHECKING, Callable, Optional, Sequence
 
@@ -42,6 +44,8 @@ from sglang.srt.runtime_context import (
     mamba_cache_chunk_size,
     mamba_checkpoint_grid,
 )
+
+logger = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from sglang.srt.managers.schedule_batch import Req
@@ -315,6 +319,13 @@ class MambaComponent(TreeComponent):
         new_parent.component_data[ct].host_value = None
         new_parent.component_data[ct].host_lock_ref = 0
 
+    def should_eager_offload(self, node: UnifiedTreeNode) -> bool:
+        """True when the node carries a live mamba snapshot not yet persisted
+        to the external store; the tree core fires the write-through for it
+        immediately instead of waiting for hit-count/chunked gating."""
+        cd = node.component_data[self.component_type]
+        return cd.value is not None
+
     def evict_component(
         self,
         node: UnifiedTreeNode,
@@ -328,6 +339,19 @@ class MambaComponent(TreeComponent):
 
         # Device layer
         if EvictLayer.DEVICE in target and cd.value is not None:
+            # Instrumentation: a live snapshot lost to capacity pressure before
+            # any offload fires is a permanent supply loss (M2 evidence).
+            if (
+                not node.external_cache_stored
+                and getattr(node, "write_through_pending_id", None) is None
+                and os.environ.get("SGLANG_LINKER_DEBUG_KEY")
+            ):
+                logger.info(
+                    "LINKER-DBG mamba-evict-unstored node_id=%s span=%d stored=%s",
+                    node.id,
+                    len(node.key) if node.key is not None else -1,
+                    node.external_cache_stored,
+                )
             device_frees[self.component_type].append(cd.value)
             freed = len(cd.value)
             self.tree_core.component_evictable_size_[self.component_type] -= freed
@@ -667,16 +691,35 @@ class MambaComponent(TreeComponent):
             value = node.component_data[self.component_type].value
             if value is None:
                 return None
+            # One mamba state covers the whole node span, but the lookup
+            # side probes per-PAGE hashes (it has no tree after a flush).
+            # The state is valid ONLY at the node's END boundary; resuming
+            # from any interior page would pair KV pages 1..P' with a state
+            # computed at the node end (depth mismatch = corrupted output).
+            # So only the LAST page hash advertises the slot. Lookup still
+            # probes every tail page hash because any page can be some
+            # node's end.
+            keys = [node.hash_value[-1]]
             return PoolTransfer(
                 name=PoolName.MAMBA,
                 device_indices=value.to(torch.int64),
-                # One state per node, valid only at that node's end boundary.
-                keys=[node.hash_value[-1]],
+                keys=keys,
                 hit_policy=PoolHitPolicy.TRAILING_PAGES,
             )
 
         if not keys:
             return None
+
+        if phase == LinkerTransferPhase.LOOKUP:
+            # Probe EVERY tail page hash: each is a candidate node boundary
+            # with a potentially offloaded mamba state. Probing only the
+            # request-end hash misses every earlier offloaded node.
+            return PoolTransfer(
+                name=PoolName.MAMBA,
+                keys=list(keys),
+                hit_policy=PoolHitPolicy.TRAILING_PAGES,
+            )
+
         transfer = PoolTransfer(
             name=PoolName.MAMBA,
             keys=[keys[-1]],
