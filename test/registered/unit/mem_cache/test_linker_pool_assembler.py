@@ -501,6 +501,60 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         )
         self.assertEqual(set(group.entry_map), {PoolName.KV, PoolName.MAMBA})
 
+    def test_mamba_undersized_draft_rows_raise_at_assembly(self):
+        """A draft pool with FEWER rows than the target must be refused at
+        assembly: the packed entry's row budget is the MIN across buffers, so
+        an undersized draft otherwise passes startup and only explodes
+        MID-FLIGHT (row-range ValueError during an offload/load burst at 48
+        concurrency). The error must name both row counts."""
+        kvcache, params = self._mamba_assembler_target()
+        # Target latents: 16 rows; draft latent: only 8 rows (< 16).
+        params.mtp_draft_device_pools = (
+            SimpleNamespace(
+                page_size=1,
+                kv_buffer=[torch.zeros((8, 9), dtype=torch.uint8)],
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, r"rows \(8\) must cover kv rows \(16\)"):
+            resolve_hybrid_device_pool_group(
+                kvcache=kvcache,
+                page_size=1,
+                params=params,
+                components={ComponentType.FULL, ComponentType.MAMBA},
+            )
+        # Equal row counts assemble fine.
+        params.mtp_draft_device_pools = (
+            SimpleNamespace(
+                page_size=1,
+                kv_buffer=[torch.zeros((16, 9), dtype=torch.uint8)],
+            ),
+        )
+        group = resolve_hybrid_device_pool_group(
+            kvcache=kvcache,
+            page_size=1,
+            params=params,
+            components={ComponentType.FULL, ComponentType.MAMBA},
+        )
+        self.assertEqual(set(group.entry_map), {PoolName.KV, PoolName.MAMBA})
+
+    def test_mamba_unknown_draft_pool_type_raises_clear_error(self):
+        """A draft pool exposing NEITHER .kv_buffer NOR .full_kv_pool.kv_buffer
+        (AttributeError before the fix) must raise a ValueError naming the
+        offending draft pool type."""
+        kvcache, params = self._mamba_assembler_target()
+
+        class WeirdDraftPool:
+            """No kv_buffer anywhere (getattr probes both paths in vain)."""
+
+        params.mtp_draft_device_pools = (WeirdDraftPool(),)
+        with self.assertRaisesRegex(ValueError, r"WeirdDraftPool"):
+            resolve_hybrid_device_pool_group(
+                kvcache=kvcache,
+                page_size=1,
+                params=params,
+                components={ComponentType.FULL, ComponentType.MAMBA},
+            )
+
     def test_hicache_draft_plan_reaches_build_kv_cache(self):
         """The EAGLE draft pools must flow from the plan into tree-cache params.
 
