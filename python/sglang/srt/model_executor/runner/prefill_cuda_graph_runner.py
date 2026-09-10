@@ -97,6 +97,7 @@ from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     BaseCudaGraphRunner,
     freeze_gc,
 )
+from sglang.srt.model_executor.runner.eager_runner import EagerRunner
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     BreakableCudaGraphBackend,
@@ -241,6 +242,15 @@ class _ChunkedPrefixCaptureBuffers:
     starts_cpu: torch.Tensor
     seq_lens_cpu: torch.Tensor
     kv_indices: torch.Tensor  # (max_chunks, prefix_chunk_capacity)
+
+
+class _DcpCaptureAbort(RuntimeError):
+    """Raised to abort prefill CG capture when DCP metadata prep failed.
+
+    The caller (capture_prefill_graph) catches this and falls back to the
+    eager runner for the run, per spec 'Metadata prep failure aborts
+    capture cleanly'. Internal signal only — not part of any public API.
+    """
 
 
 def prefill_failure_msg(backend_name: str) -> str:
@@ -419,6 +429,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self._capture_lora = False
         self.enable_cp_bcg_capture = False
         self.prefill_cp_bcg_input: Optional[PrefillCPBCGInput] = None
+        # Set when prefill DCP metadata preparation raises during capture
+        # (opsx 3.2): turns the generic capture failure into a clean
+        # disable-for-the-run with eager fallback.
+        self.dcp_metadata_prep_failed = False
+        # One-shot log latch for replay-time DCP metadata failures.
+        self._dcp_replay_failure_logged = False
         # TcPiecewise does its compile pass during backend construction.
         # Wrap only that path with the prefill CUDA graph failure hint.
         try:
@@ -604,7 +620,23 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # --- capture --------------------------------------------------
         self.device_module.synchronize()
         self.model_runner.tp_group.barrier()
-        self.capture()
+        try:
+            self.capture()
+        except RuntimeError as exc:
+            if not getattr(self, "dcp_metadata_prep_failed", False):
+                raise
+            # opsx 3.2 (spec 'Metadata prep failure aborts capture cleanly'):
+            # DCP metadata preparation raised during capture. Abort capture,
+            # disable the prefill CUDA graph for this run, and let the caller
+            # fall back to the eager runner — never serve silently wrong
+            # outputs from a DCP-less graph.
+            logger.error(
+                "Prefill CUDA graph capture aborted: prefill DCP metadata "
+                "preparation failed (%s). Disabling the prefill CUDA graph "
+                "for this run; serving falls back to eager prefill.",
+                exc,
+            )
+            raise _DcpCaptureAbort(RuntimeError.__str__(exc)) from exc
 
         self.raw_num_tokens = 0
         self.raw_bs = 0
@@ -1257,7 +1289,21 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             prepare_dcp_extend_metadata,
         )
 
-        fresh = prepare_dcp_extend_metadata(self.model_runner, forward_batch)
+        # opsx 3.2: a preparation failure must abort capture cleanly (not
+        # corrupt a graph) — record the signal before re-raising so the
+        # __init__ handler disables the prefill CG for this run.
+        try:
+            fresh = prepare_dcp_extend_metadata(self.model_runner, forward_batch)
+        except Exception as exc:
+            self.dcp_metadata_prep_failed = True
+            logger.error(
+                "Prefill DCP metadata preparation failed during capture "
+                "preparation (%s: %s); capture will be aborted and the "
+                "prefill CUDA graph disabled for this run.",
+                type(exc).__name__,
+                exc,
+            )
+            raise
         if fresh is None:
             return None
         if self.dcp_buffers is not None:
@@ -1948,17 +1994,37 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # copy_/index writes only, never reallocation (spec: 'Consecutive
         # replays with different KV layouts'). Runs before attention
         # metadata planning so init_forward_metadata sees live DCP state.
-        # getattr default: fixtures built via __new__ may predate the field.
+        # opsx 3.2: a preparation failure here must not crash serving —
+        # mark the batch and let execute() fall back to eager prefill.
         if (
             getattr(self, "dcp_buffers", None) is not None
             and self.model_runner.ps.attn_dcp_size > 1
         ):
-            with forward_context(
-                ForwardContext(attn_backend=self.model_runner.attn_backend)
-            ):
-                refreshed = self._prepare_capture_dcp_metadata(static_forward_batch)
-            if refreshed is not None:
-                metadata_forward_batch = static_forward_batch
+            try:
+                with forward_context(
+                    ForwardContext(attn_backend=self.model_runner.attn_backend)
+                ):
+                    refreshed = self._prepare_capture_dcp_metadata(static_forward_batch)
+                if refreshed is not None:
+                    metadata_forward_batch = static_forward_batch
+            except Exception as exc:
+                if not self._dcp_replay_failure_logged:
+                    self._dcp_replay_failure_logged = True
+                    logger.error(
+                        "Prefill DCP metadata preparation failed at replay "
+                        "(%s: %s); this batch falls back to eager prefill "
+                        "and further failures are logged once per run.",
+                        type(exc).__name__,
+                        exc,
+                    )
+                else:
+                    logger.debug(
+                        "Prefill DCP metadata preparation failed at replay "
+                        "(%s: %s); falling back to eager prefill.",
+                        type(exc).__name__,
+                        exc,
+                    )
+                raise _DcpCaptureAbort(str(exc)) from exc
 
         self._prepare_forward_metadata_for_replay(
             metadata_forward_batch, static_forward_batch, static_num_tokens
@@ -2104,6 +2170,21 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self, forward_batch: ForwardBatch, **kwargs
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
         self._validate_capture_hidden_mode(forward_batch)
+        try:
+            return self._execute_with_replay_session(forward_batch, **kwargs)
+        except _DcpCaptureAbort:
+            # opsx 3.2 (replay path): DCP metadata preparation failed for
+            # this batch (already logged in load_batch). Fall back to the
+            # eager runner so the server keeps serving — without a graph
+            # that would read stale or missing DCP metadata.
+            eager_runner = self.model_runner.eager_runner
+            if eager_runner is None or isinstance(eager_runner, EagerRunner):
+                raise
+            return eager_runner.execute(forward_batch, **kwargs)
+
+    def _execute_with_replay_session(
+        self, forward_batch: ForwardBatch, **kwargs
+    ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
         with self.backend.replay_session():
             static_forward_batch = self.load_batch(forward_batch, **kwargs)
             static_num_tokens = len(static_forward_batch.input_ids)

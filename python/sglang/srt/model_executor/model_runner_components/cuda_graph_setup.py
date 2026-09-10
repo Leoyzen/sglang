@@ -36,6 +36,9 @@ from sglang.srt.model_executor.runner import (
     PrefillCudaGraphRunner,
     get_batch_sizes_to_capture,
 )
+from sglang.srt.model_executor.runner.prefill_cuda_graph_runner import (
+    _DcpCaptureAbort,
+)
 from sglang.srt.model_loader.utils import resolve_language_model
 from sglang.srt.platforms import current_platform
 from sglang.srt.runtime_context import (
@@ -498,7 +501,20 @@ def capture_prefill_graph(
         f"avail mem={before_mem:.2f} GB"
     )
 
-    prefill_runner = PrefillCudaGraphRunner(model_runner)
+    try:
+        prefill_runner = PrefillCudaGraphRunner(model_runner)
+    except _DcpCaptureAbort:
+        # opsx 3.2 (spec 'Metadata prep failure aborts capture cleanly'):
+        # prefill DCP metadata preparation failed during capture (already
+        # logged by the runner with the reason). Disable the prefill CUDA
+        # graph for this run and serve prefill eagerly instead.
+        log_info_on_rank0(
+            logger,
+            "Disable the prefill CUDA graph for this run: DCP metadata "
+            "preparation failed during capture. Serving falls back to eager "
+            "prefill.",
+        )
+        return result(eager_runner)
 
     after_mem = get_available_gpu_memory(model_runner.device, model_runner.gpu_id)
     mem_usage = before_mem - after_mem
