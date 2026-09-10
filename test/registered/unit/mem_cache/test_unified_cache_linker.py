@@ -1,3 +1,4 @@
+from array import array
 from types import SimpleNamespace
 
 import pytest
@@ -5,6 +6,7 @@ import torch
 
 from sglang.srt.mem_cache.base_prefix_cache import InsertResult
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.cache_action import (
     ReplaceWriteThroughOnNodeSplit,
 )
@@ -124,6 +126,156 @@ def test_restorable_prefix_intersects_sparse_rank_results():
     hit_pages = wrapper._sync_restorable_prefix([2, 4], num_pages=4, device_hit_pages=0)
 
     assert hit_pages == 2
+
+
+class _RecordingLinker(_FakeLinker):
+    def __init__(self):
+        super().__init__()
+        self.lookups = []
+
+    def lookup(self, rid, transfers):
+        self.lookups.append(list(transfers))
+        return super().lookup(rid, transfers)
+
+
+def _match_result():
+    from sglang.srt.mem_cache.base_prefix_cache import MatchResult
+
+    return MatchResult(
+        device_indices=torch.zeros(0, dtype=torch.int64),
+        last_device_node=None,
+        last_host_node=None,
+        best_match_node=None,
+    )
+
+
+def _pair_wrapper(my_tail, peer_probe):
+    """Build one side of a fake 2-rank world.
+
+    For 2 ranks, all_reduce(MIN) equals each rank taking the elementwise MIN
+    with its peer's local probe, so contributing ``peer_probe`` (precomputed
+    from the known peer tail) makes the fake deterministic on one process.
+    """
+    reductions = {"count": 0}
+
+    def reduce_min(tensor, op):
+        assert op == torch.distributed.ReduceOp.MIN
+        reductions["count"] += 1
+        tensor.copy_(torch.minimum(tensor, peer_probe))
+
+    cache = _cache_for_wrapper(
+        page_size=2,
+        attn_cp_group=None,
+        attn_tp_group=None,
+        tp_world_size=2,
+        _all_reduce_attn_groups=reduce_min,
+        _components_tuple=(),
+    )
+    wrapper = UnifiedCacheLinkerWrapper(cache, _RecordingLinker())
+    wrapper._tail_hashes = lambda key, result, device_hit_len: list(my_tail)
+    return wrapper, reductions
+
+
+def test_empty_tail_on_one_rank_degrades_all_ranks_to_miss():
+    # Side A has no tail (its last device node has no hash anchor), side B has
+    # a 3-page tail. Pre-agreement: the reduced probe says has_tail=0, so BOTH
+    # sides return a miss after exactly one reduction, before any lookup.
+    wrapper_a, reductions_a = _pair_wrapper([], torch.tensor([1, 3], dtype=torch.int))
+    wrapper_b, reductions_b = _pair_wrapper(
+        ["h0", "h1", "h2"], torch.tensor([0, 0], dtype=torch.int)
+    )
+
+    key = RadixKey(array("q", [1] * 8))
+    req = SimpleNamespace(rid="r", last_node=None)
+
+    result_a = wrapper_a.match(key, req, _match_result())
+    result_b = wrapper_b.match(key, req, _match_result())
+
+    assert reductions_a["count"] == 1
+    assert reductions_b["count"] == 1
+    assert wrapper_a.cache_linker.lookups == []
+    assert wrapper_b.cache_linker.lookups == []
+    assert result_a.host_hit_length == 0
+    assert result_b.host_hit_length == 0
+    assert wrapper_a.hit_markers == {}
+    assert wrapper_b.hit_markers == {}
+
+
+def test_probe_domain_clamps_to_shortest_rank_tail():
+    # Side A has a 3-page tail, side B a 1-page tail. The MIN-reduced length
+    # clamps both sides to 1 page, so both enter _sync_restorable_prefix with
+    # the same mask length instead of diverging on shapes.
+    wrapper_a, reductions_a = _pair_wrapper(
+        ["a0", "a1", "a2"], torch.tensor([1, 1], dtype=torch.int)
+    )
+    wrapper_b, reductions_b = _pair_wrapper(
+        ["b0"], torch.tensor([1, 3], dtype=torch.int)
+    )
+    synced_pages = []
+    for wrapper in (wrapper_a, wrapper_b):
+        real_sync = wrapper._sync_restorable_prefix
+
+        def record_sync(restorable, *, num_pages, device_hit_pages, _real=real_sync):
+            synced_pages.append(num_pages)
+            return _real(
+                restorable, num_pages=num_pages, device_hit_pages=device_hit_pages
+            )
+
+        wrapper._sync_restorable_prefix = record_sync
+
+    key = RadixKey(array("q", [1] * 8))
+    req = SimpleNamespace(rid="r", last_node=None)
+
+    wrapper_a.match(key, req, _match_result())
+    wrapper_b.match(key, req, _match_result())
+
+    # Two reductions per side: the probe pre-agreement plus the
+    # _sync_restorable_prefix intersection -- reaching the second one is the
+    # point (no rank was stranded before the collective).
+    assert reductions_a["count"] == 2
+    assert reductions_b["count"] == 2
+    assert synced_pages == [1, 1]
+
+
+def test_single_rank_cache_skips_probe_collective():
+    cache = _cache_for_wrapper(
+        page_size=2,
+        attn_cp_group=None,
+        attn_tp_group=None,
+        tp_world_size=1,
+    )
+    reductions = {"count": 0}
+
+    def unexpected_reduce(tensor, op):
+        reductions["count"] += 1
+
+    cache._all_reduce_attn_groups = unexpected_reduce
+    wrapper = UnifiedCacheLinkerWrapper(cache, _FakeLinker())
+
+    assert not wrapper._probe_agreement_needed()
+
+    key = RadixKey(array("q", [1] * 8))
+    req = SimpleNamespace(rid="r", last_node=None)
+    wrapper._tail_hashes = lambda key, result, device_hit_len: []
+
+    result = wrapper.match(key, req, _match_result())
+
+    # World size 1: the empty tail stays a plain miss with no collective.
+    assert reductions["count"] == 0
+    assert result.host_hit_length == 0
+
+
+def test_probe_agreement_needed_for_multirank_attn_group(monkeypatch):
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda group=None: 2)
+    cache = _cache_for_wrapper(
+        attn_cp_group=None,
+        attn_tp_group=object(),
+        tp_world_size=1,
+    )
+    wrapper = UnifiedCacheLinkerWrapper(cache, _FakeLinker())
+
+    # A multi-rank attn group requires agreement even when tp_world_size == 1.
+    assert wrapper._probe_agreement_needed()
 
 
 def test_async_offload_pins_node_until_completion():

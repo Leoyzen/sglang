@@ -168,7 +168,22 @@ class UnifiedCacheLinkerWrapper:
             return result
 
         tail_hashes = self._tail_hashes(key, result, device_hit_len)
-        if not tail_hashes:
+        # Pre-agree on the probe domain before the rank-local guards below:
+        # the tail is rank-local (e.g. an empty tail when the last device node
+        # has no hash anchor), so ranks can otherwise disagree on whether or
+        # how far to probe. A diverging rank would return here and skip
+        # _sync_restorable_prefix's all_reduce while its peers enter it, or
+        # enter it with a mismatched mask shape -- either side hangs the
+        # collective. One MIN reduction over the same groups makes every rank
+        # take the SAME branch: an empty tail on any rank degrades everyone to
+        # a miss together, and surviving ranks probe the shortest tail.
+        if self._probe_agreement_needed():
+            tail_hashes = self._agree_probe_domain(tail_hashes)
+            if tail_hashes is None:
+                # Empty tail on some rank: everyone misses together.
+                return result
+        elif not tail_hashes:
+            # Single-rank cache: nobody to disagree with, keep the plain miss.
             return result
 
         lookup_transfers = []
@@ -213,6 +228,37 @@ class UnifiedCacheLinkerWrapper:
                 result.mamba_host_hit_length, mamba_host_hit_length
             ),
         )
+
+    def _agree_probe_domain(self, tail_hashes: list[str]) -> list[str] | None:
+        """MIN-reduce the probe domain across the attn groups.
+
+        Returns the (possibly clamped) probe domain every rank shares, or None
+        when any rank reported an empty tail -- every rank then degrades to a
+        plain miss together, so nobody enters _sync_restorable_prefix alone.
+        The probe tensor mirrors _sync_restorable_prefix's CPU torch.int
+        layout and reduces over the same groups.
+        """
+        probe = torch.tensor(
+            [1 if tail_hashes else 0, len(tail_hashes)], dtype=torch.int
+        )
+        self.cache._all_reduce_attn_groups(probe, torch.distributed.ReduceOp.MIN)
+        if int(probe[0].item()) == 0:
+            return None
+        return tail_hashes[: int(probe[1].item())]
+
+    def _probe_agreement_needed(self) -> bool:
+        """Whether rank-local match() branches can diverge from other ranks.
+
+        Mirrors _all_reduce_attn_groups's group selection: only when some attn
+        group (or the fall-back TP group) spans more than one rank can the
+        guards above strand a peer inside _sync_restorable_prefix's
+        collective. A single-rank cache has nobody to disagree with.
+        """
+        cache = self.cache
+        for group in (cache.attn_cp_group, cache.attn_tp_group):
+            if group is not None and torch.distributed.get_world_size(group=group) > 1:
+                return True
+        return cache.tp_world_size > 1
 
     def _sync_restorable_prefix(
         self, restorable: list[int], *, num_pages: int, device_hit_pages: int
