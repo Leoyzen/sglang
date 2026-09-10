@@ -1088,18 +1088,82 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             capture_batch, in_capture=False
         )
 
+    def _bind_dcp_views_for_breakable_contract(
+        self, forward_batch: ForwardBatch
+    ) -> ForwardBatch:
+        """Route the persistent DCP views into the BCG captured-metadata
+        contract (opsx 3.1).
+
+        Opt-in backends (``use_captured_forward_metadata_for_breakable_cuda_graph``)
+        build their metadata from the batch's ``attn_dcp_metadata`` and hold
+        its tensor addresses across graph breaks. Under DCP the captured
+        segments must address the persistent ``PrefillDcpBuffers`` storage —
+        never ephemeral planner allocations — so capture-time planning reads
+        the bound views (see capture_prepare) and this hook re-asserts the
+        binding right before backend metadata planning. Replay refresh
+        already writes into the same storage (load_batch, opsx 2.4), so the
+        addresses captured at break boundaries stay live.
+
+        Returns the batch carrying the persistent-view metadata. No-op
+        (passthrough) when DCP is off or no persistent buffers exist.
+        """
+        dcp_buffers = getattr(self, "dcp_buffers", None)
+        if dcp_buffers is None or self.model_runner.ps.attn_dcp_size <= 1:
+            return forward_batch
+        current = forward_batch.attn_dcp_metadata
+        if current is None:
+            return forward_batch
+        # The builder (opsx 2.2/2.4) binds buffer views whenever the storage
+        # exists; if an ephemeral object slipped through (e.g. a caller-built
+        # batch), rebind now so backend planning never sees one-off tensors.
+        persistent = dcp_buffers.bind()
+        for field_name in (
+            "dcp_kv_indptr",
+            "dcp_kv_indices",
+            "dcp_local_prefix_kv_indices",
+            "dcp_kv_buffer",
+        ):
+            stored = getattr(persistent, field_name)
+            live = getattr(current, field_name, None)
+            if live is not None and live.data_ptr() != stored.data_ptr():
+                # Ephemeral tensor: copy content into the static view and
+                # expose the view instead.
+                if live.shape != stored.shape:
+                    width = min(int(live.shape[0]), int(stored.shape[0]))
+                    stored[:width].copy_(live[:width])
+                    stored[width:].zero_()
+                else:
+                    stored.copy_(live)
+                setattr(current, field_name, stored)
+        # Host int lives on the storage: when rebinding an ephemeral object,
+        # its (fresher) value wins and is recorded on the storage; a batch
+        # already bound to the views keeps the storage's value.
+        current.dcp_extend_prefix_lens_sum = int(
+            current.dcp_extend_prefix_lens_sum or 0
+        ) or int(getattr(dcp_buffers, "dcp_extend_prefix_lens_sum", 0) or 0)
+        dcp_buffers.dcp_extend_prefix_lens_sum = current.dcp_extend_prefix_lens_sum
+        return forward_batch
+
     def _init_forward_metadata_for_capture(
         self, forward_batch: ForwardBatch, num_tokens: int
     ) -> None:
         """Capture-time metadata init for the BCG-with-captured-metadata
         contract. For opt-in backends (DSV4), call the BCG-specific entry
         and stash the returned per-bucket metadata object; otherwise fall
-        back to the generic eager init that BCG/TC_PIECEWISE use today."""
+        back to the generic eager init that BCG/TC_PIECEWISE use today.
+
+        Under DCP (opsx 3.1) the batch is first pinned to the persistent
+        DCP buffer views, so the metadata the backend builds from it
+        references storage that stays allocated across capture and replay."""
         attn_backend = self.model_runner.attn_backend
         with forward_context(ForwardContext(attn_backend=attn_backend)):
             if not self.use_captured_attn_metadata:
+                forward_batch = self._bind_dcp_views_for_breakable_contract(
+                    forward_batch
+                )
                 attn_backend.init_forward_metadata(forward_batch)
                 return
+            forward_batch = self._bind_dcp_views_for_breakable_contract(forward_batch)
             metadata = (
                 attn_backend.init_forward_metadata_for_breakable_cuda_graph_capture(
                     forward_batch
@@ -1141,6 +1205,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             attn_backend.init_forward_metadata_out_graph(padded_view)
             return
         if not self.use_captured_attn_metadata:
+            forward_batch = self._bind_dcp_views_for_breakable_contract(forward_batch)
             attn_backend.init_forward_metadata(forward_batch)
             attn_backend.prepare_prefill_shared_read_snapshot(
                 forward_batch, num_qo_tokens=num_tokens
@@ -1148,6 +1213,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return
         assert self.attn_metadata_buffers is not None
         metadata = self.attn_metadata_buffers[num_tokens]
+        # DCP (opsx 3.1): both batches handed to the contract replay carry
+        # the persistent views, so the refreshed backend metadata and any
+        # per-replay assignment stay on the addresses captured at capture.
+        forward_batch = self._bind_dcp_views_for_breakable_contract(forward_batch)
+        static_forward_batch = self._bind_dcp_views_for_breakable_contract(
+            static_forward_batch
+        )
         attn_backend.prepare_forward_metadata_for_breakable_cuda_graph_replay(
             metadata,
             forward_batch,
