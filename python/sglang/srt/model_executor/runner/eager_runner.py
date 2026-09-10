@@ -35,9 +35,6 @@ from sglang.srt.layers.pooler import EmbeddingPoolerOutput
 from sglang.srt.model_executor.cuda_graph_buffer_registry import (
     build_eager_registry,
 )
-from sglang.srt.model_executor.forward_batch_deepseek_mha_mixin import (
-    create_chunked_prefix_cache_kv_indices,
-)
 from sglang.srt.model_executor.forward_batch_info import (
     ForwardBatch,
     ForwardMode,
@@ -46,8 +43,6 @@ from sglang.srt.model_executor.forward_batch_info import (
 from sglang.srt.model_executor.forward_context import (
     ForwardContext,
     forward_context,
-    get_req_to_token_pool,
-    get_token_to_kv_pool,
 )
 from sglang.srt.model_executor.runner.base_runner import BaseRunner
 from sglang.srt.model_executor.runner_backend_utils.tc_piecewise_cuda_graph import (
@@ -296,25 +291,11 @@ class EagerRunner(BaseRunner):
             or cp_active
             or forward_batch.forward_mode.is_target_verify()
         ):
-            if model_runner.ps.attn_dcp_size > 1 and hasattr(
-                model_runner.model, "prepare_context_parallel_metadata_for_dcp"
-            ):
-                # prepare kv cache buffer for dcp to gather kv cache
-                forward_batch.attn_dcp_metadata = (
-                    model_runner.model.prepare_context_parallel_metadata_for_dcp(
-                        forward_batch.seq_lens,
-                        forward_batch.extend_prefix_lens,
-                        forward_batch.extend_prefix_lens_cpu,
-                        forward_batch.extend_seq_lens,
-                        forward_batch.req_pool_indices,
-                        get_req_to_token_pool().req_to_token,
-                        forward_batch.seq_lens_sum,
-                        get_token_to_kv_pool().get_kv_buffer_shape()[0],
-                        model_runner.kv_cache_dtype,
-                        model_runner.device,
-                        create_chunked_prefix_cache_kv_indices,
-                    )
-                )
+            from sglang.srt.model_executor.model_runner_components.dcp_prefill_metadata import (
+                prepare_dcp_extend_metadata,
+            )
+
+            prepare_dcp_extend_metadata(model_runner, forward_batch)
             if hasattr(model_runner.model, "prepare_forward_batch"):
                 # Prepare model-specific attention metadata before planning,
                 # e.g. Moss-VL's prefill cross-attention custom mask.
