@@ -33,6 +33,38 @@ from sglang.srt.utils.hf_transformers_utils import check_gguf_file
 
 logger = logging.getLogger(__name__)
 
+# Attention backends allowed to capture prefill CUDA graphs under decode
+# context parallelism (dcp_size > 1); design D3 replaces the blanket
+# disable with backend-conditional gating. Names are the attention-backend
+# strings resolved by ``attention_backends_of`` (the same identifiers the
+# attention registry and ATTENTION_BACKEND_CHOICES use).
+#
+# Initial content is DOCUMENTED INTENT (design D3: the trtllm-mla family,
+# matching #31821's validated kernel stack). Per tasks.md 5.4, production
+# enablement is gated on Section 5 E2E validation (bucket-set parity +
+# rank-divergence audit) — until that lands, treat entries as pending
+# validation. Rollback lever: clear this set to restore the blanket
+# dcp_size > 1 auto-disable (migration-plan step 4).
+DCP_PREFILL_CG_ATTENTION_BACKEND_ALLOWLIST = frozenset({"trtllm_mla"})
+
+
+def _resolved_prefill_attention_backend(server_args: Any) -> Any:
+    """The prefill attention backend name at hook-resolution time, with the
+    same access pattern the other backend-aware rules here use (split field
+    falls back to the base backend; ``None`` while still unresolved)."""
+    prefill_backend, _ = attention_backends_of(resolved_view(server_args))
+    return prefill_backend
+
+
+def _dcp_prefill_backend_allowlisted(server_args: Any) -> bool:
+    """Whether the resolved prefill attention backend is on the DCP
+    prefill-CUDA-graph allowlist (design D3). An unresolved (auto) backend
+    is conservatively treated as NOT allowlisted: today's behavior."""
+    return (
+        _resolved_prefill_attention_backend(server_args)
+        in DCP_PREFILL_CG_ATTENTION_BACKEND_ALLOWLIST
+    )
+
 
 def parse_cuda_graph_config(server_args: Any):
     """Resolve cuda_graph_config from explicit JSON, per-phase
@@ -244,10 +276,16 @@ def disable_tc_piecewise_cudagraph_if_incompatible(server_args: Any):
             lambda: resolved_view(server_args).attn_cp_size > 1,
         ),
         ("CUDA graph debug mode", lambda: cfg.debug_cuda_graph),
-        # Capture builds a dummy extend forward with attn_dcp_metadata=None.
+        # DCP (design D3): the capture dummy now binds real DCP metadata
+        # through the shared builder, so capture is allowed for allowlisted
+        # attention backends and keeps today's auto-disable otherwise.
+        # The rule fires when the backend is NOT validated for DCP; the
+        # resolve-time access follows this hook's other backend reads.
         (
             "decode context parallel (dcp_size > 1)",
-            lambda: cfg.dcp_size > 1,
+            lambda: (
+                cfg.dcp_size > 1 and not _dcp_prefill_backend_allowlisted(server_args)
+            ),
         ),
     ]
     for _name, predicate in rules:
@@ -298,10 +336,15 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
                 and not supports_prefill_cp_bcg(server_args)
             ),
         ),
-        # Capture builds a dummy extend forward with attn_dcp_metadata=None.
+        # DCP (design D3): backend-conditional like the tc_piecewise rule —
+        # allowlisted backends capture (the shared builder + persistent DCP
+        # buffers wire real metadata into the captured segments); others
+        # keep today's auto-disable.
         (
             "decode context parallel (dcp_size > 1)",
-            lambda: cfg.dcp_size > 1,
+            lambda: (
+                cfg.dcp_size > 1 and not _dcp_prefill_backend_allowlisted(server_args)
+            ),
         ),
         # TBO capture is unsupported.
         (
