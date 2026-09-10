@@ -145,6 +145,30 @@ def apply_cuda_graph_compatibility(server_args: Any):
 
     cfg = resolving_view(server_args)
     if (Phase.PREFILL, "backend") in server_args._cuda_graph_config_locked:
+        # opsx 4.2 (spec 'Forced enablement warns'): an explicit prefill
+        # backend lock skips the auto-disable cascade — that contract
+        # (#31532) is preserved. Under DCP the user is then responsible for
+        # the combination, so warn when the backend is not allowlisted
+        # (validated); an allowlisted backend is quiet.
+        if (
+            cfg.dcp_size > 1
+            and cfg.cuda_graph_config.prefill.backend
+            in (Backend.BREAKABLE, Backend.TC_PIECEWISE)
+            and not _dcp_prefill_backend_allowlisted(server_args)
+        ):
+            prefill_attention_backend = _resolved_prefill_attention_backend(server_args)
+            logger.warning(
+                "The prefill CUDA graph (%s) combined with decode context "
+                "parallelism (dcp_size > 1) is unvalidated for this "
+                "attention backend (%s) and was forced on by an explicit "
+                "prefill-backend lock; capture proceeds, but correctness "
+                "and performance are not guaranteed. Allowlisted backends: "
+                "%s. See openspec enable-dcp-bcg-prefill-cudagraph "
+                "(#29736 backend x DCP matrix).",
+                cfg.cuda_graph_config.prefill.backend,
+                prefill_attention_backend,
+                sorted(DCP_PREFILL_CG_ATTENTION_BACKEND_ALLOWLIST),
+            )
         return
 
     # PP prefill graph replay is opt-in. It is most useful for small
