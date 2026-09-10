@@ -450,6 +450,115 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         self.assertEqual(kv2.layer_mapping[2], (1, 4))
         self.assertEqual(kv2.layer_mapping[4], 2)
 
+    def test_hicache_draft_plan_reaches_build_kv_cache(self):
+        """The EAGLE draft pools must flow from the plan into tree-cache params.
+
+        Pins the scheduler's init seam (ordering verified identical to
+        upstream main): Scheduler.__init__ runs init_model_worker() ->
+        init_memory_pools() -> draft_worker.init_hicache_draft_plan()
+        (scheduler.py:554/989) BEFORE kv_cache_builder.build_kv_cache()
+        (scheduler.py:560). build_kv_cache must then read
+        tp_worker.model_runner.mtp_draft_device_pools -- the very attribute
+        _build_hicache_draft_plan mutated -- into CacheInitParams, so the
+        direct linker's strategy sees non-empty draft pools. A regression in
+        either hop silently drains mamba P2 draft packing (spec_accept_rate
+        collapse with empty draft pools at the assembler).
+        """
+        from sglang.srt.configs.model_config import ModelImpl
+        from sglang.srt.runtime_context import get_memory, reset_context
+        from sglang.srt.server_args import (
+            ServerArgs,
+            set_global_server_args_for_scheduler,
+        )
+        from sglang.srt.speculative import base_spec_worker as spec
+        from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
+        from sglang.srt.mem_cache import kv_cache_builder
+
+        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy", page_size=1))
+        self.addCleanup(reset_context)
+
+        model_config = SimpleNamespace(
+            hf_config=SimpleNamespace(
+                architectures=["LlamaForCausalLM"],
+                get_text_config=lambda: SimpleNamespace(),
+            ),
+            linear_attn_registry_result=None,
+            _resolved_model_impl=ModelImpl.SGLANG,
+            is_multimodal=False,
+        )
+        draft_pool = SimpleNamespace(
+            page_size=1,
+            kv_buffer=[torch.zeros((16, 9), dtype=torch.uint8)],
+        )
+        target_runner = SimpleNamespace(
+            spec_algorithm=SpeculativeAlgorithm.EAGLE,
+            mtp_draft_device_pools=(),
+            model_config=model_config,
+        )
+        draft_runner = SimpleNamespace(
+            token_to_kv_pool=draft_pool,
+            model_config=SimpleNamespace(
+                num_nextn_predict_layers=1,
+                hf_config=SimpleNamespace(architectures=["LlamaForCausalLMNextN"]),
+            ),
+        )
+        worker = SimpleNamespace(
+            target_worker=SimpleNamespace(model_runner=target_runner),
+            draft_worker=SimpleNamespace(draft_runners=[draft_runner]),
+            _draft_model_runners=lambda: (draft_runner,),
+        )
+        # Real-system aliasing: the draft worker's target_worker IS the
+        # scheduler's tp_worker, so model_runner here must be the SAME object
+        # the plan mutates (scheduler.py:944 target_worker=self.tp_worker).
+        tp_worker = SimpleNamespace(
+            is_hybrid_swa=False,
+            model_runner=target_runner,
+            get_memory_pool=lambda: (object(), SimpleNamespace(get_kvcache=lambda: object())),
+        )
+
+        captured = {}
+
+        def fake_create_tree_cache(ctx):
+            captured["ctx"] = ctx
+            return SimpleNamespace(cache_controller=None)
+
+        with (
+            get_memory().override(enable_unified_cache_external_linker=True),
+            patch.object(
+                kv_cache_builder,
+                "create_tree_cache",
+                side_effect=fake_create_tree_cache,
+            ),
+            patch.object(kv_cache_builder, "maybe_register_hicache_draft"),
+        ):
+            plan = spec.BaseSpecWorker._build_hicache_draft_plan(worker)
+            self.assertEqual(plan.mode, spec.HiCacheDraftMode.PACKED)
+            self.assertEqual(plan.device_pools, (draft_pool,))
+            # Hop 1: the plan injected the draft pools onto the target runner.
+            self.assertEqual(target_runner.mtp_draft_device_pools, (draft_pool,))
+
+            # Hop 2: build_kv_cache forwards them into CacheInitParams exactly
+            # as the scheduler's call site does.
+            kv_cache_builder.build_kv_cache(
+                server_args=ServerArgs(model_path="dummy", page_size=1),
+                model_config=model_config,
+                tp_worker=tp_worker,
+                page_size=1,
+                spec_algorithm=SpeculativeAlgorithm.EAGLE,
+                attn_tp_cpu_group=None,
+                tp_cpu_group=None,
+                attn_cp_cpu_group=None,
+                enable_metrics=False,
+                enable_kv_cache_events=False,
+                ps=SimpleNamespace(pp_rank=0, pp_size=1, attn_cp_rank=0, attn_cp_size=1, tp_size=1, tp_rank=0),
+                tp_group=None,
+                pp_group=SimpleNamespace(cpu_group=None),
+                enable_hierarchical_cache=False,
+                hicache_draft_plan=plan,
+            )
+        params = captured["ctx"].params
+        self.assertEqual(params.mtp_draft_device_pools, (draft_pool,))
+
 
 if __name__ == "__main__":
     unittest.main()
