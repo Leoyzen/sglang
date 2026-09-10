@@ -371,9 +371,7 @@ class TestSelfKeyedBatchExists(CustomTestCase):
         return store
 
     def test_self_keyed_probe_uses_transfer_keys(self):
-        group = _build_mamba_device_pool_group(
-            _fake_hybrid_kvcache(), page_size=64, params=_fake_params()
-        )
+        group = _build_mamba_device_pool_group(_fake_hybrid_kvcache(), page_size=64, params=_fake_params())
         mamba = group.entry_map[PoolName.MAMBA]
 
         store = self._store_stub(mamba)
@@ -401,9 +399,7 @@ class TestSelfKeyedBatchExists(CustomTestCase):
         self.assertIn(5, result.restorable_prefix_pages)
 
     def test_self_keyed_miss_caps_restorable_prefix(self):
-        group = _build_mamba_device_pool_group(
-            _fake_hybrid_kvcache(), page_size=64, params=_fake_params()
-        )
+        group = _build_mamba_device_pool_group(_fake_hybrid_kvcache(), page_size=64, params=_fake_params())
         mamba = group.entry_map[PoolName.MAMBA]
 
         store = self._store_stub(mamba)
@@ -430,20 +426,82 @@ class TestSelfKeyedBatchExists(CustomTestCase):
         component = TestMambaComponentTransfers._component(self, _FakeAllocator())
         node = SimpleNamespace(
             hash_value=["h0", "h1", "h2"],
-            component_data={
-                ComponentType.MAMBA: SimpleNamespace(value=torch.tensor([7], dtype=torch.int64))
-            },
+            component_data={ComponentType.MAMBA: SimpleNamespace(value=torch.tensor([7], dtype=torch.int64))},
         )
-        offload = component.build_external_linker_transfer(
-            LinkerTransferPhase.OFFLOAD, node, None
-        )
+        offload = component.build_external_linker_transfer(LinkerTransferPhase.OFFLOAD, node, None)
         # A request whose device-uncached tail ends at this node's boundary
         # carries the same page-hash chain, so its last tail hash == h2.
-        lookup = component.build_external_linker_transfer(
-            LinkerTransferPhase.LOOKUP, None, ["h0", "h1", "h2"]
-        )
+        lookup = component.build_external_linker_transfer(LinkerTransferPhase.LOOKUP, None, ["h0", "h1", "h2"])
         self.assertEqual(offload.keys, ["h2"])
         self.assertEqual(lookup.keys, offload.keys)
+
+
+def _fake_draft_pool():
+    """MTP draft HybridLinearKVPool wrapper: full_kv_pool carries MHA buffers
+    plus a DSA index sidecar with one buffer per draft layer."""
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+    draft_layer_num = 1
+
+    class _DraftFullPool:
+        k_buffer = [torch.zeros((16, 5), dtype=torch.uint8) for _ in range(draft_layer_num)]
+        v_buffer = [torch.zeros((16, 7), dtype=torch.uint8) for _ in range(draft_layer_num)]
+        index_k_with_scale_buffer = [torch.zeros((4, 11), dtype=torch.uint8) for _ in range(draft_layer_num)]
+        use_dsa = True
+        page_size = 1
+
+    pool = SimpleNamespace(full_kv_pool=_DraftFullPool(), page_size=1)
+    assert isinstance(HybridLinearKVPool, object)  # keep import meaningful
+    return pool
+
+
+class TestMambaPackedDraftMapping(CustomTestCase):
+    """The packed-draft path must key draft depths by ACTUAL mapping keys.
+
+    Regression: _with_packed_draft_mapping assumed contiguous local keys
+    (0..N-1) and crashed with KeyError: 0 on the mamba-hybrid path, where
+    full_attention_layer_id_mapping is keyed by interleaved global layer ids
+    (layer 0 is a mamba layer). It also flattened component GROUPS as single
+    buffers, crashing _row_count with AttributeError ('list' has no shape).
+    """
+
+    def test_packed_draft_group_resolves_all_layers(self):
+        params = _fake_params()
+        params.mtp_draft_device_pools = (_fake_draft_pool(),)
+        group = _build_mamba_device_pool_group(_fake_hybrid_kvcache(), page_size=1, params=params)
+
+        kv = group.entry_map[PoolName.KV]
+        # All flattened components must be real tensors (not nested lists).
+        for buffer in kv.kv_buffer:
+            self.assertIsInstance(buffer, torch.Tensor)
+
+        # Target full layers are global ids {0, 2, 4}; the single draft layer
+        # attaches to the first (lowest-id) target layer.
+        mapping = kv.layer_mapping
+        self.assertIn(0, mapping)
+        self.assertEqual(mapping[0], (0, 3))  # (target comp 0, device layer 3)
+        self.assertEqual(mapping[2], 1)
+        self.assertEqual(mapping[4], 2)
+
+        # Transfer layers 0..3 must all resolve to per-layer pointer views.
+        for layer in range(4):
+            meta = kv.get_prepared_layer_range_meta(kv.prepare_locations(torch.tensor([2])), layer)
+            self.assertIsNotNone(meta, f"transfer layer {layer} unresolved")
+            ptrs, sizes, offsets = meta
+            self.assertTrue(all(p != 0 for p in [x for row in ptrs for x in row]))
+
+    def test_identity_key_path_unchanged(self):
+        """Pure-DSA-style identity mappings must keep their key space."""
+        from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+            _with_packed_draft_mapping,
+        )
+
+        mapping = _with_packed_draft_mapping(
+            {l: l for l in range(4)},
+            target_device_layer_num=4,
+            draft_layer_num=1,
+        )
+        self.assertEqual(mapping, {0: (0, 4), 1: 1, 2: 2, 3: 3})
 
 
 if __name__ == "__main__":
