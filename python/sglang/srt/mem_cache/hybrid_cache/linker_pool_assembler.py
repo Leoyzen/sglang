@@ -399,13 +399,36 @@ def _build_mamba_device_pool_group(
 
     state_components, conv_buffers, temporal_state_elem_size = _build_mamba_state_components(mamba_pool)
 
+    # P2: pack the EAGLE draft pools alongside the target so restores cover
+    # the draft's KV and index rows too. Without this, a store hit gives the
+    # target model the context but the draft has never seen it (#31600 form):
+    # speculative acceptance collapses toward token-by-token decoding. Draft
+    # pools are HybridLinearKVPool wrappers — unwrap to full_kv_pool (cf. the
+    # HiCache strategy in hybrid_pool_assembler.py) and keep only pools that
+    # actually carry an index sidecar.
+    draft_pools = tuple(getattr(pool, "full_kv_pool", pool) for pool in mtp_draft_device_pools)
+    draft_kv_buffers = [buffer for pool in draft_pools for buffer in pool.kv_buffer]
+    draft_indexer_buffers = [buffer for pool in draft_pools for buffer in getattr(pool, "index_k_with_scale_buffer", ())]
+    if draft_kv_buffers and len(draft_kv_buffers) != len(draft_indexer_buffers):
+        raise ValueError("Mamba-hybrid MTP KV and indexer draft layer counts must match.")
+    draft_layer_num = len(draft_kv_buffers)
+    kv_layer_mapping = (
+        _with_packed_draft_mapping(
+            dict(full_layer_mapping),
+            target_device_layer_num=len(full_layer_mapping),
+            draft_layer_num=draft_layer_num,
+        )
+        if draft_kv_buffers
+        else full_layer_mapping
+    )
+
     entries = [
         DevicePoolEntry(
             name=PoolName.KV,
             indices_from_pool=PoolName.KV,
             device_pool=kvcache,
-            components=_mamba_kv_components(kvcache),
-            layer_mapping=full_layer_mapping,
+            components=[[*_mamba_kv_components(kvcache), *draft_kv_buffers]],
+            layer_mapping=kv_layer_mapping,
             page_size=page_size,
             rows_are_pages=False,
         ),
@@ -443,12 +466,13 @@ def _build_mamba_device_pool_group(
                 name=PoolName.INDEXER,
                 indices_from_pool=PoolName.KV,
                 device_pool=full_kv_pool,
-                components=[[*index_buffers]],
-                layer_mapping=dict(full_layer_mapping),
+                components=[[*index_buffers, *draft_indexer_buffers]],
+                layer_mapping=kv_layer_mapping,
                 page_size=page_size,
                 rows_are_pages=True,
             )
         )
+        num_layers = max(num_layers, len(full_layer_mapping) + draft_layer_num)
     elif index_buffers and getattr(full_kv_pool, "use_dsa", False):
         logger.warning(
             "Mamba direct linker: DSA index sidecar present but tree page_size=%d != IndexKeyCache kernel page 64; INDEXER entry skipped (L3 restores would be unsafe).",
