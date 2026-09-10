@@ -522,6 +522,31 @@ def _build_mamba_device_pool_group(
             )
         return list(kv_buffers)
 
+    def _validate_draft_row_coverage(
+        target_buffers: Sequence[torch.Tensor],
+        draft_buffers: Sequence[torch.Tensor],
+        target_label: str,
+        draft_label: str,
+    ) -> None:
+        """Reject undersized draft pools AT ASSEMBLY.
+
+        The packed entry's row budget is the MINIMUM across its buffers, so a
+        draft pool with fewer rows than the target would pass startup and only
+        fail MID-FLIGHT (row-range ValueError during an offload/load burst at
+        high concurrency). Fail loudly here instead, naming pools and shapes.
+        """
+        if not draft_buffers or not target_buffers:
+            return
+        target_rows = min(buffer.shape[0] for buffer in target_buffers)
+        draft_rows = min(buffer.shape[0] for buffer in draft_buffers)
+        if draft_rows < target_rows:
+            raise ValueError(
+                f"Packed {draft_label} rows ({draft_rows}) must cover "
+                f"{target_label} rows ({target_rows}); "
+                f"target shapes={[tuple(buffer.shape) for buffer in target_buffers]}, "
+                f"draft shapes={[tuple(buffer.shape) for buffer in draft_buffers]}."
+            )
+
     draft_kv_buffers = [
         buffer
         for pool in mtp_draft_device_pools
@@ -572,6 +597,14 @@ def _build_mamba_device_pool_group(
     # Pack target + draft per-layer buffers into ONE component group so the
     # packed mapping tuple (target_comp, N + depth) resolves both indices
     # inside the same group (same scheme as the pure-DSA KV entry).
+    # Row coverage: a draft pool smaller than the target would only explode
+    # mid-flight; refuse it at assembly.
+    _validate_draft_row_coverage(
+        _target_kv_buffers,
+        draft_kv_buffers,
+        target_label=PoolName.KV.value,
+        draft_label="MTP draft KV",
+    )
     entries = [
         DevicePoolEntry(
             name=PoolName.KV,
@@ -611,6 +644,12 @@ def _build_mamba_device_pool_group(
     full_kv_pool = kvcache.full_kv_pool
     index_buffers = getattr(full_kv_pool, "index_k_with_scale_buffer", None)
     if index_buffers and getattr(full_kv_pool, "use_dsa", False) and page_size == 64:
+        _validate_draft_row_coverage(
+            index_buffers,
+            draft_indexer_buffers,
+            target_label=PoolName.INDEXER.value,
+            draft_label="MTP draft indexer",
+        )
         entries.append(
             DevicePoolEntry(
                 name=PoolName.INDEXER,
