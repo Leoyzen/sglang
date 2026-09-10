@@ -1870,6 +1870,24 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             )
             metadata_forward_batch = static_forward_batch
 
+        # In-place refresh of the persistent DCP metadata buffers (opsx 2.4):
+        # compute this batch's DCP metadata through the shared builder and
+        # write it into the static views the captured segments address —
+        # copy_/index writes only, never reallocation (spec: 'Consecutive
+        # replays with different KV layouts'). Runs before attention
+        # metadata planning so init_forward_metadata sees live DCP state.
+        # getattr default: fixtures built via __new__ may predate the field.
+        if (
+            getattr(self, "dcp_buffers", None) is not None
+            and self.model_runner.ps.attn_dcp_size > 1
+        ):
+            with forward_context(
+                ForwardContext(attn_backend=self.model_runner.attn_backend)
+            ):
+                refreshed = self._prepare_capture_dcp_metadata(static_forward_batch)
+            if refreshed is not None:
+                metadata_forward_batch = static_forward_batch
+
         self._prepare_forward_metadata_for_replay(
             metadata_forward_batch, static_forward_batch, static_num_tokens
         )
