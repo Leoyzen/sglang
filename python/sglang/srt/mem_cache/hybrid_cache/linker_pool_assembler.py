@@ -7,7 +7,7 @@ from collections.abc import Callable, Sequence
 
 logger = logging.getLogger(__name__)
 from dataclasses import replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -17,6 +17,22 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolTransfer,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
+
+if TYPE_CHECKING:
+    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+
+def _is_hybrid_linear_kv_pool(pool: Any) -> bool:
+    """Duck check for the HybridLinearKVPool wrapper (lazy import avoids a
+    circular dependency with memory_pool)."""
+    try:
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+        if isinstance(pool, HybridLinearKVPool):
+            return True
+    except ImportError:
+        pass
+    return hasattr(pool, "full_kv_pool") and hasattr(pool, "full_attention_layer_id_mapping")
 
 
 class DevicePoolEntry:
@@ -408,13 +424,34 @@ def _build_mamba_device_pool_group(
     # the draft's KV and index rows too. Without this, a store hit gives the
     # target model the context but the draft has never seen it (#31600 form):
     # speculative acceptance collapses toward token-by-token decoding.
-    # Draft pools are HybridLinearKVPool wrappers. Their .kv_buffer /
-    # .index_k_with_scale_buffer are flat per-layer tensor lists (same shape
-    # the pure-DSA group consumes), so take them directly instead of unwrapping
-    # to full_kv_pool — unwrapping changes kv_buffer into component groups.
-    draft_kv_buffers = [buffer for pool in mtp_draft_device_pools for buffer in pool.kv_buffer]
+    # Draft pools arrive as runner.token_to_kv_pool, whose flat-buffer shape
+    # depends on the draft's OWN pool family:
+    #   - DSA/MLA drafts (e.g. GLM-5.3-Flash NextN): DSATokenToKVPool with
+    #     flat .kv_buffer (+ .index_k_with_scale_buffer sidecar).
+    #   - Mamba-family drafts (Qwen3Next / NemotronH / Kimi / Bailing NextN):
+    #     the HybridLinearKVPool WRAPPER, which exposes no .kv_buffer — the
+    #     flat latent rows live on wrapper.full_kv_pool.kv_buffer (component
+    #     groups are unwrapped into flat per-layer lists), and the wrapper
+    #     carries no index sidecar. Unwrapping the WRAPPER (not the inner
+    #     DSA pool) preserves the flat list shape the packed group consumes.
+    def _draft_flat_kv_buffers(pool: Any) -> list[torch.Tensor]:
+        kv_buffers = getattr(pool, "kv_buffer", None)
+        if kv_buffers is None and _is_hybrid_linear_kv_pool(pool):
+            kv_buffers = [
+                buffer
+                for group in pool.full_kv_pool.kv_buffer
+                for buffer in (group if isinstance(group, list) else (group,))
+            ]
+        if kv_buffers is None:
+            raise ValueError(f"Mamba-hybrid MTP draft pool has no flat KV buffers: {type(pool).__name__}.")
+        return list(kv_buffers)
+
+    draft_kv_buffers = [buffer for pool in mtp_draft_device_pools for buffer in _draft_flat_kv_buffers(pool)]
     draft_indexer_buffers = [buffer for pool in mtp_draft_device_pools for buffer in getattr(pool, "index_k_with_scale_buffer", ())]
-    if draft_kv_buffers and len(draft_kv_buffers) != len(draft_indexer_buffers):
+    # A non-DSA draft legitimately has no index sidecar: requiring parity
+    # would reject every mamba-family draft whose full pool is plain MHA/MLA.
+    # Only enforce parity when BOTH buffer lists exist.
+    if draft_kv_buffers and draft_indexer_buffers and len(draft_kv_buffers) != len(draft_indexer_buffers):
         raise ValueError("Mamba-hybrid MTP KV and indexer draft layer counts must match.")
     draft_layer_num = len(draft_kv_buffers)
     kv_layer_mapping = (

@@ -330,6 +330,7 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                 ),
                 mamba_map={0: 0},
             ),
+            mtp_draft_device_pools=(),
         )
         group = resolve_hybrid_device_pool_group(
             kvcache=kvcache,
@@ -345,6 +346,109 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         # slot-granular rows: internal page_size==1 while the KV entry carries
         # the tree page size; _row_span == 1 means rows_are_pages semantics.
         self.assertEqual(mamba._row_span, 1)
+
+    def _mamba_assembler_target(self):
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+        kvcache = HybridLinearKVPool.__new__(HybridLinearKVPool)
+        kvcache.full_attention_layer_id_mapping = {0: 0, 2: 1, 4: 2}
+        kvcache.full_kv_pool = SimpleNamespace(
+            k_buffer=[torch.zeros((16, 5), dtype=torch.uint8) for _ in range(3)],
+            v_buffer=[torch.zeros((16, 7), dtype=torch.uint8) for _ in range(3)],
+        )
+        params = SimpleNamespace(
+            req_to_token_pool=SimpleNamespace(
+                mamba_pool=SimpleNamespace(
+                    mamba_cache=SimpleNamespace(
+                        temporal=torch.zeros((2, 8, 4), dtype=torch.uint8),
+                        conv=[torch.zeros((2, 8, 3), dtype=torch.uint8)],
+                    )
+                ),
+                mamba_map={1: 0, 3: 1},
+            ),
+            mtp_draft_device_pools=(),
+        )
+        return kvcache, params
+
+    def test_mamba_packs_dsa_draft_pool_flat_buffers(self):
+        """DSA-shaped draft pool (GLM-5.3-Flash NextN: DSATokenToKVPool with
+        flat .kv_buffer + .index_k_with_scale_buffer) packs its KV rows into
+        the KV entry and its index rows into the INDEXER entry."""
+        kvcache, params = self._mamba_assembler_target()
+        params.mtp_draft_device_pools = (
+            SimpleNamespace(
+                page_size=1,
+                kv_buffer=[torch.zeros((16, 9), dtype=torch.uint8)],
+                index_k_with_scale_buffer=[torch.zeros((4, 11), dtype=torch.uint8)],
+            ),
+        )
+        group = resolve_hybrid_device_pool_group(
+            kvcache=kvcache,
+            page_size=1,
+            params=params,
+            components={ComponentType.FULL, ComponentType.MAMBA},
+        )
+        # Draft index rows only land when the TARGET carries its own DSA
+        # index sidecar AND the tree page_size is 64 (see the INDEXER entry
+        # gating in _build_mamba_device_pool_group); this MHA-shaped target
+        # at page_size=1 has none, so only KV + MAMBA exist.
+        self.assertEqual(set(group.entry_map), {PoolName.KV, PoolName.MAMBA})
+        kv = group.entry_map[PoolName.KV]
+        # Draft depth 0 attaches to the first mapped target layer (gid 0).
+        self.assertEqual(kv.layer_mapping[0], (0, 3))
+        self.assertEqual(kv.layer_mapping[2], 1)
+        _, sizes, _ = kv.get_prepared_layer_range_meta(kv.prepare_locations(torch.tensor([0])), 0)
+        # Layer 0 resolves TWO buffers: target latent + draft latent.
+        self.assertEqual(len(sizes[0]), 2)
+
+    def test_mamba_packs_hybrid_wrapper_draft_pool_without_flat_attrs(self):
+        """Regression: a mamba-family NextN draft (Qwen3Next / NemotronH /
+        Kimi / Bailing) hands over the HybridLinearKVPool WRAPPER, which has
+        NO .kv_buffer / .index_k_with_scale_buffer (everything delegates to
+        full_kv_pool). The assembler must unwrap the wrapper's flat latent
+        rows instead of crashing with AttributeError, and a sidecar-less
+        draft must be accepted (parity only enforced when both sides exist)."""
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+        kvcache, params = self._mamba_assembler_target()
+        wrapper = HybridLinearKVPool.__new__(HybridLinearKVPool)
+        wrapper.full_kv_pool = SimpleNamespace(
+            # Flat per-layer latent list, the same shape the packed group
+            # consumes (DSA-style single buffer per draft layer).
+            kv_buffer=[torch.zeros((16, 9), dtype=torch.uint8)],
+        )
+        params.mtp_draft_device_pools = (wrapper,)
+        group = resolve_hybrid_device_pool_group(
+            kvcache=kvcache,
+            page_size=1,
+            params=params,
+            components={ComponentType.FULL, ComponentType.MAMBA},
+        )
+        # No INDEXER entry: the wrapper draft carries no index sidecar.
+        self.assertEqual(set(group.entry_map), {PoolName.KV, PoolName.MAMBA})
+        kv = group.entry_map[PoolName.KV]
+        self.assertEqual(kv.layer_mapping[0], (0, 3))
+        _, sizes, _ = kv.get_prepared_layer_range_meta(kv.prepare_locations(torch.tensor([0])), 0)
+        self.assertEqual(len(sizes[0]), 2)
+
+        # Component-GROUP full pool (plain MHA k/v per layer) flattens too.
+        kvcache2, params2 = self._mamba_assembler_target()
+        wrapper2 = HybridLinearKVPool.__new__(HybridLinearKVPool)
+        wrapper2.full_kv_pool = SimpleNamespace(
+            kv_buffer=[[torch.zeros((16, 5), dtype=torch.uint8)], [torch.zeros((16, 7), dtype=torch.uint8)]],
+        )
+        params2.mtp_draft_device_pools = (wrapper2,)
+        group2 = resolve_hybrid_device_pool_group(
+            kvcache=kvcache2,
+            page_size=1,
+            params=params2,
+            components={ComponentType.FULL, ComponentType.MAMBA},
+        )
+        kv2 = group2.entry_map[PoolName.KV]
+        # 2 draft components attach to the first two mapped target layers.
+        self.assertEqual(kv2.layer_mapping[0], (0, 3))
+        self.assertEqual(kv2.layer_mapping[2], (1, 4))
+        self.assertEqual(kv2.layer_mapping[4], 2)
 
 
 if __name__ == "__main__":
