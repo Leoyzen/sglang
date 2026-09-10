@@ -168,7 +168,25 @@ class UnifiedCacheLinkerWrapper:
             return result
 
         tail_hashes = self._tail_hashes(key, result, device_hit_len)
-        if not tail_hashes:
+
+        # Probe-domain pre-agreement: the guards below are rank-local (empty
+        # tail when the last device node has no hash anchor). Without
+        # pre-agreement, a diverging rank returns here and skips
+        # _sync_restorable_prefix's all_reduce while other ranks enter it —
+        # a mutual hang (observed in production: TP0 stuck in
+        # _all_reduce_attn_groups while TP1-3 sat in the next-round
+        # recv_requests broadcast). One MIN reduction over the same groups
+        # makes every rank take the SAME branch: has_tail=0 on any rank
+        # degrades everyone to a miss together, and surviving ranks clamp
+        # their probe to the shortest tail.
+        if self._probe_agreement_needed():
+            tail_hashes = self._agree_probe_domain(tail_hashes)
+            if tail_hashes is None:
+                # ALL ranks take this miss branch together.
+                return result
+        elif not tail_hashes:
+            # Single-rank cache: no collective to agree on, keep the plain
+            # early miss (no pre-agreement overhead).
             return result
 
         lookup_transfers = []
@@ -177,6 +195,10 @@ class UnifiedCacheLinkerWrapper:
                 LinkerTransferPhase.LOOKUP, None, tail_hashes
             )
             if transfer is None:
+                # Rank-local decline — NOT covered by the probe pre-agreement
+                # (residual deadlock risk if ranks diverge here; guarding it
+                # needs a second pre-agreement pass over the transfer
+                # construction and is deferred).
                 return result
             lookup_transfers.append(transfer)
         by_pool = {transfer.name: transfer for transfer in lookup_transfers}
@@ -213,6 +235,38 @@ class UnifiedCacheLinkerWrapper:
                 result.mamba_host_hit_length, mamba_host_hit_length
             ),
         )
+
+    def _agree_probe_domain(self, tail_hashes: list[str]) -> list[str] | None:
+        """MIN-reduce the probe domain across the attn groups.
+
+        Returns the (possibly clamped) probe domain every rank shares, or
+        None when ANY rank reported an empty tail — every rank then degrades
+        to a plain miss TOGETHER, so nobody enters _sync_restorable_prefix
+        alone. The probe tensor mirrors _sync_restorable_prefix's CPU
+        ``torch.int`` layout and reduces over the SAME groups (via
+        _all_reduce_attn_groups).
+        """
+        probe = torch.tensor(
+            [1 if tail_hashes else 0, len(tail_hashes)], dtype=torch.int
+        )
+        self.cache._all_reduce_attn_groups(probe, torch.distributed.ReduceOp.MIN)
+        if int(probe[0].item()) == 0:
+            return None
+        return tail_hashes[: int(probe[1].item())]
+
+    def _probe_agreement_needed(self) -> bool:
+        """Whether rank-local match() branches can diverge from other ranks.
+
+        Mirrors _all_reduce_attn_groups's group selection: only when some
+        attn group (or the fall-back TP group) spans >1 rank do the guards
+        above risk hanging the collective in _sync_restorable_prefix. A
+        single-rank cache has nobody to disagree with.
+        """
+        cache = self.cache
+        for group in (cache.attn_cp_group, cache.attn_tp_group):
+            if group is not None and torch.distributed.get_world_size(group=group) > 1:
+                return True
+        return getattr(cache, "tp_world_size", 1) > 1
 
     def _sync_restorable_prefix(
         self, restorable: list[int], *, num_pages: int, device_hit_pages: int

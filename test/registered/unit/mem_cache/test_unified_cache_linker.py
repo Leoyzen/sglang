@@ -1,3 +1,4 @@
+from array import array
 from types import SimpleNamespace
 
 import pytest
@@ -21,6 +22,7 @@ from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
 )
 from sglang.srt.mem_cache.unified_radix_cache import UnifiedRadixCache
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
@@ -443,6 +445,196 @@ def test_component_commit_keeps_only_adopted_pages():
     mapped_full, mapped_swa = mapping.mapping[0]
     assert mapped_full.tolist() == [102, 103, 106, 107]
     assert mapped_swa.tolist() == [202, 203, 206, 207]
+
+
+class TestMatchProbeDomainPreAgreement(CustomTestCase):
+    """match()'s rank-local guards must not strand a peer inside a collective.
+
+    Root cause (production, TP4): match() early-returns on an empty tail
+    BEFORE _sync_restorable_prefix's all_reduce. When one rank's last device
+    node has no hash anchor (empty tail) while peers have tails, the diverging
+    rank advances to the next-round recv_requests broadcast while peers block
+    in _all_reduce_attn_groups — mutual hang. The fix inserts a pre-agreement
+    MIN reduction over the SAME groups so all ranks take the SAME branch.
+
+    The tests fake the 2-rank world: for 2 ranks, all_reduce(MIN) ≡ each
+    rank taking elementwise MIN with the peer's LOCAL probe contribution,
+    which we precompute from the known tails — deterministic on one process.
+    """
+
+    PAGE = 2
+
+    def test_one_side_empty_tail_degrades_both_to_miss(self):
+        """Side A has NO tail (no hash anchor); side B has 3 tail pages.
+
+        Pre-fix behavior: A returns a miss immediately while B enters
+        _sync_restorable_prefix alone — production deadlock. Post-fix: the
+        pre-agreement probe (has_tail=0 on A) forces BOTH sides to return
+        the plain miss together, before any lookup is queued.
+
+        For 2 ranks, all_reduce(MIN) ≡ each rank taking elementwise MIN with
+        the peer's local probe; the peer contributions are precomputed from
+        the known tails (A: has_tail=0 / len 0, B: has_tail=1 / len 3)."""
+        from sglang.srt.mem_cache.base_prefix_cache import MatchResult
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+
+        lookups = []
+
+        def make_wrapper(my_tail, peer_probe):
+            reductions = {"count": 0}
+
+            def reduce_min(tensor, op):
+                assert op == torch.distributed.ReduceOp.MIN
+                reductions["count"] += 1
+                reduced = torch.minimum(tensor, peer_probe)
+                tensor.copy_(reduced)
+
+            cache = SimpleNamespace(
+                page_size=self.PAGE,
+                attn_cp_group=None,
+                attn_tp_group=None,
+                tp_world_size=2,
+                _all_reduce_attn_groups=reduce_min,
+                _components_tuple=(),
+                get_last_hash_value=lambda node: "anchor",
+            )
+            wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
+            wrapper.cache = cache
+            wrapper._match_disabled = False
+            wrapper.hit_markers = {}
+            wrapper.cache_linker = SimpleNamespace(
+                lookup=lambda rid, transfers: (
+                    [] if lookups.append(transfers) is None else []
+                )
+            )
+            wrapper._tail_hashes = lambda key, result, device_hit_len: list(my_tail)
+            return wrapper, reductions
+
+        # Peer probes: A contributes [0, 0] (empty tail), B contributes [1, 3].
+        probe_a = torch.tensor([0, 0], dtype=torch.int)
+        probe_b = torch.tensor([1, 3], dtype=torch.int)
+        wrapper_a, red_a = make_wrapper([], probe_b)
+        wrapper_b, red_b = make_wrapper(["h0", "h1", "h2"], probe_a)
+
+        self.assertTrue(wrapper_a._probe_agreement_needed())
+
+        key = RadixKey(array("q", [1] * 8))
+        req = SimpleNamespace(rid="r", last_node=None)
+
+        def zero_result():
+            return MatchResult(
+                device_indices=torch.zeros(0, dtype=torch.int64),
+                last_device_node=None,
+                last_host_node=None,
+                best_match_node=None,
+            )
+
+        result_a = wrapper_a.match(key, req, zero_result())
+        result_b = wrapper_b.match(key, req, zero_result())
+
+        # Both sides agreed on the shared miss: one pre-agreement probe each,
+        # and NO lookup was queued on either side.
+        self.assertEqual(red_a["count"], 1)
+        self.assertEqual(red_b["count"], 1)
+        self.assertEqual(lookups, [])
+        self.assertEqual(int(result_a.host_hit_length), 0)
+        self.assertEqual(int(result_b.host_hit_length), 0)
+        self.assertNotIn("r", wrapper_a.hit_markers)
+        self.assertNotIn("r", wrapper_b.hit_markers)
+
+    def test_surviving_ranks_clamp_to_shortest_tail(self):
+        """Side A tail = 3 pages, side B tail = 1 page. The MIN-reduced probe
+        length clamps BOTH sides to 1 page, so both probe the same domain and
+        _sync_restorable_prefix reduces over equal lengths (instead of A's
+        longer probe domain silently diverging from B's)."""
+        from sglang.srt.mem_cache.base_prefix_cache import MatchResult
+        from sglang.srt.mem_cache.radix_cache import RadixKey
+
+        lookups = []
+
+        def make_wrapper(my_tail, peer_probe):
+            reductions = {"count": 0}
+
+            def reduce_min(tensor, op):
+                assert op == torch.distributed.ReduceOp.MIN
+                reductions["count"] += 1
+                reduced = torch.minimum(tensor, peer_probe)
+                tensor.copy_(reduced)
+
+            cache = SimpleNamespace(
+                page_size=self.PAGE,
+                attn_cp_group=None,
+                attn_tp_group=None,
+                tp_world_size=2,
+                _all_reduce_attn_groups=reduce_min,
+                _components_tuple=(),
+                get_last_hash_value=lambda node: "anchor",
+            )
+            wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
+            wrapper.cache = cache
+            wrapper._match_disabled = False
+            wrapper.hit_markers = {}
+            wrapper.cache_linker = SimpleNamespace(
+                lookup=lambda rid, transfers: (
+                    [] if lookups.append(transfers) is None else []
+                )
+            )
+            wrapper._tail_hashes = lambda key, result, device_hit_len: list(my_tail)
+            return wrapper, reductions
+
+        # Peer probes: A contributes [1, 3], B contributes [1, 1]; the shared
+        # reduction lands on [1, 1] for both ranks.
+        wrapper_a, red_a = make_wrapper(
+            ["a0", "a1", "a2"], torch.tensor([1, 1], dtype=torch.int)
+        )
+        wrapper_b, red_b = make_wrapper(["b0"], torch.tensor([1, 3], dtype=torch.int))
+
+        # Spy on the restorable-prefix sync to observe the clamped domain.
+        synced_pages = []
+        for wrapper in (wrapper_a, wrapper_b):
+            real_sync = wrapper._sync_restorable_prefix
+            wrapper._sync_restorable_prefix = (
+                lambda restorable, *, num_pages, device_hit_pages, _real=real_sync: (
+                    synced_pages.append(num_pages)
+                    or _real(
+                        restorable,
+                        num_pages=num_pages,
+                        device_hit_pages=device_hit_pages,
+                    )
+                )
+            )
+
+        key = RadixKey(array("q", [1] * 8))
+        req = SimpleNamespace(rid="r", last_node=None)
+
+        def zero_result():
+            return MatchResult(
+                device_indices=torch.zeros(0, dtype=torch.int64),
+                last_device_node=None,
+                last_host_node=None,
+                best_match_node=None,
+            )
+
+        wrapper_a.match(key, req, zero_result())
+        wrapper_b.match(key, req, zero_result())
+
+        # Each side performs TWO reductions: the pre-agreement probe plus the
+        # _sync_restorable_prefix intersection — reaching the second one is
+        # the point (no rank was stranded before the collective).
+        self.assertEqual(red_a["count"], 2)
+        self.assertEqual(red_b["count"], 2)
+        # BOTH sides synced over the clamped 1-page domain (not A's 3 pages).
+        self.assertEqual(synced_pages, [1, 1])
+
+    def test_single_rank_cache_skips_collective(self):
+        """World size 1: no attn/TP group spans multiple ranks, so the
+        pre-agreement collective must be skipped entirely (no reduction
+        overhead) and the plain empty-tail miss stays."""
+        wrapper = UnifiedCacheLinkerWrapper.__new__(UnifiedCacheLinkerWrapper)
+        wrapper.cache = SimpleNamespace(
+            attn_cp_group=None, attn_tp_group=None, tp_world_size=1
+        )
+        self.assertFalse(wrapper._probe_agreement_needed())
 
 
 if __name__ == "__main__":
