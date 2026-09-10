@@ -36,12 +36,18 @@ Keeping the model wrapper in the chain preserves model-specific delegation
 
 from __future__ import annotations
 
+import logging
 from typing import TYPE_CHECKING, Optional
 
+import torch
+
+from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
+
 if TYPE_CHECKING:
-    from sglang.srt.layers.dcp.metadata import DecodeContextParallelMetadata
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+logger = logging.getLogger(__name__)
 
 
 def prepare_dcp_extend_metadata(
@@ -93,3 +99,120 @@ def prepare_dcp_extend_metadata(
         create_chunked_prefix_cache_kv_indices,
     )
     return forward_batch.attn_dcp_metadata
+
+
+class PrefillDcpBuffers:
+    """Persistent static buffers for the DCP intermediates captured prefill
+    segments read (opsx 2.3, design D1).
+
+    The captured segments address the ``DecodeContextParallelMetadata``
+    tensors by data pointer, so the storage must be allocated ONCE, before
+    capture, and refreshed in place per replay — never reallocated (spec:
+    'No in-graph allocation of DCP intermediates'). This mirrors how decode
+    graph replay keeps ``dcp_kv_mask`` live in its static input buffers
+    (#18167).
+
+    Which tensors the captured segments read, identified from the DCP
+    consumers active during a prefill (extend) forward:
+
+    - ``dcp_kv_indptr`` / ``dcp_kv_indices``: consumed by paged prefill
+      attention planning (flashinfer_mla_backend
+      ``forward_extend`` reads ``attn_dcp_metadata.dcp_kv_indptr`` /
+      ``.dcp_kv_indices`` for the wrapper plan).
+    - ``dcp_kv_buffer``: the cross-rank gathered KV store read as ``k_buf``
+      by paged prefill attention (flashinfer_mla_backend) and written by
+      ``all_gather_kv_cache_for_mla_extend`` / ``for_mha_extend`` in the
+      model's attention prepare (may sit inside pre-attention captured
+      segments).
+    - ``dcp_local_prefix_kv_indices``: the rank-local ownership indices fed
+      to ``get_mla_kv_buffer`` by the same gather helpers — i.e. the KV
+      ownership read of pre-attention segments (#33253 class).
+    - ``dcp_extend_prefix_lens_sum`` (host int): bounds the prefix portion
+      of ``dcp_kv_buffer``.
+
+    ``dcp_kv_mask`` (HIP decode write mask) is carried by the batch and
+    already refreshed per replay by the scheduler path; it is not
+    prefill-graph-owned here.
+    """
+
+    def __init__(
+        self,
+        *,
+        device: torch.device,
+        max_bs: int,
+        max_num_tokens: int,
+        kv_cache_dim: int,
+        kv_cache_dtype: torch.dtype,
+    ) -> None:
+        self.device = torch.device(device)
+        self.max_bs = max_bs
+        self.max_num_tokens = max_num_tokens
+        self.kv_cache_dim = kv_cache_dim
+        self.kv_cache_dtype = kv_cache_dtype
+        with torch.device(self.device):
+            # indptr: bs+1 entries; indices: flat seq_lens_sum entries
+            # (bounded by max_num_tokens); prefix indices: also bounded by
+            # max_num_tokens (prefix ⊆ seq_len ⊆ max_num_tokens per bucket;
+            # an aggregate bucket's seq_lens_sum == its token count).
+            self.dcp_kv_indptr = torch.zeros((max_bs + 1,), dtype=torch.int32)
+            self.dcp_kv_indices = torch.zeros((max_num_tokens,), dtype=torch.int32)
+            self.dcp_local_prefix_kv_indices = torch.zeros(
+                (max_num_tokens,), dtype=torch.int32
+            )
+            self.dcp_kv_buffer = torch.zeros(
+                (max_num_tokens, 1, kv_cache_dim), dtype=kv_cache_dtype
+            )
+        # Host-side scalar refreshed with the buffers.
+        self.dcp_extend_prefix_lens_sum = 0
+
+    def bind(self) -> DecodeContextParallelMetadata:
+        """Build a metadata object whose tensors ARE views of this storage.
+
+        The views keep stable data pointers across capture and replay; the
+        planner/refresh path writes into the slices, never reassigns them.
+        """
+        return DecodeContextParallelMetadata(
+            dcp_kv_indptr=self.dcp_kv_indptr,
+            dcp_kv_buffer=self.dcp_kv_buffer,
+            dcp_kv_indices=self.dcp_kv_indices,
+            dcp_local_prefix_kv_indices=self.dcp_local_prefix_kv_indices,
+            dcp_extend_prefix_lens_sum=self.dcp_extend_prefix_lens_sum,
+        )
+
+    def refresh_from(
+        self, metadata: DecodeContextParallelMetadata, *, bs: int
+    ) -> DecodeContextParallelMetadata:
+        """Copy freshly computed values into the static views, in place.
+
+        ``metadata`` is the planner output for the current batch; every
+        field is written with copy_/assignment into the persistent slice —
+        no reallocation. Returns a metadata object exposing the refreshed
+        static views (the object the captured segments already address).
+        """
+        self.dcp_kv_indptr.zero_()
+        assert metadata.dcp_kv_indptr is not None
+        width = min(int(metadata.dcp_kv_indptr.shape[0]), self.max_bs + 1)
+        self.dcp_kv_indptr[:width].copy_(metadata.dcp_kv_indptr[:width])
+
+        self.dcp_kv_indices.zero_()
+        assert metadata.dcp_kv_indices is not None
+        width = min(int(metadata.dcp_kv_indices.shape[0]), self.max_num_tokens)
+        self.dcp_kv_indices[:width].copy_(metadata.dcp_kv_indices[:width])
+
+        self.dcp_local_prefix_kv_indices.zero_()
+        if metadata.dcp_local_prefix_kv_indices is not None:
+            width = min(
+                int(metadata.dcp_local_prefix_kv_indices.shape[0]),
+                self.max_num_tokens,
+            )
+            self.dcp_local_prefix_kv_indices[:width].copy_(
+                metadata.dcp_local_prefix_kv_indices[:width]
+            )
+
+        self.dcp_kv_buffer.zero_()
+        assert metadata.dcp_kv_buffer is not None
+        rows = min(int(metadata.dcp_kv_buffer.shape[0]), self.max_num_tokens)
+        self.dcp_kv_buffer[:rows].copy_(metadata.dcp_kv_buffer[:rows])
+
+        self.dcp_extend_prefix_lens_sum = int(metadata.dcp_extend_prefix_lens_sum or 0)
+        return self.bind()

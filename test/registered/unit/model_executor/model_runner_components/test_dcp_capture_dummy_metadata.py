@@ -97,8 +97,8 @@ class _RecordingModel:
         return meta
 
 
-def _make_runner(store, *, attn_dcp_size=2):
-    """A PrefillCudaGraphRunner skeleton with only what 2.2 touches."""
+def _make_runner(store, *, attn_dcp_size=2, dcp_buffers=None):
+    """A PrefillCudaGraphRunner skeleton with only what 2.2/2.3 touch."""
     runner = PrefillCudaGraphRunner.__new__(PrefillCudaGraphRunner)
     model = _RecordingModel(store)
     runner.model_runner = SimpleNamespace(
@@ -108,6 +108,7 @@ def _make_runner(store, *, attn_dcp_size=2):
         device="cpu",
         attn_backend=SimpleNamespace(name="fake"),
     )
+    runner.dcp_buffers = dcp_buffers
     return runner
 
 

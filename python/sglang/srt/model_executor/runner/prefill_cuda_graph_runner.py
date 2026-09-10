@@ -90,6 +90,9 @@ from sglang.srt.model_executor.forward_batch_info import (
     prefill_graph_tolerates_sum_len,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.model_runner_components.dcp_prefill_metadata import (
+    PrefillDcpBuffers,
+)
 from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     BaseCudaGraphRunner,
     freeze_gc,
@@ -520,6 +523,32 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 self.capture_num_tokens, server_args
             )
             self.prefill_cp_bcg_input = PrefillCPBCGInput.create(self)
+
+        # Persistent DCP metadata buffers (opsx 2.3): allocated BEFORE
+        # capture, owned alongside the runner's static input buffers. The
+        # captured segments address these by pointer; replay refreshes them
+        # in place (see load_batch). Allocated only when DCP is active —
+        # inert otherwise.
+        self.dcp_buffers: Optional[PrefillDcpBuffers] = None
+        if model_runner.ps.attn_dcp_size > 1 and hasattr(
+            model_runner.model, "prepare_context_parallel_metadata_for_dcp"
+        ):
+            kv_buffer_shape = model_runner.token_to_kv_pool.get_kv_buffer_shape()[0]
+            self.dcp_buffers = PrefillDcpBuffers(
+                device=torch.device(self.device),
+                max_bs=self.max_bs,
+                max_num_tokens=self.max_num_tokens,
+                kv_cache_dim=int(kv_buffer_shape[-1]),
+                kv_cache_dtype=model_runner.kv_cache_dtype,
+            )
+            logger.info(
+                "Allocated persistent prefill DCP metadata buffers: "
+                "bs=%d, max_num_tokens=%d, kv_cache_dim=%d, dtype=%s.",
+                self.max_bs,
+                self.max_num_tokens,
+                int(kv_buffer_shape[-1]),
+                model_runner.kv_cache_dtype,
+            )
 
         # Static hidden_states buffer giving the captured graph a stable
         # address; load_batch refreshes it from live spec_info at replay.
@@ -1144,9 +1173,11 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         would bake a DCP-less forward into the graph (design D1/D4, spec
         'DCP metadata present at capture').
 
-        The shared builder runs inside the active forward context (the
-        caller holds one), so it resolves the req/token pools exactly like
-        the eager path.
+        With persistent buffers (opsx 2.3) the fresh planner output is
+        copied into the static views, and the metadata the capture binds is
+        the persistent one — same addresses the captured segments and every
+        later replay address. Requires an active forward context (the
+        caller holds one).
         """
         if self.model_runner.ps.attn_dcp_size <= 1:
             return None
@@ -1154,7 +1185,14 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             prepare_dcp_extend_metadata,
         )
 
-        return prepare_dcp_extend_metadata(self.model_runner, forward_batch)
+        fresh = prepare_dcp_extend_metadata(self.model_runner, forward_batch)
+        if fresh is None:
+            return None
+        if self.dcp_buffers is not None:
+            bound = self.dcp_buffers.refresh_from(fresh, bs=forward_batch.batch_size)
+            forward_batch.attn_dcp_metadata = bound
+            return bound
+        return fresh
 
     def can_replay_locally(
         self,
