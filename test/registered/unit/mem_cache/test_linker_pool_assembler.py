@@ -348,13 +348,18 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         self.assertEqual(mamba._row_span, 1)
 
     def _mamba_assembler_target(self):
+        """Latent-per-layer (MLA/DSA-shaped) mamba-hybrid target — the ONLY
+        shape the packed-draft mapping supports. Models the GLM-5.3-Flash
+        family: one flat latent buffer per full-attention layer, so the
+        flattened buffer count equals len(full_layer_mapping) and the packed
+        tuple (target_comp, N + depth) indexes draft latents, not v-buffers."""
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
         kvcache = HybridLinearKVPool.__new__(HybridLinearKVPool)
         kvcache.full_attention_layer_id_mapping = {0: 0, 2: 1, 4: 2}
         kvcache.full_kv_pool = SimpleNamespace(
-            k_buffer=[torch.zeros((16, 5), dtype=torch.uint8) for _ in range(3)],
-            v_buffer=[torch.zeros((16, 7), dtype=torch.uint8) for _ in range(3)],
+            # Flat latent list: 1 buffer per mapped layer (MLA/DSA layout).
+            kv_buffer=[torch.zeros((16, 5), dtype=torch.uint8) for _ in range(3)],
         )
         params = SimpleNamespace(
             req_to_token_pool=SimpleNamespace(
@@ -390,16 +395,23 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         )
         # Draft index rows only land when the TARGET carries its own DSA
         # index sidecar AND the tree page_size is 64 (see the INDEXER entry
-        # gating in _build_mamba_device_pool_group); this MHA-shaped target
-        # at page_size=1 has none, so only KV + MAMBA exist.
+        # gating in _build_mamba_device_pool_group); this latent target at
+        # page_size=1 has none, so only KV + MAMBA exist.
         self.assertEqual(set(group.entry_map), {PoolName.KV, PoolName.MAMBA})
         kv = group.entry_map[PoolName.KV]
-        # Draft depth 0 attaches to the first mapped target layer (gid 0).
+        # Draft depth 0 attaches to the first mapped target layer (gid 0);
+        # device layer 3 is the draft latent (3 target latents + depth 0).
         self.assertEqual(kv.layer_mapping[0], (0, 3))
         self.assertEqual(kv.layer_mapping[2], 1)
         _, sizes, _ = kv.get_prepared_layer_range_meta(kv.prepare_locations(torch.tensor([0])), 0)
         # Layer 0 resolves TWO buffers: target latent + draft latent.
         self.assertEqual(len(sizes[0]), 2)
+        # The packed draft pointer must be the DRAFT buffer, not a v-buffer:
+        # with an MHA-shaped target this index would silently resolve into
+        # the target's k/v split (regression pinned by
+        # test_mamba_mha_layout_rejects_packed_draft).
+        draft_buffer = params.mtp_draft_device_pools[0].kv_buffer[0]
+        self.assertIs(kv.kv_buffer[3], draft_buffer)
 
     def test_mamba_packs_hybrid_wrapper_draft_pool_without_flat_attrs(self):
         """Regression: a mamba-family NextN draft (Qwen3Next / NemotronH /
@@ -431,7 +443,7 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         _, sizes, _ = kv.get_prepared_layer_range_meta(kv.prepare_locations(torch.tensor([0])), 0)
         self.assertEqual(len(sizes[0]), 2)
 
-        # Component-GROUP full pool (plain MHA k/v per layer) flattens too.
+        # Component-GROUP full pool (nested per-layer lists) flattens too.
         kvcache2, params2 = self._mamba_assembler_target()
         wrapper2 = HybridLinearKVPool.__new__(HybridLinearKVPool)
         wrapper2.full_kv_pool = SimpleNamespace(
@@ -449,6 +461,45 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         self.assertEqual(kv2.layer_mapping[0], (0, 3))
         self.assertEqual(kv2.layer_mapping[2], (1, 4))
         self.assertEqual(kv2.layer_mapping[4], 2)
+
+    def test_mamba_mha_layout_rejects_packed_draft(self):
+        """An MHA-layout target (separate k_buffer/v_buffer groups → 2N flat
+        buffers) must fail LOUDLY at assembly instead of mis-indexing: the
+        packed tuple (target_comp, N + depth) would resolve into the target's
+        v-buffers (index 3 = v[0]) instead of the draft buffers, corrupting
+        every packed restore. Startup must refuse, not mis-store."""
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
+
+        kvcache, params = self._mamba_assembler_target()
+        # Swap the latent list for the k/v split: 3 k + 3 v = 6 flat buffers
+        # for 3 mapped layers.
+        kvcache.full_kv_pool = SimpleNamespace(
+            k_buffer=[torch.zeros((16, 5), dtype=torch.uint8) for _ in range(3)],
+            v_buffer=[torch.zeros((16, 7), dtype=torch.uint8) for _ in range(3)],
+        )
+        params.mtp_draft_device_pools = (
+            SimpleNamespace(
+                page_size=1,
+                kv_buffer=[torch.zeros((16, 9), dtype=torch.uint8)],
+            ),
+        )
+        with self.assertRaisesRegex(NotImplementedError, "MHA-layout mamba-hybrid targets"):
+            resolve_hybrid_device_pool_group(
+                kvcache=kvcache,
+                page_size=1,
+                params=params,
+                components={ComponentType.FULL, ComponentType.MAMBA},
+            )
+        # The no-draft path stays untouched: MHA-layout targets without draft
+        # pools must keep assembling (their unpumped mapping is index-exact).
+        params.mtp_draft_device_pools = ()
+        group = resolve_hybrid_device_pool_group(
+            kvcache=kvcache,
+            page_size=1,
+            params=params,
+            components={ComponentType.FULL, ComponentType.MAMBA},
+        )
+        self.assertEqual(set(group.entry_map), {PoolName.KV, PoolName.MAMBA})
 
     def test_hicache_draft_plan_reaches_build_kv_cache(self):
         """The EAGLE draft pools must flow from the plan into tree-cache params.

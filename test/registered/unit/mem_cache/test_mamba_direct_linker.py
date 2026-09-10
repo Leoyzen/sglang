@@ -47,11 +47,30 @@ def _fake_mamba_pool():
 
 
 def _fake_hybrid_kvcache():
-    """HybridLinearKVPool stand-in with MHA full pool buffers."""
+    """HybridLinearKVPool stand-in with MHA full pool buffers (k/v split).
+
+    NOTE: MHA-layout targets are rejected by the packed-draft mapping
+    (NotImplementedError); packed-draft tests must use
+    :func:`_fake_latent_hybrid_kvcache` instead."""
 
     class _FullPool:
         k_buffer = [torch.zeros((16, 5), dtype=torch.uint8) for _ in range(_NUM_FULL_LAYERS)]
         v_buffer = [torch.zeros((16, 7), dtype=torch.uint8) for _ in range(_NUM_FULL_LAYERS)]
+
+    kvcache = SimpleNamespace(
+        full_attention_layer_id_mapping={gid: i for i, gid in enumerate([0, 2, 4])},
+        full_kv_pool=_FullPool(),
+    )
+    return kvcache
+
+
+def _fake_latent_hybrid_kvcache():
+    """Latent-per-layer (MLA/DSA-shaped) target: ONE flat buffer per mapped
+    full-attention layer — the only layout the packed-draft mapping supports
+    (flattened buffer count == len(full_attention_layer_id_mapping))."""
+
+    class _FullPool:
+        kv_buffer = [torch.zeros((16, 5), dtype=torch.uint8) for _ in range(_NUM_FULL_LAYERS)]
 
     kvcache = SimpleNamespace(
         full_attention_layer_id_mapping={gid: i for i, gid in enumerate([0, 2, 4])},
@@ -495,7 +514,9 @@ class TestMambaPackedDraftMapping(CustomTestCase):
     def test_packed_draft_group_resolves_all_layers(self):
         params = _fake_params()
         params.mtp_draft_device_pools = (draft_pool := _fake_draft_pool(),)
-        group = _build_mamba_device_pool_group(_fake_hybrid_kvcache(), page_size=1, params=params, mtp_draft_device_pools=(draft_pool,))
+        group = _build_mamba_device_pool_group(
+            _fake_latent_hybrid_kvcache(), page_size=1, params=params, mtp_draft_device_pools=(draft_pool,)
+        )
 
         kv = group.entry_map[PoolName.KV]
         # All flattened components must be real tensors (not nested lists).
@@ -503,7 +524,9 @@ class TestMambaPackedDraftMapping(CustomTestCase):
             self.assertIsInstance(buffer, torch.Tensor)
 
         # Target full layers are global ids {0, 2, 4}; the single draft layer
-        # attaches to the first (lowest-id) target layer.
+        # attaches to the first (lowest-id) target layer. Device layer 3 is
+        # the draft latent (3 target latents + depth 0), NOT a target v-buffer
+        # (this target has no k/v split; the MHA layout refuses packed drafts).
         mapping = kv.layer_mapping
         self.assertIn(0, mapping)
         self.assertEqual(mapping[0], (0, 3))  # (target comp 0, device layer 3)
@@ -518,6 +541,9 @@ class TestMambaPackedDraftMapping(CustomTestCase):
             self.assertIsNotNone(meta, f"transfer layer {key} unresolved")
             ptrs, sizes, offsets = meta
             self.assertTrue(all(p != 0 for p in [x for row in ptrs for x in row]))
+
+        # The packed depth resolves the DRAFT buffer itself.
+        self.assertIs(kv.kv_buffer[3], draft_pool.kv_buffer[0])
 
     def test_identity_key_path_unchanged(self):
         """Pure-DSA-style identity mappings must keep their key space."""

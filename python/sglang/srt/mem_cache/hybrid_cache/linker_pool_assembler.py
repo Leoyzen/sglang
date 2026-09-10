@@ -454,10 +454,23 @@ def _build_mamba_device_pool_group(
     if draft_kv_buffers and draft_indexer_buffers and len(draft_kv_buffers) != len(draft_indexer_buffers):
         raise ValueError("Mamba-hybrid MTP KV and indexer draft layer counts must match.")
     draft_layer_num = len(draft_kv_buffers)
+
+    # Flatten the target's component groups BEFORE building the packed
+    # mapping: the packed tuple indexes the flat [*target, *draft] buffer
+    # list, so the draft domain must start at len(_target_kv_buffers). The
+    # layer count coincides only for 1-latent-per-layer (MLA/DSA) targets;
+    # an MHA-layout target (separate k/v groups) would flatten to 2*N buffers
+    # and the packed tuple would index v-buffers instead of draft buffers.
+    _target_kv_buffers = [buffer for group in _mamba_kv_components(kvcache) for buffer in group]
+    if draft_kv_buffers and len(_target_kv_buffers) != len(full_layer_mapping):
+        raise NotImplementedError(
+            "MHA-layout mamba-hybrid targets with the direct linker packed-draft "
+            "mapping are not supported yet (k/v split buffers)"
+        )
     kv_layer_mapping = (
         _with_packed_draft_mapping(
             dict(full_layer_mapping),
-            target_device_layer_num=len(full_layer_mapping),
+            target_device_layer_num=len(_target_kv_buffers),
             draft_layer_num=draft_layer_num,
         )
         if draft_kv_buffers
@@ -466,10 +479,7 @@ def _build_mamba_device_pool_group(
 
     # Pack target + draft per-layer buffers into ONE component group so the
     # packed mapping tuple (target_comp, N + depth) resolves both indices
-    # inside the same group (same scheme as the pure-DSA KV entry). NOTE:
-    # _mamba_kv_components returns component GROUPS (lists of per-layer
-    # tensors), so flatten groups first instead of unpacking them as units.
-    _target_kv_buffers = [buffer for group in _mamba_kv_components(kvcache) for buffer in group]
+    # inside the same group (same scheme as the pure-DSA KV entry).
     entries = [
         DevicePoolEntry(
             name=PoolName.KV,
