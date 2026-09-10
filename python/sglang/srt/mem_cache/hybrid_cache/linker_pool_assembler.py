@@ -407,13 +407,13 @@ def _build_mamba_device_pool_group(
     # P2: pack the EAGLE draft pools alongside the target so restores cover
     # the draft's KV and index rows too. Without this, a store hit gives the
     # target model the context but the draft has never seen it (#31600 form):
-    # speculative acceptance collapses toward token-by-token decoding. Draft
-    # pools are HybridLinearKVPool wrappers — unwrap to full_kv_pool (cf. the
-    # HiCache strategy in hybrid_pool_assembler.py) and keep only pools that
-    # actually carry an index sidecar.
-    draft_pools = tuple(getattr(pool, "full_kv_pool", pool) for pool in mtp_draft_device_pools)
-    draft_kv_buffers = [buffer for pool in draft_pools for buffer in pool.kv_buffer]
-    draft_indexer_buffers = [buffer for pool in draft_pools for buffer in getattr(pool, "index_k_with_scale_buffer", ())]
+    # speculative acceptance collapses toward token-by-token decoding.
+    # Draft pools are HybridLinearKVPool wrappers. Their .kv_buffer /
+    # .index_k_with_scale_buffer are flat per-layer tensor lists (same shape
+    # the pure-DSA group consumes), so take them directly instead of unwrapping
+    # to full_kv_pool — unwrapping changes kv_buffer into component groups.
+    draft_kv_buffers = [buffer for pool in mtp_draft_device_pools for buffer in pool.kv_buffer]
+    draft_indexer_buffers = [buffer for pool in mtp_draft_device_pools for buffer in getattr(pool, "index_k_with_scale_buffer", ())]
     if draft_kv_buffers and len(draft_kv_buffers) != len(draft_indexer_buffers):
         raise ValueError("Mamba-hybrid MTP KV and indexer draft layer counts must match.")
     draft_layer_num = len(draft_kv_buffers)
@@ -427,12 +427,18 @@ def _build_mamba_device_pool_group(
         else full_layer_mapping
     )
 
+    # Pack target + draft per-layer buffers into ONE component group so the
+    # packed mapping tuple (target_comp, N + depth) resolves both indices
+    # inside the same group (same scheme as the pure-DSA KV entry). NOTE:
+    # _mamba_kv_components returns component GROUPS (lists of per-layer
+    # tensors), so flatten groups first instead of unpacking them as units.
+    _target_kv_buffers = [buffer for group in _mamba_kv_components(kvcache) for buffer in group]
     entries = [
         DevicePoolEntry(
             name=PoolName.KV,
             indices_from_pool=PoolName.KV,
             device_pool=kvcache,
-            components=[[*_mamba_kv_components(kvcache), *draft_kv_buffers]],
+            components=[[*_target_kv_buffers, *draft_kv_buffers]],
             layer_mapping=kv_layer_mapping,
             page_size=page_size,
             rows_are_pages=False,
