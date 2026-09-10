@@ -45,7 +45,11 @@ def _fake_mamba_pool():
 
 
 def _fake_hybrid_kvcache():
-    """HybridLinearKVPool stand-in with MHA full pool buffers."""
+    """HybridLinearKVPool stand-in with MHA full pool buffers (k/v split).
+
+    NOTE: MHA-layout targets are rejected by the packed-draft mapping
+    (NotImplementedError); packed-draft tests must use
+    :func:`_fake_latent_hybrid_kvcache` instead."""
 
     class _FullPool:
         k_buffer = [
@@ -53,6 +57,23 @@ def _fake_hybrid_kvcache():
         ]
         v_buffer = [
             torch.zeros((16, 7), dtype=torch.uint8) for _ in range(_NUM_FULL_LAYERS)
+        ]
+
+    kvcache = SimpleNamespace(
+        full_attention_layer_id_mapping={gid: i for i, gid in enumerate([0, 2, 4])},
+        full_kv_pool=_FullPool(),
+    )
+    return kvcache
+
+
+def _fake_latent_hybrid_kvcache():
+    """Latent-per-layer (MLA/DSA-shaped) target: ONE flat buffer per mapped
+    full-attention layer — the only layout the packed-draft mapping supports
+    (flattened buffer count == len(full_attention_layer_id_mapping))."""
+
+    class _FullPool:
+        kv_buffer = [
+            torch.zeros((16, 5), dtype=torch.uint8) for _ in range(_NUM_FULL_LAYERS)
         ]
 
     kvcache = SimpleNamespace(
