@@ -523,12 +523,13 @@ def _fake_draft_pool():
 
     draft_layer_num = 1
 
-    class _DraftFullPool:
-        k_buffer = [
-            torch.zeros((16, 5), dtype=torch.uint8) for _ in range(draft_layer_num)
-        ]
-        v_buffer = [
-            torch.zeros((16, 7), dtype=torch.uint8) for _ in range(draft_layer_num)
+    # The packed-draft assembler reads FLAT per-layer tensor lists off the
+    # draft pool object itself (pool.kv_buffer / pool.index_k_with_scale_buffer),
+    # mirroring how the pure-DSA group consumes them. Packed drafts are
+    # DSA-style: ONE latent buffer per layer, 1:1 with the index sidecar.
+    class _DraftPool:
+        kv_buffer = [
+            torch.zeros((16, 9), dtype=torch.uint8) for _ in range(draft_layer_num)
         ]
         index_k_with_scale_buffer = [
             torch.zeros((4, 11), dtype=torch.uint8) for _ in range(draft_layer_num)
@@ -536,7 +537,7 @@ def _fake_draft_pool():
         use_dsa = True
         page_size = 1
 
-    pool = SimpleNamespace(full_kv_pool=_DraftFullPool(), page_size=1)
+    pool = _DraftPool()
     assert isinstance(HybridLinearKVPool, object)  # keep import meaningful
     return pool
 
@@ -553,9 +554,12 @@ class TestMambaPackedDraftMapping(CustomTestCase):
 
     def test_packed_draft_group_resolves_all_layers(self):
         params = _fake_params()
-        params.mtp_draft_device_pools = (_fake_draft_pool(),)
+        params.mtp_draft_device_pools = (draft_pool := _fake_draft_pool(),)
         group = _build_mamba_device_pool_group(
-            _fake_hybrid_kvcache(), page_size=1, params=params
+            _fake_latent_hybrid_kvcache(),
+            page_size=1,
+            params=params,
+            mtp_draft_device_pools=(draft_pool,),
         )
 
         kv = group.entry_map[PoolName.KV]
@@ -564,99 +568,26 @@ class TestMambaPackedDraftMapping(CustomTestCase):
             self.assertIsInstance(buffer, torch.Tensor)
 
         # Target full layers are global ids {0, 2, 4}; the single draft layer
-        # attaches to the first (lowest-id) target layer.
+        # attaches to the first (lowest-id) target layer. Device layer 3 is
+        # the draft latent (3 target latents + depth 0), NOT a target v-buffer
+        # (this target has no k/v split; the MHA layout refuses packed drafts).
         mapping = kv.layer_mapping
         self.assertIn(0, mapping)
         self.assertEqual(mapping[0], (0, 3))  # (target comp 0, device layer 3)
         self.assertEqual(mapping[2], 1)
         self.assertEqual(mapping[4], 2)
 
-        # Transfer layers 0..3 must all resolve to per-layer pointer views.
-        for layer in range(4):
-            meta = kv.get_prepared_layer_range_meta(
-                kv.prepare_locations(torch.tensor([2])), layer
-            )
-            self.assertIsNotNone(meta, f"transfer layer {layer} unresolved")
+        # Every mapping key (global layer ids; the packed key resolves both its
+        # target and draft buffers) must resolve to non-zero pointer views.
+        locations = kv.prepare_locations(torch.tensor([2]))
+        for key in kv.layer_mapping:
+            meta = kv.get_prepared_layer_range_meta(locations, key)
+            self.assertIsNotNone(meta, f"transfer layer {key} unresolved")
             ptrs, sizes, offsets = meta
             self.assertTrue(all(p != 0 for p in [x for row in ptrs for x in row]))
 
-    def test_identity_key_path_unchanged(self):
-        """Pure-DSA-style identity mappings must keep their key space."""
-        from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
-            _with_packed_draft_mapping,
-        )
-
-        mapping = _with_packed_draft_mapping(
-            {l: l for l in range(4)},
-            target_device_layer_num=4,
-            draft_layer_num=1,
-        )
-        self.assertEqual(mapping, {0: (0, 4), 1: 1, 2: 2, 3: 3})
-
-
-def _fake_draft_pool():
-    """MTP draft HybridLinearKVPool wrapper: full_kv_pool carries MHA buffers
-    plus a DSA index sidecar with one buffer per draft layer."""
-    from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
-
-    draft_layer_num = 1
-
-    class _DraftFullPool:
-        k_buffer = [
-            torch.zeros((16, 5), dtype=torch.uint8) for _ in range(draft_layer_num)
-        ]
-        v_buffer = [
-            torch.zeros((16, 7), dtype=torch.uint8) for _ in range(draft_layer_num)
-        ]
-        index_k_with_scale_buffer = [
-            torch.zeros((4, 11), dtype=torch.uint8) for _ in range(draft_layer_num)
-        ]
-        use_dsa = True
-        page_size = 1
-
-    pool = SimpleNamespace(full_kv_pool=_DraftFullPool(), page_size=1)
-    assert isinstance(HybridLinearKVPool, object)  # keep import meaningful
-    return pool
-
-
-class TestMambaPackedDraftMapping(CustomTestCase):
-    """The packed-draft path must key draft depths by ACTUAL mapping keys.
-
-    Regression: _with_packed_draft_mapping assumed contiguous local keys
-    (0..N-1) and crashed with KeyError: 0 on the mamba-hybrid path, where
-    full_attention_layer_id_mapping is keyed by interleaved global layer ids
-    (layer 0 is a mamba layer). It also flattened component GROUPS as single
-    buffers, crashing _row_count with AttributeError ('list' has no shape).
-    """
-
-    def test_packed_draft_group_resolves_all_layers(self):
-        params = _fake_params()
-        params.mtp_draft_device_pools = (_fake_draft_pool(),)
-        group = _build_mamba_device_pool_group(
-            _fake_hybrid_kvcache(), page_size=1, params=params
-        )
-
-        kv = group.entry_map[PoolName.KV]
-        # All flattened components must be real tensors (not nested lists).
-        for buffer in kv.kv_buffer:
-            self.assertIsInstance(buffer, torch.Tensor)
-
-        # Target full layers are global ids {0, 2, 4}; the single draft layer
-        # attaches to the first (lowest-id) target layer.
-        mapping = kv.layer_mapping
-        self.assertIn(0, mapping)
-        self.assertEqual(mapping[0], (0, 3))  # (target comp 0, device layer 3)
-        self.assertEqual(mapping[2], 1)
-        self.assertEqual(mapping[4], 2)
-
-        # Transfer layers 0..3 must all resolve to per-layer pointer views.
-        for layer in range(4):
-            meta = kv.get_prepared_layer_range_meta(
-                kv.prepare_locations(torch.tensor([2])), layer
-            )
-            self.assertIsNotNone(meta, f"transfer layer {layer} unresolved")
-            ptrs, sizes, offsets = meta
-            self.assertTrue(all(p != 0 for p in [x for row in ptrs for x in row]))
+        # The packed depth resolves the DRAFT buffer itself.
+        self.assertIs(kv.kv_buffer[3], draft_pool.kv_buffer[0])
 
     def test_identity_key_path_unchanged(self):
         """Pure-DSA-style identity mappings must keep their key space."""
