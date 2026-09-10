@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Callable, NamedTuple, Optional
 
@@ -1730,7 +1731,9 @@ class _MambaStrategy(StackStrategy):
         )
 
 
-def _swa_layer_mappings(kvcache) -> tuple[dict[int, int], dict[int, int]]:
+def _swa_layer_mappings(
+    kvcache,
+) -> tuple[dict[int, int | Sequence[int]], dict[int, int | Sequence[int]]]:
     full = {
         gid - kvcache.start_layer: lid
         for gid, (lid, is_swa) in kvcache.layers_mapping.items()
