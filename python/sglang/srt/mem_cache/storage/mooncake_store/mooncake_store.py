@@ -48,9 +48,7 @@ class MooncakeHostTensorAllocator(HostTensorAllocator):
         # 0 means "not this check's budget to spend", not "no hugepages".
         return 0
 
-    def allocate(
-        self, dims: tuple, dtype: torch.dtype, device: str = "cpu"
-    ) -> torch.Tensor:
+    def allocate(self, dims: tuple, dtype: torch.dtype, device: str = "cpu") -> torch.Tensor:
         """
         Allocates memory using MooncakeHostMemAllocator and wraps it in a PyTorch tensor.
         """
@@ -83,9 +81,7 @@ def _parse_global_segment_size(value) -> int:
         if s.endswith("gb"):
             num = s[:-2].strip()
             if not num:
-                raise ValueError(
-                    "Invalid global_segment_size: missing number before 'gb'"
-                )
+                raise ValueError("Invalid global_segment_size: missing number before 'gb'")
             return int(num) * 1024 * 1024 * 1024
         return int(s)
     return int(value)
@@ -118,9 +114,7 @@ class MooncakeStoreConfig:
     def from_file() -> "MooncakeStoreConfig":
         """Load the config from a JSON file."""
         if not envs.SGLANG_HICACHE_MOONCAKE_CONFIG_PATH.is_set():
-            raise RuntimeError(
-                f"Config file path not set. Please set {envs.SGLANG_HICACHE_MOONCAKE_CONFIG_PATH.name}"
-            )
+            raise RuntimeError(f"Config file path not set. Please set {envs.SGLANG_HICACHE_MOONCAKE_CONFIG_PATH.name}")
         file_path = envs.SGLANG_HICACHE_MOONCAKE_CONFIG_PATH.get()
         try:
             with open(file_path) as fin:
@@ -128,50 +122,23 @@ class MooncakeStoreConfig:
         except Exception as e:
             raise RuntimeError(f"Failed to load config from {file_path}: {str(e)}")
 
-        if (
-            "master_server_address" not in config
-            and "client_server_address" not in config
-        ):
-            raise ValueError(
-                "Either master_server_address or client_server_address is required in config file"
-            )
+        if "master_server_address" not in config and "client_server_address" not in config:
+            raise ValueError("Either master_server_address or client_server_address is required in config file")
 
         return MooncakeStoreConfig(
-            local_hostname=config.get(
-                "local_hostname", envs.MOONCAKE_LOCAL_HOSTNAME.default
-            ),
-            metadata_server=config.get(
-                "metadata_server", envs.MOONCAKE_TE_META_DATA_SERVER.default
-            ),
-            global_segment_size=_parse_global_segment_size(
-                config.get(
-                    "global_segment_size", envs.MOONCAKE_GLOBAL_SEGMENT_SIZE.default
-                )
-            ),
+            local_hostname=config.get("local_hostname", envs.MOONCAKE_LOCAL_HOSTNAME.default),
+            metadata_server=config.get("metadata_server", envs.MOONCAKE_TE_META_DATA_SERVER.default),
+            global_segment_size=_parse_global_segment_size(config.get("global_segment_size", envs.MOONCAKE_GLOBAL_SEGMENT_SIZE.default)),
             protocol=config.get("protocol", envs.MOONCAKE_PROTOCOL.default),
             device_name=config.get("device_name", envs.MOONCAKE_DEVICE.default),
-            master_server_address=config.get(
-                "master_server_address", envs.MOONCAKE_MASTER.default
-            ),
-            master_metrics_port=config.get(
-                "master_metrics_port", envs.MOONCAKE_MASTER_METRICS_PORT.default
-            ),
+            master_server_address=config.get("master_server_address", envs.MOONCAKE_MASTER.default),
+            master_metrics_port=config.get("master_metrics_port", envs.MOONCAKE_MASTER_METRICS_PORT.default),
             check_server=config.get("check_server", envs.MOONCAKE_CHECK_SERVER.default),
-            standalone_storage=config.get(
-                "standalone_storage", envs.MOONCAKE_STANDALONE_STORAGE.default
-            ),
-            client_server_address=config.get(
-                "client_server_address", envs.MOONCAKE_CLIENT.default
-            ),
-            enable_ssd_offload=config.get(
-                "enable_ssd_offload", envs.MOONCAKE_ENABLE_SSD_OFFLOAD.default
-            ),
-            ssd_offload_path=config.get(
-                "ssd_offload_path", envs.MOONCAKE_OFFLOAD_FILE_STORAGE_PATH.default
-            ),
-            tenant_id=_normalize_tenant_id(
-                config.get("tenant_id", envs.MOONCAKE_TENANT_ID.default)
-            ),
+            standalone_storage=config.get("standalone_storage", envs.MOONCAKE_STANDALONE_STORAGE.default),
+            client_server_address=config.get("client_server_address", envs.MOONCAKE_CLIENT.default),
+            enable_ssd_offload=config.get("enable_ssd_offload", envs.MOONCAKE_ENABLE_SSD_OFFLOAD.default),
+            ssd_offload_path=config.get("ssd_offload_path", envs.MOONCAKE_OFFLOAD_FILE_STORAGE_PATH.default),
+            tenant_id=_normalize_tenant_id(config.get("tenant_id", envs.MOONCAKE_TENANT_ID.default)),
         )
 
     @staticmethod
@@ -184,9 +151,7 @@ class MooncakeStoreConfig:
         """
         # other required environment variables...
         if not envs.MOONCAKE_MASTER.is_set() and not envs.MOONCAKE_CLIENT.is_set():
-            raise ValueError(
-                "Either the environment variable 'MOONCAKE_MASTER' or 'MOONCAKE_CLIENT' is not set."
-            )
+            raise ValueError("Either the environment variable 'MOONCAKE_MASTER' or 'MOONCAKE_CLIENT' is not set.")
 
         # Special handling for local_hostname: try MOONCAKE_LOCAL_HOSTNAME first,
         # then fall back to LOCAL_HOSTNAME if not set.
@@ -194,16 +159,12 @@ class MooncakeStoreConfig:
         if envs.MOONCAKE_LOCAL_HOSTNAME.is_set():
             local_hostname = envs.MOONCAKE_LOCAL_HOSTNAME.get()
         else:
-            local_hostname = os.getenv(
-                "LOCAL_HOSTNAME", envs.MOONCAKE_LOCAL_HOSTNAME.default
-            )
+            local_hostname = os.getenv("LOCAL_HOSTNAME", envs.MOONCAKE_LOCAL_HOSTNAME.default)
 
         return MooncakeStoreConfig(
             local_hostname=local_hostname,
             metadata_server=envs.MOONCAKE_TE_META_DATA_SERVER.get(),
-            global_segment_size=_parse_global_segment_size(
-                envs.MOONCAKE_GLOBAL_SEGMENT_SIZE.get()
-            ),
+            global_segment_size=_parse_global_segment_size(envs.MOONCAKE_GLOBAL_SEGMENT_SIZE.get()),
             protocol=envs.MOONCAKE_PROTOCOL.get(),
             device_name=envs.MOONCAKE_DEVICE.get(),
             master_server_address=envs.MOONCAKE_MASTER.get(),
@@ -219,52 +180,23 @@ class MooncakeStoreConfig:
     @staticmethod
     def load_from_extra_config(extra_config: dict) -> "MooncakeStoreConfig":
         """Load config from extra_config dictionary."""
-        if (
-            "master_server_address" not in extra_config
-            and "client_server_address" not in extra_config
-        ):
-            raise ValueError(
-                "Either master_server_address or client_server_address is required in extra_config"
-            )
+        if "master_server_address" not in extra_config and "client_server_address" not in extra_config:
+            raise ValueError("Either master_server_address or client_server_address is required in extra_config")
 
         return MooncakeStoreConfig(
-            local_hostname=extra_config.get(
-                "local_hostname", envs.MOONCAKE_LOCAL_HOSTNAME.default
-            ),
-            metadata_server=extra_config.get(
-                "metadata_server", envs.MOONCAKE_TE_META_DATA_SERVER.default
-            ),
-            global_segment_size=_parse_global_segment_size(
-                extra_config.get(
-                    "global_segment_size", envs.MOONCAKE_GLOBAL_SEGMENT_SIZE.default
-                )
-            ),
+            local_hostname=extra_config.get("local_hostname", envs.MOONCAKE_LOCAL_HOSTNAME.default),
+            metadata_server=extra_config.get("metadata_server", envs.MOONCAKE_TE_META_DATA_SERVER.default),
+            global_segment_size=_parse_global_segment_size(extra_config.get("global_segment_size", envs.MOONCAKE_GLOBAL_SEGMENT_SIZE.default)),
             protocol=extra_config.get("protocol", envs.MOONCAKE_PROTOCOL.default),
             device_name=extra_config.get("device_name", envs.MOONCAKE_DEVICE.default),
-            master_server_address=extra_config.get(
-                "master_server_address", envs.MOONCAKE_MASTER.default
-            ),
-            master_metrics_port=extra_config.get(
-                "master_metrics_port", envs.MOONCAKE_MASTER_METRICS_PORT.default
-            ),
-            check_server=extra_config.get(
-                "check_server", envs.MOONCAKE_CHECK_SERVER.default
-            ),
-            standalone_storage=extra_config.get(
-                "standalone_storage", envs.MOONCAKE_STANDALONE_STORAGE.default
-            ),
-            client_server_address=extra_config.get(
-                "client_server_address", envs.MOONCAKE_CLIENT.default
-            ),
-            enable_ssd_offload=extra_config.get(
-                "enable_ssd_offload", envs.MOONCAKE_ENABLE_SSD_OFFLOAD.default
-            ),
-            ssd_offload_path=extra_config.get(
-                "ssd_offload_path", envs.MOONCAKE_OFFLOAD_FILE_STORAGE_PATH.default
-            ),
-            tenant_id=_normalize_tenant_id(
-                extra_config.get("tenant_id", envs.MOONCAKE_TENANT_ID.default)
-            ),
+            master_server_address=extra_config.get("master_server_address", envs.MOONCAKE_MASTER.default),
+            master_metrics_port=extra_config.get("master_metrics_port", envs.MOONCAKE_MASTER_METRICS_PORT.default),
+            check_server=extra_config.get("check_server", envs.MOONCAKE_CHECK_SERVER.default),
+            standalone_storage=extra_config.get("standalone_storage", envs.MOONCAKE_STANDALONE_STORAGE.default),
+            client_server_address=extra_config.get("client_server_address", envs.MOONCAKE_CLIENT.default),
+            enable_ssd_offload=extra_config.get("enable_ssd_offload", envs.MOONCAKE_ENABLE_SSD_OFFLOAD.default),
+            ssd_offload_path=extra_config.get("ssd_offload_path", envs.MOONCAKE_OFFLOAD_FILE_STORAGE_PATH.default),
+            tenant_id=_normalize_tenant_id(extra_config.get("tenant_id", envs.MOONCAKE_TENANT_ID.default)),
         )
 
 
@@ -280,9 +212,7 @@ class MooncakeBaseStore:
             return MooncakeDistributedStore
         except ImportError as e:
             raise ImportError(
-                "Please install mooncake by following the instructions at "
-                "https://kvcache-ai.github.io/Mooncake/getting_started/build.html "
-                "to run SGLang with MooncakeConnector."
+                "Please install mooncake by following the instructions at https://kvcache-ai.github.io/Mooncake/getting_started/build.html to run SGLang with MooncakeConnector."
             ) from e
 
     def _import_mooncake_group_semantics(self):
@@ -300,14 +230,9 @@ class MooncakeBaseStore:
         return ReplicateConfig, supports_group_ids
 
     def _load_config(self, storage_config: Any = None):
-        extra_config = (
-            getattr(storage_config, "extra_config", None) if storage_config else None
-        )
+        extra_config = getattr(storage_config, "extra_config", None) if storage_config else None
 
-        if extra_config and (
-            extra_config.get("master_server_address") is not None
-            or extra_config.get("client_server_address") is not None
-        ):
+        if extra_config and (extra_config.get("master_server_address") is not None or extra_config.get("client_server_address") is not None):
             config = MooncakeStoreConfig.load_from_extra_config(extra_config)
             logger.info("Mooncake Configuration loaded from extra_config successfully.")
 
@@ -332,9 +257,7 @@ class MooncakeBaseStore:
         ret_code = self.store.register_buffer(ptr, size)
         if ret_code != 0:
             logger.error(f"Failed to register buffer, error code: {ret_code}")
-            raise RuntimeError(
-                f"Failed to register buffer to Mooncake Store, error code: {ret_code}"
-            )
+            raise RuntimeError(f"Failed to register buffer to Mooncake Store, error code: {ret_code}")
 
 
 class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
@@ -384,48 +307,26 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             _add_tensor(buf)
         return total
 
-    def __init__(
-        self, storage_config: HiCacheStorageConfig = None, mem_pool: HostKVCache = None
-    ):
+    def __init__(self, storage_config: HiCacheStorageConfig = None, mem_pool: HostKVCache = None):
         MooncakeBaseStore.__init__(self)
         MooncakeDistributedStore = self._import_mooncake_store()
-        self._replicate_config_cls, self._supports_group_ids = (
-            self._import_mooncake_group_semantics()
-        )
+        self._replicate_config_cls, self._supports_group_ids = self._import_mooncake_group_semantics()
         try:
             self.store = MooncakeDistributedStore()
 
             self.config = self._load_config(storage_config)
-            extra_config = (
-                getattr(storage_config, "extra_config", None)
-                if storage_config
-                else None
-            )
-            self.enable_group_semantics = bool(
-                extra_config.get("enable_group_semantics", False)
-                if extra_config
-                else False
-            )
-            self._use_group_semantics = (
-                self.enable_group_semantics
-                and self._supports_group_ids
-                and self._replicate_config_cls is not None
-            )
+            extra_config = getattr(storage_config, "extra_config", None) if storage_config else None
+            self.enable_group_semantics = bool(extra_config.get("enable_group_semantics", False) if extra_config else False)
+            self._use_group_semantics = self.enable_group_semantics and self._supports_group_ids and self._replicate_config_cls is not None
             if self.enable_group_semantics and not self._supports_group_ids:
                 logger.warning(
                     "Mooncake group semantics is enabled, but the installed "
                     "Mooncake package does not support ReplicateConfig.group_ids. "
                     "Falling back to the existing batch_put_from path."
                 )
-            rank_scale_factor = (
-                1
-                if storage_config is None
-                else (storage_config.tp_size * storage_config.pp_size)
-            )
+            rank_scale_factor = 1 if storage_config is None else (storage_config.tp_size * storage_config.pp_size)
 
-            per_rank_global_segment_size = (
-                self.config.global_segment_size // rank_scale_factor
-            )
+            per_rank_global_segment_size = self.config.global_segment_size // rank_scale_factor
 
             # Use the backend tag and model name as a prefix to isolate tenants
             # and models sharing one store.
@@ -460,9 +361,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     else:
                         device_name = ""
                 except (json.JSONDecodeError, AttributeError):
-                    logger.warning(
-                        f"Failed to parse device_name as JSON: {device_name}"
-                    )
+                    logger.warning(f"Failed to parse device_name as JSON: {device_name}")
                     device_name = ""
             if self.config.standalone_storage:
                 if not isinstance(mem_pool.allocator, MooncakeHostTensorAllocator):
@@ -483,9 +382,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                         get_mooncake_transfer_engine,
                     )
 
-                    self._shared_mooncake_transfer_engine = (
-                        get_mooncake_transfer_engine()
-                    )
+                    self._shared_mooncake_transfer_engine = get_mooncake_transfer_engine()
                 except Exception:
                     self._shared_mooncake_transfer_engine = None
                     logger.debug("Failed to reuse initialized mooncake transfer engine")
@@ -494,18 +391,13 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 # configuration matches the one used by MooncakeStore.
                 if (
                     self._shared_mooncake_transfer_engine is not None
-                    and device_name
-                    == self._shared_mooncake_transfer_engine.get_ib_device()
+                    and device_name == self._shared_mooncake_transfer_engine.get_ib_device()
                     and self.config.metadata_server == "P2PHANDSHAKE"
                     and self.config.protocol == "rdma"
                 ):
-                    client_hostname = (
-                        self._shared_mooncake_transfer_engine.get_session_id()
-                    )
+                    client_hostname = self._shared_mooncake_transfer_engine.get_session_id()
                     transfer_engine = self._shared_mooncake_transfer_engine.get_engine()
-                    logger.info(
-                        f"Reuse initialized mooncake transfer engine: {self._shared_mooncake_transfer_engine}"
-                    )
+                    logger.info(f"Reuse initialized mooncake transfer engine: {self._shared_mooncake_transfer_engine}")
                 else:
                     client_hostname = self.config.local_hostname
                     transfer_engine = None
@@ -533,9 +425,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                         )
                         break
                     except TypeError as e:
-                        unsupported_kwargs = [
-                            key for key in list(setup_kwargs) if key in str(e)
-                        ]
+                        unsupported_kwargs = [key for key in list(setup_kwargs) if key in str(e)]
                         if not unsupported_kwargs:
                             raise
                         if "tenant_id" in unsupported_kwargs:
@@ -554,14 +444,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                         for key in unsupported_kwargs:
                             setup_kwargs.pop(key, None)
             if ret_code:
-                raise RuntimeError(
-                    f"Failed to setup Mooncake store, error code: {ret_code}"
-                )
+                raise RuntimeError(f"Failed to setup Mooncake store, error code: {ret_code}")
             logger.info("Mooncake store setup successfully.")
 
-            self.local_rank = (
-                storage_config.tp_rank if storage_config is not None else 0
-            )
+            self.local_rank = storage_config.tp_rank if storage_config is not None else 0
             self.warmup()
             logger.info("Mooncake store warmup successfully.")
 
@@ -593,15 +479,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             self.should_split_heads = storage_config.should_split_heads
             self.split_factor = 0
             if self.should_split_heads:
-                self.split_factor = (
-                    self.storage_config.tp_lcm_size // self.storage_config.tp_size
-                )
+                self.split_factor = self.storage_config.tp_lcm_size // self.storage_config.tp_size
                 base_rank = self.local_rank * self.split_factor
                 target_ranks = [base_rank + i for i in range(self.split_factor)]
                 if self.enable_pp:
-                    self.mha_suffix = [
-                        f"{rank}_{self.pp_rank}" for rank in target_ranks
-                    ]
+                    self.mha_suffix = [f"{rank}_{self.pp_rank}" for rank in target_ranks]
                 else:
                     self.mha_suffix = [f"{rank}" for rank in target_ranks]
 
@@ -676,16 +558,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             ret = self.store.put(warmup_key, warmup_value)
             if ret == 0:
                 break
-            logger.warning(
-                f"[TP{self.local_rank}] Warmup put failed (attempt {attempt + 1}/{max_retries}), "
-                f"ret={ret}, retrying in {retry_delay}s..."
-            )
+            logger.warning(f"[TP{self.local_rank}] Warmup put failed (attempt {attempt + 1}/{max_retries}), ret={ret}, retrying in {retry_delay}s...")
             time.sleep(retry_delay)
         else:
-            raise RuntimeError(
-                f"[TP{self.local_rank}] Warmup put failed after {max_retries} attempts, "
-                "Transfer Engine might not be ready"
-            )
+            raise RuntimeError(f"[TP{self.local_rank}] Warmup put failed after {max_retries} attempts, Transfer Engine might not be ready")
 
         assert self.store.is_exist(warmup_key) == 1
         assert self.store.get(warmup_key) == warmup_value
@@ -736,24 +612,18 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def _make_group_id(self, logical_key: str) -> str:
         return f"sglang-hicache:{logical_key}"
 
-    def _expand_group_ids(
-        self, logical_keys: List[str], key_multiplier: int
-    ) -> List[str]:
+    def _expand_group_ids(self, logical_keys: List[str], key_multiplier: int) -> List[str]:
         group_ids = []
         for key in logical_keys:
             group_ids.extend([self._make_group_id(key)] * key_multiplier)
         return group_ids
 
-    def _filter_group_ids(
-        self, group_ids: Optional[List[str]], indices: List[int]
-    ) -> Optional[List[str]]:
+    def _filter_group_ids(self, group_ids: Optional[List[str]], indices: List[int]) -> Optional[List[str]]:
         if group_ids is None:
             return None
         return [group_ids[i] for i in indices]
 
-    def _get_hybrid_page_component_keys(
-        self, page_keys: List[str], transfer: PoolTransfer
-    ) -> Tuple[List[str], int]:
+    def _get_hybrid_page_component_keys(self, page_keys: List[str], transfer: PoolTransfer) -> Tuple[List[str], int]:
         host_pool = getattr(self, "registered_pools", {}).get(transfer.name)
         if host_pool is None:
             raise ValueError(f"Unregistered Mooncake hybrid pool: {transfer.name}")
@@ -828,14 +698,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 suffixes = [f"_{self.mla_suffix}_{pool_name}"]
 
         if not suffixes:
-            raise ValueError(
-                f"Unsupported Mooncake hybrid pool name: {pool_name}, "
-                f"host_pool={type(host_pool)}"
-            )
+            raise ValueError(f"Unsupported Mooncake hybrid pool name: {pool_name}, host_pool={type(host_pool)}")
         key_multiplier = len(suffixes)
-        component_keys = [
-            f"{page_key}{suffix}" for page_key in page_keys for suffix in suffixes
-        ]
+        component_keys = [f"{page_key}{suffix}" for page_key in page_keys for suffix in suffixes]
         return component_keys, key_multiplier
 
     def batch_exists_v2(
@@ -866,37 +731,44 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             # a chunk of the KV page-hash array. Evaluate them against their
             # own keys; the result still intersects the whole-page restorable
             # domain via the TRAILING_PAGES window below.
-            self_keyed = (
-                transfer.probe_source is not None
-                and transfer.probe_source != PoolName.KV
-                and transfer.name != PoolName.KV
-            )
+            self_keyed = transfer.probe_source is not None and transfer.probe_source != PoolName.KV and transfer.name != PoolName.KV
             probe_keys = list(transfer.keys) if self_keyed else keys
-            component_keys, key_multiplier = self._get_hybrid_page_component_keys(
-                probe_keys, transfer
-            )
+            component_keys, key_multiplier = self._get_hybrid_page_component_keys(probe_keys, transfer)
             component_keys = self._tag_keys(component_keys)
+            import os as _os
+
+            if _os.environ.get("SGLANG_LINKER_DEBUG_KEY"):
+                logger.info(
+                    "LINKER-DBG batch_exists pool=%s self_keyed=%s n_comp=%d mult=%d comp_first2=%s",
+                    transfer.name,
+                    self_keyed,
+                    len(component_keys),
+                    key_multiplier,
+                    component_keys[:2],
+                )
             ex = self._batch_exist(component_keys)
+            if _os.environ.get("SGLANG_LINKER_DEBUG_KEY"):
+                logger.info(
+                    "LINKER-DBG batch_exists ex_total=%d ex_head=%s ex_true=%d",
+                    len(ex),
+                    list(ex[:2]),
+                    sum(1 for r in ex if r == 1),
+                )
             if key_multiplier > 0:
                 if self_keyed:
-                    # One hit element per probed slot (not per KV page). The
-                    # slots are tail-aligned: slot i of the transfer maps to
-                    # the i-th-from-last whole-page position of the KV
-                    # domain (each boundary is a page-aligned node end).
+                    # One hit element per probed slot (not per KV page). A
+                    # self-keyed slot stores its OWN absolute hash (a node
+                    # boundary), so slot i of the transfer maps to page i of
+                    # the probe domain: the probe keys ARE the tail hashes
+                    # starting at device_hit_len. Right-aligning to the KV
+                    # domain would assume the written slots end exactly at
+                    # this conversation tail, which scattered write-through
+                    # chains do not satisfy.
                     n_slots = len(probe_keys)
-                    slot_exists = [
-                        all(r == 1 for r in ex[i * key_multiplier : (i + 1) * key_multiplier])
-                        for i in range(n_slots)
-                    ]
-                    item_exists = [False] * (kv_pages - n_slots) + slot_exists
+                    slot_exists = [all(r == 1 for r in ex[i * key_multiplier : (i + 1) * key_multiplier]) for i in range(n_slots)]
+                    item_exists = slot_exists + [False] * max(0, kv_pages - n_slots)
                 else:
-                    item_exists = [
-                        all(
-                            r == 1
-                            for r in ex[i * key_multiplier : (i + 1) * key_multiplier]
-                        )
-                        for i in range(kv_pages)
-                    ]
+                    item_exists = [all(r == 1 for r in ex[i * key_multiplier : (i + 1) * key_multiplier]) for i in range(kv_pages)]
             else:
                 item_exists = [False] * kv_pages
             page_exists = item_exists
@@ -911,12 +783,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             elif transfer.hit_policy == PoolHitPolicy.TRAILING_PAGES:
                 # A stop point works when the window ending there is complete,
                 # so scan every one instead of stopping at the longest.
-                trailing = max(1, len(transfer.keys) if transfer.keys else 1)
+                # A self-keyed pool stores ONE object per boundary hash, so
+                # each probed slot is its own stop point: the window is a
+                # single slot, not the whole probe-key array.
+                trailing = 1 if self_keyed else max(1, len(transfer.keys) if transfer.keys else 1)
                 for prefix_len in range(kv_pages, 0, -1):
-                    if all(
-                        page_exists[i]
-                        for i in range(max(0, prefix_len - trailing), prefix_len)
-                    ):
+                    if all(page_exists[i] for i in range(max(0, prefix_len - trailing), prefix_len)):
                         pool_restorable.append(prefix_len)
                         if boundary == 0:
                             boundary = prefix_len
@@ -943,22 +815,14 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             assert len(keys) == len(host_indices) // page_size
 
             tagged_keys = self._tag_keys(keys)
-            key_strs, key_multiplier = self._get_hybrid_page_component_keys(
-                keys, transfer
-            )
+            key_strs, key_multiplier = self._get_hybrid_page_component_keys(keys, transfer)
             key_strs = self._tag_keys(key_strs)
             ptr_list, element_size_list = host_pool.get_page_buffer_meta(host_indices)
             if len(ptr_list) != len(key_strs):
-                ptr_list, element_size_list = self._pack_multi_buffer_meta(
-                    key_strs, ptr_list, element_size_list
-                )
+                ptr_list, element_size_list = self._pack_multi_buffer_meta(key_strs, ptr_list, element_size_list)
 
             if is_set:
-                group_ids = (
-                    self._expand_group_ids(tagged_keys, key_multiplier)
-                    if self._can_use_group_semantics()
-                    else None
-                )
+                group_ids = self._expand_group_ids(tagged_keys, key_multiplier) if self._can_use_group_semantics() else None
                 exist_result = self._batch_exist(key_strs)
                 io_results = [0 if state == 1 else -1 for state in exist_result]
                 missing_idx = [i for i, state in enumerate(exist_result) if state != 1]
@@ -972,12 +836,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     for i, res in zip(missing_idx, put_results):
                         io_results[i] = res
             else:
-                io_results = self._get_batch_zero_copy_impl(
-                    key_strs, ptr_list, element_size_list
-                )
-            results[transfer.name] = self._batch_postprocess(
-                io_results, is_set_operate=is_set, key_multiplier=key_multiplier
-            )
+                io_results = self._get_batch_zero_copy_impl(key_strs, ptr_list, element_size_list)
+            results[transfer.name] = self._batch_postprocess(io_results, is_set_operate=is_set, key_multiplier=key_multiplier)
         return results
 
     def batch_get_v2(
@@ -995,11 +855,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return self._batch_io_v2(transfers, is_set=True)
 
     def _get_mha_split_heads_buffer_meta(self, keys, indices):
-        ptr_list, element_size_list = (
-            self.mem_pool_host.get_split_heads_page_buffer_meta(
-                indices, self.split_factor
-            )
-        )
+        ptr_list, element_size_list = self.mem_pool_host.get_split_heads_page_buffer_meta(indices, self.split_factor)
         key_list = []
         for key_ in keys:
             for suffix in self.mha_suffix:
@@ -1026,10 +882,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         assert len(ptr_list) % len(key_strs) == 0
 
         nbuf = len(ptr_list) // len(key_strs)
-        return [ptr_list[i : i + nbuf] for i in range(0, len(ptr_list), nbuf)], [
-            element_size_list[i : i + nbuf]
-            for i in range(0, len(element_size_list), nbuf)
-        ]
+        return [ptr_list[i : i + nbuf] for i in range(0, len(ptr_list), nbuf)], [element_size_list[i : i + nbuf] for i in range(0, len(element_size_list), nbuf)]
 
     def _get_mha_buffer_meta(self, keys, indices):
         ptr_list, element_size_list = self.mem_pool_host.get_page_buffer_meta(indices)
@@ -1038,10 +891,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             key_list.append(f"{key_}_{self.mha_suffix}_k")
             key_list.append(f"{key_}_{self.mha_suffix}_v")
         if len(key_list) != len(ptr_list):
-            raise RuntimeError(
-                "Mooncake layer_first multi-buffer is only supported for MLA "
-                "host KV pool. Use page_first/page_first_direct for MHA."
-            )
+            raise RuntimeError("Mooncake layer_first multi-buffer is only supported for MLA host KV pool. Use page_first/page_first_direct for MHA.")
         return key_list, ptr_list, element_size_list
 
     def _get_mla_buffer_meta(self, keys, indices):
@@ -1049,9 +899,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         key_list = []
         for key_ in keys:
             key_list.append(f"{key_}_{self.mla_suffix}_k")
-        ptr_list, element_size_list = self._pack_multi_buffer_meta(
-            key_list, ptr_list, element_size_list
-        )
+        ptr_list, element_size_list = self._pack_multi_buffer_meta(key_list, ptr_list, element_size_list)
         assert len(key_list) == len(ptr_list)
         return key_list, ptr_list, element_size_list
 
@@ -1066,9 +914,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             else:
                 return self._get_mha_buffer_meta(keys, host_indices)
 
-    def _batch_postprocess(
-        self, results: List[int], is_set_operate=False, key_multiplier=None
-    ):
+    def _batch_postprocess(self, results: List[int], is_set_operate=False, key_multiplier=None):
         """
         refer to https://github.com/kvcache-ai/Mooncake/blob/main/mooncake-store/include/pybind_client.h
         for batch_get_into, results is Vector of integers,
@@ -1084,18 +930,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 if self.should_split_heads:
                     key_multiplier *= self.split_factor
 
-        result_groups = [
-            results[i : i + key_multiplier]
-            for i in range(0, len(results), key_multiplier)
-        ]
-        return [
-            (
-                all(res == 0 for res in group)
-                if is_set_operate
-                else all(res > 0 for res in group)
-            )
-            for group in result_groups
-        ]
+        result_groups = [results[i : i + key_multiplier] for i in range(0, len(results), key_multiplier)]
+        return [(all(res == 0 for res in group) if is_set_operate else all(res > 0 for res in group)) for group in result_groups]
 
     def batch_get_v1(
         self,
@@ -1113,16 +949,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
 
         start_time = time.perf_counter()
-        get_results = self._get_batch_zero_copy_impl(
-            key_strs, buffer_ptrs, buffer_sizes
-        )
+        get_results = self._get_batch_zero_copy_impl(key_strs, buffer_ptrs, buffer_sizes)
         end_time = time.perf_counter()
 
         if self.enable_storage_metrics:
             self.prefetch_pgs.append(len(keys))
-            self.prefetch_bandwidth.append(
-                len(keys) / (end_time - start_time) * self.gb_per_page
-            )
+            self.prefetch_bandwidth.append(len(keys) / (end_time - start_time) * self.gb_per_page)
 
         return self._batch_postprocess(get_results, is_set_operate=False)
 
@@ -1141,11 +973,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         key_strs, buffer_ptrs, buffer_sizes = self._batch_preprocess(keys, host_indices)
         key_multiplier = len(key_strs) // len(keys)
-        group_ids = (
-            self._expand_group_ids(keys, key_multiplier)
-            if self._can_use_group_semantics()
-            else None
-        )
+        group_ids = self._expand_group_ids(keys, key_multiplier) if self._can_use_group_semantics() else None
         exist_result = self._batch_exist(key_strs)
 
         set_keys = []
@@ -1175,9 +1003,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
             if self.enable_storage_metrics:
                 self.backup_pgs.append(len(set_keys))
-                self.backup_bandwidth.append(
-                    len(set_keys) / (end_time - start_time) * self.gb_per_page
-                )
+                self.backup_bandwidth.append(len(set_keys) / (end_time - start_time) * self.gb_per_page)
 
             for i in range(len(set_indices)):
                 set_results[set_indices[i]] = put_results[i]
@@ -1196,9 +1022,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         exist_result = self._batch_exist([key])
         if exist_result[0] == 1:
             return True
-        put_result = self._put_batch_zero_copy_impl(
-            [key], [target_location], [target_sizes]
-        )
+        put_result = self._put_batch_zero_copy_impl([key], [target_location], [target_sizes])
         return put_result[0] == 0
 
     def batch_set(
@@ -1216,11 +1040,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             return False
 
         for i in range(len(keys)):
-            if (
-                keys[i] is None
-                or target_locations[i] is None
-                or target_sizes[i] is None
-            ):
+            if keys[i] is None or target_locations[i] is None or target_sizes[i] is None:
                 return False
 
         exist_result = self._batch_exist(keys)
@@ -1236,16 +1056,12 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 set_indices.append(i)
         # Only set non-existing keys to storage
         start_time = time.perf_counter()
-        put_result = self._put_batch_zero_copy_impl(
-            set_keys, set_target_locations, set_target_sizes
-        )
+        put_result = self._put_batch_zero_copy_impl(set_keys, set_target_locations, set_target_sizes)
         end_time = time.perf_counter()
 
         if self.enable_storage_metrics:
             self.backup_pgs.append(len(set_keys))
-            self.backup_bandwidth.append(
-                len(set_keys) / (end_time - start_time) * self.gb_per_page
-            )
+            self.backup_bandwidth.append(len(set_keys) / (end_time - start_time) * self.gb_per_page)
 
         for i in range(len(set_indices)):
             if put_result[i] == 0:
@@ -1266,9 +1082,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         target_sizes: Optional[Any] = None,
     ) -> bool:
         assert target_location is not None and target_sizes is not None
-        get_result = self._get_batch_zero_copy_impl(
-            [key], [target_location], [target_sizes]
-        )
+        get_result = self._get_batch_zero_copy_impl([key], [target_location], [target_sizes])
         return get_result[0] >= 0
 
     def batch_get(
@@ -1282,9 +1096,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             return 0
 
         start_time = time.perf_counter()
-        get_result = self._get_batch_zero_copy_impl(
-            keys, target_locations, target_sizes
-        )
+        get_result = self._get_batch_zero_copy_impl(keys, target_locations, target_sizes)
         end_time = time.perf_counter()
 
         if self.is_mla_backend:
@@ -1294,9 +1106,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
 
         if self.enable_storage_metrics:
             self.prefetch_pgs.append(len(keys))
-            self.prefetch_bandwidth.append(
-                len(keys) / (end_time - start_time) * self.gb_per_page
-            )
+            self.prefetch_bandwidth.append(len(keys) / (end_time - start_time) * self.gb_per_page)
 
         for i in range(len(keys)):
             if get_result[i] < 0:
@@ -1307,9 +1117,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         exist_result = self._batch_exist([key])
         return exist_result[0] == 1
 
-    def batch_exists(
-        self, keys, extra_info: Optional[HiCacheStorageExtraInfo] = None
-    ) -> int:
+    def batch_exists(self, keys, extra_info: Optional[HiCacheStorageExtraInfo] = None) -> int:
         # Apply config prefix if available.
         keys = self._tag_keys(keys)
 
@@ -1354,32 +1162,21 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         config = None
         if self._can_use_group_semantics() and group_ids is not None:
             if len(group_ids) != len(key_strs):
-                raise ValueError(
-                    "Mooncake group_ids length must match key_strs length: "
-                    f"{len(group_ids)} != {len(key_strs)}"
-                )
+                raise ValueError(f"Mooncake group_ids length must match key_strs length: {len(group_ids)} != {len(key_strs)}")
             config = self._replicate_config_cls()
             config.group_ids = group_ids
 
         if self._uses_multi_buffer(buffer_ptrs):
             config = config or self._replicate_config_cls()
-            return self.store.batch_put_from_multi_buffers(
-                key_strs, buffer_ptrs, buffer_sizes, config
-            )
+            return self.store.batch_put_from_multi_buffers(key_strs, buffer_ptrs, buffer_sizes, config)
         elif config is not None:
-            return self.store.batch_put_from(
-                key_strs, buffer_ptrs, buffer_sizes, config
-            )
+            return self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes, config)
         else:
             return self.store.batch_put_from(key_strs, buffer_ptrs, buffer_sizes)
 
-    def _get_batch_zero_copy_impl(
-        self, key_strs: List[str], buffer_ptrs: List[Any], buffer_sizes: List[Any]
-    ) -> List[int]:
+    def _get_batch_zero_copy_impl(self, key_strs: List[str], buffer_ptrs: List[Any], buffer_sizes: List[Any]) -> List[int]:
         if self._uses_multi_buffer(buffer_ptrs):
-            return self.store.batch_get_into_multi_buffers(
-                key_strs, buffer_ptrs, buffer_sizes
-            )
+            return self.store.batch_get_into_multi_buffers(key_strs, buffer_ptrs, buffer_sizes)
         return self.store.batch_get_into(key_strs, buffer_ptrs, buffer_sizes)
 
     def _batch_exist(self, key_strs: List[str]) -> List[int]:

@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-from collections.abc import Callable, Sequence
 import logging
+from collections.abc import Callable, Sequence
 
 logger = logging.getLogger(__name__)
 from dataclasses import replace
@@ -380,7 +380,12 @@ class MambaDevicePoolEntry(DevicePoolEntry):
         self.conv_buffer = list(conv_buffers)
 
 
-def _build_mamba_device_pool_group(kvcache: Any, page_size: int, params: Any) -> DevicePoolGroup:
+def _build_mamba_device_pool_group(
+    kvcache: Any,
+    page_size: int,
+    params: Any,
+    mtp_draft_device_pools: tuple[Any, ...] = (),
+) -> DevicePoolGroup:
     if page_size != 1:
         # The MAMBA entry addresses slots by node-boundary keys (page-aligned
         # node ends) and keeps page_size=1 rows internally, so any tree
@@ -394,30 +399,64 @@ def _build_mamba_device_pool_group(kvcache: Any, page_size: int, params: Any) ->
 
     state_components, conv_buffers, temporal_state_elem_size = _build_mamba_state_components(mamba_pool)
 
-    kv_entry = DevicePoolEntry(
-        name=PoolName.KV,
-        indices_from_pool=PoolName.KV,
-        device_pool=kvcache,
-        components=_mamba_kv_components(kvcache),
-        layer_mapping=full_layer_mapping,
-        page_size=page_size,
-        rows_are_pages=False,
-    )
-    mamba_entry = MambaDevicePoolEntry(
-        name=PoolName.MAMBA,
-        indices_from_pool=PoolName.MAMBA,
-        device_pool=mamba_pool,
-        components=state_components,
-        layer_mapping=_sorted_union_remapping(mamba_layer_mapping, union_layers),
-        page_size=1,
-        rows_are_pages=True,
-        packed=False,
-        temporal_state_elem_size=temporal_state_elem_size,
-        conv_buffers=conv_buffers,
-    )
+    entries = [
+        DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=kvcache,
+            components=_mamba_kv_components(kvcache),
+            layer_mapping=full_layer_mapping,
+            page_size=page_size,
+            rows_are_pages=False,
+        ),
+        MambaDevicePoolEntry(
+            name=PoolName.MAMBA,
+            indices_from_pool=PoolName.MAMBA,
+            device_pool=mamba_pool,
+            components=state_components,
+            layer_mapping=_sorted_union_remapping(mamba_layer_mapping, union_layers),
+            page_size=1,
+            rows_are_pages=True,
+            packed=False,
+            temporal_state_elem_size=temporal_state_elem_size,
+            conv_buffers=conv_buffers,
+        ),
+    ]
+    num_layers = len(union_layers)
+
+    # DSA full-attention layers carry a persistent per-page index sidecar
+    # (DSATokenToKVPool.index_k_with_scale_buffer). Without an INDEXER entry
+    # here, an L3 restore would land latent KV rows on freshly allocated
+    # slots whose index rows are zero/stale, and dsa_topk would then pick
+    # wrong pages over the whole restored prefix (upstream #30057 form;
+    # observed as gsm8k 0.94 -> 0.44 on pure-L3 restore). Mirror the pure-DSA
+    # group: the INDEXER entry is KV-sourced (ALL_PAGES), so batch_exists_v2
+    # intersects restorable prefixes with index availability at lookup time —
+    # the native clamp-by-sidecar-hits equivalent of PR #31443. Index rows
+    # live in fixed 64-token kernel pages (IndexKeyCache.KERNEL_PAGE_TOKENS),
+    # so the entry only pages 1:1 with the tree when page_size == 64.
+    full_kv_pool = kvcache.full_kv_pool
+    index_buffers = getattr(full_kv_pool, "index_k_with_scale_buffer", None)
+    if index_buffers and getattr(full_kv_pool, "use_dsa", False) and page_size == 64:
+        entries.append(
+            DevicePoolEntry(
+                name=PoolName.INDEXER,
+                indices_from_pool=PoolName.KV,
+                device_pool=full_kv_pool,
+                components=[[*index_buffers]],
+                layer_mapping=dict(full_layer_mapping),
+                page_size=page_size,
+                rows_are_pages=True,
+            )
+        )
+    elif index_buffers and getattr(full_kv_pool, "use_dsa", False):
+        logger.warning(
+            "Mamba direct linker: DSA index sidecar present but tree page_size=%d != IndexKeyCache kernel page 64; INDEXER entry skipped (L3 restores would be unsafe).",
+            page_size,
+        )
     return DevicePoolGroup(
-        [kv_entry, mamba_entry],
-        len(union_layers),
+        entries,
+        num_layers,
         page_size,
         rank_replicated=False,
     )
