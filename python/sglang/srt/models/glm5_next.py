@@ -50,6 +50,7 @@ from sglang.srt.layers.moe.utils import (
     is_shared_experts_fusion_disabled,
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.layers.quantization.utils import are_linear_prefixes_unquantized
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.rotary_embedding import get_rope
 from sglang.srt.layers.utils.common import PPMissingLayer
@@ -276,10 +277,16 @@ class Glm5NextVisionModel(GlmOcrVisionModel):
                 for layer_idx in range(vision_config.depth)
             ]
         )
-        projection_intermediate_size = getattr(vision_config, "projection_intermediate_size", None)
+        projection_intermediate_size = getattr(
+            vision_config, "projection_intermediate_size", None
+        )
         self.merger = Glm5NextVisionPatchMerger(
             d_model=vision_config.out_hidden_size,
-            context_dim=(projection_intermediate_size if projection_intermediate_size is not None else vision_config.intermediate_size),
+            context_dim=(
+                projection_intermediate_size
+                if projection_intermediate_size is not None
+                else vision_config.intermediate_size
+            ),
             quant_config=quant_config,
             bias=False,
             prefix=add_prefix("merger", prefix),
@@ -293,7 +300,9 @@ class Glm5NextVisionModel(GlmOcrVisionModel):
             kernel_size=vision_config.spatial_merge_size,
             stride=vision_config.spatial_merge_size,
         )
-        self.post_layernorm = GlmOcrRMSNorm(vision_config.hidden_size, eps=vision_config.rms_norm_eps)
+        self.post_layernorm = GlmOcrRMSNorm(
+            vision_config.hidden_size, eps=vision_config.rms_norm_eps
+        )
 
 
 class Glm5NextLinearAttention(nn.Module):
@@ -330,7 +339,30 @@ class Glm5NextLinearAttention(nn.Module):
         projection_size = self.head_dim * self.num_heads
         self.conv_size = config.linear_attn_config["short_conv_kernel_size"]
 
-        self.do_fuse_qkvbfg = quant_config is None and head_shard_size == self.tp_size
+        # A global quant_config does not mean these six projections are
+        # quantized: GLM-5.3-Flash ships FP8 experts with BF16 attention. Ask
+        # per prefix, since the fused modules can only eat unquantized weights.
+        self.do_fuse_qkvbfg = (
+            head_shard_size == self.tp_size
+            and (
+                quant_config is None
+                or envs.SGLANG_OPT_GLM5_NEXT_KDA_PROJECTION_FUSION.get()
+            )
+            and are_linear_prefixes_unquantized(
+                quant_config,
+                [
+                    f"{prefix}.{name}"
+                    for name in (
+                        "qkv_proj",
+                        "f_a_proj",
+                        "f_b_proj",
+                        "b_proj",
+                        "g_a_proj",
+                        "g_b_proj",
+                    )
+                ],
+            )
+        )
         if self.do_fuse_qkvbfg:
             self.qkvb_sizes = [
                 projection_size,
@@ -344,7 +376,12 @@ class Glm5NextLinearAttention(nn.Module):
                 self.hidden_size,
                 self.qkvb_sizes,
                 self.fg_sizes,
-                quant_config=quant_config,
+                # The gate above already proved the source weights are
+                # unquantized. This name exists in no checkpoint, so an ignore
+                # list written in terms of the real ones is not guaranteed to
+                # cover it -- handing it the global config risks quantizing a
+                # layer whose source weights are BF16.
+                quant_config=None,
                 prefix=f"{prefix}.fused_qkvbfg_a_proj",
             )
             self.split_sizes = [
@@ -352,8 +389,14 @@ class Glm5NextLinearAttention(nn.Module):
                 self.num_heads // head_shard_size,
                 2 * self.head_dim,
             ]
-            fused_dtype = getattr(config, "dtype", None) or getattr(config, "torch_dtype", None) or torch.get_default_dtype()
-            self.fused_fg_b_proj = ColumnParallelBatchedLinear(2, self.head_dim, projection_size, dtype=fused_dtype)
+            fused_dtype = (
+                getattr(config, "dtype", None)
+                or getattr(config, "torch_dtype", None)
+                or torch.get_default_dtype()
+            )
+            self.fused_fg_b_proj = ColumnParallelBatchedLinear(
+                2, self.head_dim, projection_size, dtype=fused_dtype
+            )
         else:
             self.qkv_proj = QKVParallelLinear(
                 self.hidden_size,
@@ -412,7 +455,9 @@ class Glm5NextLinearAttention(nn.Module):
                 tp_size=head_shard_size,
             )
 
-        self.dt_bias = nn.Parameter(torch.empty(divide(projection_size, head_shard_size), dtype=torch.float32))
+        self.dt_bias = nn.Parameter(
+            torch.empty(divide(projection_size, head_shard_size), dtype=torch.float32)
+        )
 
         set_weight_attrs(
             self.dt_bias,
@@ -432,13 +477,17 @@ class Glm5NextLinearAttention(nn.Module):
         # singleton dimension after construction.
         self.qkv_conv1d.weight.data = self.qkv_conv1d.weight.data.unsqueeze(1)
 
-        self.A_log = nn.Parameter(torch.empty(1, 1, self.local_num_heads, 1, dtype=torch.float32))
+        self.A_log = nn.Parameter(
+            torch.empty(1, 1, self.local_num_heads, 1, dtype=torch.float32)
+        )
         set_weight_attrs(
             self.A_log,
             {"weight_loader": sharded_weight_loader(2, _head_shard_rank_getter)},
         )
 
-        self.o_norm = FusedRMSNormGated(self.head_dim, eps=rms_norm_eps, activation="sigmoid")
+        self.o_norm = FusedRMSNormGated(
+            self.head_dim, eps=rms_norm_eps, activation="sigmoid"
+        )
         self.o_proj = RowParallelLinear(
             projection_size,
             self.hidden_size,
@@ -483,12 +532,16 @@ class Glm5NextLinearAttention(nn.Module):
             g_proj_states,
         )
 
-    def forward_qkvbfg_fused(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
+    def forward_qkvbfg_fused(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+    ):
         fused_states = self.fused_qkvbfg_a_proj(hidden_states)
 
         qkv, beta, fg_a_states = torch.split(fused_states, self.split_sizes, dim=-1)
 
-        forget_gate, g_proj_states = self.fused_fg_b_proj(fg_a_states.view(-1, 2, self.head_dim).transpose(0, 1))
+        forget_gate, g_proj_states = self.fused_fg_b_proj(
+            fg_a_states.view(-1, 2, self.head_dim).transpose(0, 1)
+        )
 
         return (
             qkv,
@@ -507,9 +560,13 @@ class Glm5NextLinearAttention(nn.Module):
             return hidden_states
 
         if self.do_fuse_qkvbfg:
-            mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg_fused(hidden_states, forward_batch)
+            mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg_fused(
+                hidden_states, forward_batch
+            )
         else:
-            mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg(hidden_states, forward_batch)
+            mixed_qkv, beta, forget_gate, g_proj_states = self.forward_qkvbfg(
+                hidden_states, forward_batch
+            )
 
         if not forward_batch.forward_mode.is_decode():
             forget_gate = forget_gate.unsqueeze(0)
@@ -546,7 +603,9 @@ class Glm5NextDecoderLayer(nn.Module):
         rope_theta = config.rope_theta
         rope_scaling = config.rope_scaling
         max_position_embeddings = config.max_position_embeddings
-        self.speculative_algorithm = SpeculativeAlgorithm.from_string(get_spec().speculative_algorithm)
+        self.speculative_algorithm = SpeculativeAlgorithm.from_string(
+            get_spec().speculative_algorithm
+        )
         self.layer_id = layer_id
         self.is_nextn = is_nextn
         self.is_linear_attn = config.is_kda_layer(layer_id)
@@ -584,7 +643,9 @@ class Glm5NextDecoderLayer(nn.Module):
             )
 
         if config.q_lora_rank is None and envs.SGLANG_USE_AG_AFTER_QLORA.get():
-            raise ValueError("SGLANG_USE_AG_AFTER_QLORA only supports the model with q_lora_rank")
+            raise ValueError(
+                "SGLANG_USE_AG_AFTER_QLORA only supports the model with q_lora_rank"
+            )
 
         self.is_layer_sparse = self._is_layer_sparse(layer_id, is_nextn=is_nextn)
         is_previous_layer_sparse = self._is_layer_sparse(layer_id - 1, is_nextn=False)
@@ -624,7 +685,9 @@ class Glm5NextDecoderLayer(nn.Module):
             )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.post_attention_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = RMSNorm(
+            config.hidden_size, eps=config.rms_norm_eps
+        )
 
         if self.config.mhc:
             hc_mult = config.hc_mult
@@ -635,19 +698,27 @@ class Glm5NextDecoderLayer(nn.Module):
             # the checkpoint verbatim.
             self.hc_attn_base = nn.Parameter(torch.empty(mix_hc, dtype=torch.float32))
             self.hc_attn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
-            self.hc_attn_fn = nn.Parameter(torch.empty(mix_hc, hc_dim, dtype=torch.float32))
+            self.hc_attn_fn = nn.Parameter(
+                torch.empty(mix_hc, hc_dim, dtype=torch.float32)
+            )
 
             self.hc_ffn_base = nn.Parameter(torch.empty(mix_hc, dtype=torch.float32))
             self.hc_ffn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32))
-            self.hc_ffn_fn = nn.Parameter(torch.empty(mix_hc, hc_dim, dtype=torch.float32))
+            self.hc_ffn_fn = nn.Parameter(
+                torch.empty(mix_hc, hc_dim, dtype=torch.float32)
+            )
 
         shared_kwargs: Dict[str, Any] = dict(
             layer_scatter_modes=self.layer_scatter_modes,
             input_layernorm=self.input_layernorm,
             post_attention_layernorm=self.post_attention_layernorm,
             allow_reduce_scatter=True,
-            is_last_layer=(is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)),
-            qkv_latent_func=(self.self_attn.prepare_qkv_latent if not self.is_linear_attn else None),
+            is_last_layer=(
+                is_nextn or (self.layer_id == self.config.num_hidden_layers - 1)
+            ),
+            qkv_latent_func=(
+                self.self_attn.prepare_qkv_latent if not self.is_linear_attn else None
+            ),
         )
 
         if self.config.mhc:
@@ -665,7 +736,9 @@ class Glm5NextDecoderLayer(nn.Module):
         else:
             self.layer_communicator = LayerCommunicator(**shared_kwargs)
 
-    def _hc_pre(self, hc_fn, hc_scale, hc_base, hidden_states, out_norm_weight, out_norm_eps):
+    def _hc_pre(
+        self, hc_fn, hc_scale, hc_base, hidden_states, out_norm_weight, out_norm_eps
+    ):
         return _hc_pre_fn(
             x=hidden_states,
             hc_fn=hc_fn,
@@ -712,7 +785,11 @@ class Glm5NextDecoderLayer(nn.Module):
         )
 
     def _is_layer_sparse(self, layer_id: int, is_nextn: bool) -> bool:
-        return is_nextn or (self.config.n_routed_experts is not None and layer_id >= self.config.first_k_dense_replace and layer_id % self.config.moe_layer_freq == 0)
+        return is_nextn or (
+            self.config.n_routed_experts is not None
+            and layer_id >= self.config.first_k_dense_replace
+            and layer_id % self.config.moe_layer_freq == 0
+        )
 
     def forward(
         self,
@@ -752,14 +829,24 @@ class Glm5NextDecoderLayer(nn.Module):
             forward_batch,
         )
 
-        should_allreduce_fusion = self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(forward_batch)
+        should_allreduce_fusion = (
+            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                forward_batch
+            )
+        )
 
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(forward_batch)
+        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+            forward_batch
+        )
 
         if isinstance(self.mlp, Glm5NextMLP):
             gemm_output_zero_allocator = None
 
-        if isinstance(self.mlp, Glm5NextMoE) and not self.mlp.experts.moe_runner_config.inplace and not torch.compiler.is_compiling():
+        if (
+            isinstance(self.mlp, Glm5NextMoE)
+            and not self.mlp.experts.moe_runner_config.inplace
+            and not torch.compiler.is_compiling()
+        ):
             from sglang.srt.layers.moe.moe_runner.base import moe_output_buffer_ctx
 
             _mlp_ctx = moe_output_buffer_ctx(hidden_states_orig)
@@ -815,7 +902,15 @@ class Glm5NextModel(nn.Module):
         else:
             self.embed_tokens = PPMissingLayer()
 
-        self.alt_stream = torch.cuda.Stream() if (_is_cuda or envs.SGLANG_NPU_USE_MULTI_STREAM.get() or envs.SGLANG_ROCM_USE_MULTI_STREAM.get()) else None
+        self.alt_stream = (
+            torch.cuda.Stream()
+            if (
+                _is_cuda
+                or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+                or envs.SGLANG_ROCM_USE_MULTI_STREAM.get()
+            )
+            else None
+        )
 
         self.layers, self.start_layer, self.end_layer = make_layers(
             config.num_hidden_layers,
@@ -836,25 +931,45 @@ class Glm5NextModel(nn.Module):
             self.norm = PPMissingLayer(return_tuple=True)
 
         self.gemm_output_zero_allocator_size = 0
-        if _use_aiter_gfx95 and config.n_routed_experts == 256 and self.embed_tokens.embedding_dim == 7168:
-            num_moe_layers = sum([1 for i in range(len(self.layers)) if isinstance(self.layers[i].mlp, Glm5NextMoE)])
+        if (
+            _use_aiter_gfx95
+            and config.n_routed_experts == 256
+            and self.embed_tokens.embedding_dim == 7168
+        ):
+            num_moe_layers = sum(
+                [
+                    1
+                    for i in range(len(self.layers))
+                    if isinstance(self.layers[i].mlp, Glm5NextMoE)
+                ]
+            )
 
             allocate_size = 0
             for i in range(len(self.layers)):
                 if isinstance(self.layers[i].mlp, Glm5NextMoE):
                     a2a_backend = get_moe_a2a_backend()
-                    is_a2a_moe = a2a_backend.is_deepep() or a2a_backend.is_mori() or a2a_backend.is_mooncake()
+                    is_a2a_moe = (
+                        a2a_backend.is_deepep()
+                        or a2a_backend.is_mori()
+                        or a2a_backend.is_mooncake()
+                    )
                     tp_size = 1 if is_a2a_moe else get_parallel().tp_size
-                    intermediate_size = config.moe_intermediate_size * config.n_shared_experts
-                    share_expert_output_size_per_partition = divide(intermediate_size * 2, tp_size)
+                    intermediate_size = (
+                        config.moe_intermediate_size * config.n_shared_experts
+                    )
+                    share_expert_output_size_per_partition = divide(
+                        intermediate_size * 2, tp_size
+                    )
                     allocate_size = share_expert_output_size_per_partition
                     break
 
-            self.gemm_output_zero_allocator_size = get_dsv3_gemm_output_zero_allocator_size(
-                config.n_routed_experts,
-                num_moe_layers,
-                allocate_size,
-                self.embed_tokens.embedding_dim,
+            self.gemm_output_zero_allocator_size = (
+                get_dsv3_gemm_output_zero_allocator_size(
+                    config.n_routed_experts,
+                    num_moe_layers,
+                    allocate_size,
+                    self.embed_tokens.embedding_dim,
+                )
             )
         self.layers_to_capture = []
         self.dflash_capture = False
@@ -866,10 +981,14 @@ class Glm5NextModel(nn.Module):
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
 
-    def _prepare_aux_hidden_state(self, hidden_states: torch.Tensor, residual: Optional[torch.Tensor]) -> torch.Tensor:
+    def _prepare_aux_hidden_state(
+        self, hidden_states: torch.Tensor, residual: Optional[torch.Tensor]
+    ) -> torch.Tensor:
         # mHC folds the residual into widened hidden state, so residual remains None
         # until hc_contract merges it; only plain residual streams are added here.
-        aux_hidden_state = hidden_states if residual is None else hidden_states + residual
+        aux_hidden_state = (
+            hidden_states if residual is None else hidden_states + residual
+        )
         if self.dflash_capture and self.config.mhc:
             aux_hidden_state = hc_contract(aux_hidden_state, self.config.hc_mult)
         return aux_hidden_state
@@ -900,7 +1019,9 @@ class Glm5NextModel(nn.Module):
             device=device,
         )
 
-        has_gemm_output_zero_allocator = hasattr(self, "gemm_output_zero_allocator_size")
+        has_gemm_output_zero_allocator = hasattr(
+            self, "gemm_output_zero_allocator_size"
+        )
 
         gemm_output_zero_allocator = (
             BumpAllocator(
@@ -908,14 +1029,18 @@ class Glm5NextModel(nn.Module):
                 dtype=torch.float32,
                 device=device,
             )
-            if has_gemm_output_zero_allocator and self.gemm_output_zero_allocator_size > 0
+            if has_gemm_output_zero_allocator
+            and self.gemm_output_zero_allocator_size > 0
             else None
         )
 
         normal_start_layer = self.start_layer
         normal_end_layer = self.end_layer
         if forward_batch.can_run_tbo and not self.dflash_capture:
-            if self.first_k_dense_replace > normal_start_layer and self.first_k_dense_replace < normal_end_layer:
+            if (
+                self.first_k_dense_replace > normal_start_layer
+                and self.first_k_dense_replace < normal_end_layer
+            ):
                 normal_end_layer = self.first_k_dense_replace
             elif self.first_k_dense_replace < normal_start_layer:
                 normal_end_layer = normal_start_layer = 0
@@ -923,12 +1048,20 @@ class Glm5NextModel(nn.Module):
         topk_indices = None
         for i in range(normal_start_layer, normal_end_layer):
             # NOTE: torch dynamo does not support graph break in context manager
-            ctx = nullcontext() if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE) else get_global_expert_distribution_recorder().with_current_layer(i)
+            ctx = (
+                nullcontext()
+                if check_cuda_graph_backend(Phase.PREFILL, Backend.TC_PIECEWISE)
+                else get_global_expert_distribution_recorder().with_current_layer(i)
+            )
             with ctx:
                 if i in self.layers_to_capture:
-                    aux_hidden_state = self._prepare_aux_hidden_state(hidden_states, residual)
+                    aux_hidden_state = self._prepare_aux_hidden_state(
+                        hidden_states, residual
+                    )
                     if self.enable_a2a_moe and i > self.first_k_dense_replace:
-                        aux_hidden_state = get_parallel().attn_tp_group.all_gather(aux_hidden_state, dim=0)
+                        aux_hidden_state = get_parallel().attn_tp_group.all_gather(
+                            aux_hidden_state, dim=0
+                        )
                     aux_hidden_states.append(aux_hidden_state)
                 layer = self.layers[i]
                 hidden_states, residual, topk_indices = layer(
@@ -949,7 +1082,9 @@ class Glm5NextModel(nn.Module):
                 forward_batch=forward_batch,
                 hidden_states=hidden_states,
                 residual=residual,
-                input_data_scatter_mode=self.layers[normal_end_layer - 1].layer_scatter_modes.layer_output_mode,
+                input_data_scatter_mode=self.layers[
+                    normal_end_layer - 1
+                ].layer_scatter_modes.layer_output_mode,
                 zero_allocator=zero_allocator,
             )
 
@@ -1010,7 +1145,10 @@ class Glm5NextForConditionalGeneration(nn.Module):
         self.encoder_only = bool(getattr(config, "encoder_only", False))
         self.language_only = bool(getattr(config, "language_only", False))
 
-        self.fuse_qkv_a_proj = not self.encoder_only and getattr(text_config, "q_lora_rank", None) is not None
+        self.fuse_qkv_a_proj = (
+            not self.encoder_only
+            and getattr(text_config, "q_lora_rank", None) is not None
+        )
 
         self.pp_group = get_pp_group()
         self.config = text_config
@@ -1023,7 +1161,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
         self.logits_processor = None
         if not self.encoder_only:
             self.determine_num_fused_shared_experts()
-            self.model = Glm5NextModel(text_config, quant_config, prefix=add_prefix("model", prefix))
+            self.model = Glm5NextModel(
+                text_config, quant_config, prefix=add_prefix("model", prefix)
+            )
             if self.pp_group.is_last_rank:
                 if self.pp_group.world_size == 1 and text_config.tie_word_embeddings:
                     self.lm_head = self.model.embed_tokens
@@ -1041,7 +1181,13 @@ class Glm5NextForConditionalGeneration(nn.Module):
 
         self._routed_experts_weights_of_layer = LazyValue(
             lambda: (
-                {layer_id: layer.mlp.get_moe_weights() for layer_id, layer in enumerate(self.model.layers) if isinstance(layer.mlp, Glm5NextMoE)} if self.model is not None else {}
+                {
+                    layer_id: layer.mlp.get_moe_weights()
+                    for layer_id, layer in enumerate(self.model.layers)
+                    if isinstance(layer.mlp, Glm5NextMoE)
+                }
+                if self.model is not None
+                else {}
             )
         )
         self.capture_aux_hidden_states = False
@@ -1062,11 +1208,15 @@ class Glm5NextForConditionalGeneration(nn.Module):
                 prefix=add_prefix("visual", prefix),
                 use_data_parallel=self.use_data_parallel,
             )
-        self.is_mrope_enabled = not self.encoder_only and "mrope_section" in (self.config.rope_scaling or {})
+        self.is_mrope_enabled = not self.encoder_only and "mrope_section" in (
+            self.config.rope_scaling or {}
+        )
 
     def get_input_embeddings(self) -> nn.Embedding:
         if self.model is None:
-            raise AttributeError("get_input_embeddings() is not available in encoder-only mode")
+            raise AttributeError(
+                "get_input_embeddings() is not available in encoder-only mode"
+            )
         return self.model.embed_tokens
 
     @property
@@ -1110,10 +1260,14 @@ class Glm5NextForConditionalGeneration(nn.Module):
         return None
 
     def determine_num_fused_shared_experts(self):
-        self.num_fused_shared_experts = 0 if is_shared_experts_fusion_disabled() else self.config.n_shared_experts
+        self.num_fused_shared_experts = (
+            0 if is_shared_experts_fusion_disabled() else self.config.n_shared_experts
+        )
         if self.num_fused_shared_experts == 0:
             return
-        assert self.num_fused_shared_experts == 1, f"Only 1 fused shared expert is supported for {type(self).__name__}"
+        assert self.num_fused_shared_experts == 1, (
+            f"Only 1 fused shared expert is supported for {type(self).__name__}"
+        )
         log_info_on_rank0(logger, "Shared experts fusion optimization enabled.")
 
     def set_eagle3_layers_to_capture(self, layer_ids: Optional[List[int]] = None):
@@ -1133,7 +1287,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
             return
 
         if layer_ids is None:
-            raise ValueError("DFLASH requires explicit layer_ids for aux hidden capture.")
+            raise ValueError(
+                "DFLASH requires explicit layer_ids for aux hidden capture."
+            )
 
         self.capture_aux_hidden_states = True
         self.model.dflash_capture = True
@@ -1180,23 +1336,31 @@ class Glm5NextForConditionalGeneration(nn.Module):
         return pattern.pad_input_tokens(input_ids, mm_inputs)
 
     def get_image_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        pixel_values = torch.cat([item.feature for item in items], dim=0).type(self.visual.dtype)
+        pixel_values = torch.cat([item.feature for item in items], dim=0).type(
+            self.visual.dtype
+        )
         image_grid_thw = torch.concat([item.image_grid_thw for item in items], dim=0)
         assert pixel_values.dim() == 2, pixel_values.dim()
         assert image_grid_thw.dim() == 2, image_grid_thw.dim()
 
         if self.use_data_parallel:
-            return run_dp_sharded_mrope_vision_model(self.visual, pixel_values, image_grid_thw.tolist(), rope_type="rope_3d")
+            return run_dp_sharded_mrope_vision_model(
+                self.visual, pixel_values, image_grid_thw.tolist(), rope_type="rope_3d"
+            )
         image_embeds = self.visual(pixel_values, grid_thw=image_grid_thw)
         return image_embeds
 
     def get_video_feature(self, items: List[MultimodalDataItem]) -> torch.Tensor:
-        pixel_values = torch.cat([item.feature for item in items], dim=0).type(self.visual.dtype)
+        pixel_values = torch.cat([item.feature for item in items], dim=0).type(
+            self.visual.dtype
+        )
         video_grid_thw = torch.concat([item.video_grid_thw for item in items], dim=0)
 
         temp_frames_hw = []
         for t, h, w in video_grid_thw:
-            repeated_row = torch.tensor([1, h.item(), w.item()]).unsqueeze(0).repeat(t, 1)
+            repeated_row = (
+                torch.tensor([1, h.item(), w.item()]).unsqueeze(0).repeat(t, 1)
+            )
             temp_frames_hw.append(repeated_row)
         flattened_video_grid_thw = torch.cat(temp_frames_hw, dim=0)
 
@@ -1254,7 +1418,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
             hidden_states, aux_hidden_states = hidden_states
 
         if self.pp_group.is_last_rank:
-            return self.logits_processor(input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states)
+            return self.logits_processor(
+                input_ids, hidden_states, self.lm_head, forward_batch, aux_hidden_states
+            )
         else:
             return hidden_states
 
@@ -1263,7 +1429,11 @@ class Glm5NextForConditionalGeneration(nn.Module):
             if hasattr(self.config, "num_nextn_predict_layers"):
                 num_nextn_layers = self.config.num_nextn_predict_layers
                 assert num_nextn_layers == 1, "Only 1 nextn layer is supported"
-                nextn_layer_id = 0 if self.config.num_hidden_layers == 1 else self.config.num_hidden_layers
+                nextn_layer_id = (
+                    0
+                    if self.config.num_hidden_layers == 1
+                    else self.config.num_hidden_layers
+                )
             else:
                 raise ValueError("num_nextn_predict_layers is not in the config")
 
@@ -1326,7 +1496,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
 
             if "visual" in name:
                 name = name.replace("attn.qkv.", "attn.qkv_proj.")
-                loaded_weight = vision_utils.pad_vit_attn_dummy_heads(self.mm_config, name, loaded_weight)
+                loaded_weight = vision_utils.pad_vit_attn_dummy_heads(
+                    self.mm_config, name, loaded_weight
+                )
 
             weight_names.append(name)
 
@@ -1341,7 +1513,10 @@ class Glm5NextForConditionalGeneration(nn.Module):
                     num_nextn_layers = self.config.num_nextn_predict_layers
                     if num_nextn_layers > 0 and name.startswith("model.layers"):
                         name_list = name.split(".")
-                        if len(name_list) >= 3 and int(name_list[2]) >= self.config.num_hidden_layers:
+                        if (
+                            len(name_list) >= 3
+                            and int(name_list[2]) >= self.config.num_hidden_layers
+                        ):
                             continue
             else:
                 if not name.startswith(nextn_layer_prefix):
@@ -1415,11 +1590,24 @@ class Glm5NextForConditionalGeneration(nn.Module):
                     if name.endswith(".bias") and name not in params_dict:
                         continue
 
-                    if fuse_qkv_a_proj and ("q_a_proj" in name or "kv_a_proj_with_mqa" in name):
+                    if fuse_qkv_a_proj and (
+                        "q_a_proj" in name or "kv_a_proj_with_mqa" in name
+                    ):
                         cached_a_proj[name] = loaded_weight
-                        q_a_proj_name = name if "q_a_proj" in name else name.replace("kv_a_proj_with_mqa", "q_a_proj")
-                        kv_a_proj_name = name if "kv_a_proj_with_mqa" in name else name.replace("q_a_proj", "kv_a_proj_with_mqa")
-                        if q_a_proj_name in cached_a_proj and kv_a_proj_name in cached_a_proj:
+                        q_a_proj_name = (
+                            name
+                            if "q_a_proj" in name
+                            else name.replace("kv_a_proj_with_mqa", "q_a_proj")
+                        )
+                        kv_a_proj_name = (
+                            name
+                            if "kv_a_proj_with_mqa" in name
+                            else name.replace("q_a_proj", "kv_a_proj_with_mqa")
+                        )
+                        if (
+                            q_a_proj_name in cached_a_proj
+                            and kv_a_proj_name in cached_a_proj
+                        ):
                             fused_weight = torch.cat(
                                 [
                                     cached_a_proj[q_a_proj_name],
@@ -1437,7 +1625,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
                             )
                             if target in params_dict:
                                 param = params_dict[target]
-                                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                                weight_loader = getattr(
+                                    param, "weight_loader", default_weight_loader
+                                )
                                 weight_loader(param, fused_weight)
                             cached_a_proj.pop(q_a_proj_name, None)
                             cached_a_proj.pop(kv_a_proj_name, None)
@@ -1450,7 +1640,9 @@ class Glm5NextForConditionalGeneration(nn.Module):
                         loaded_weight = loaded_weight.view(1, 1, -1, 1)
 
                     param = params_dict[name]
-                    weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                    weight_loader = getattr(
+                        param, "weight_loader", default_weight_loader
+                    )
                     weight_loader(param, loaded_weight)
 
         if getattr(self, "encoder_only", False):
@@ -1461,29 +1653,41 @@ class Glm5NextForConditionalGeneration(nn.Module):
         else:
             run_post = True
         if run_post:
-            DeepseekV2WeightLoaderMixin.post_load_weights(self, is_nextn=is_nextn, weight_names=weight_names)
+            DeepseekV2WeightLoaderMixin.post_load_weights(
+                self, is_nextn=is_nextn, weight_names=weight_names
+            )
 
     def post_load_weights(self, is_nextn: bool = False, weight_names=None):
         if self.encoder_only:
             return
-        DeepseekV2WeightLoaderMixin.post_load_weights(self, is_nextn=is_nextn, weight_names=weight_names)
+        DeepseekV2WeightLoaderMixin.post_load_weights(
+            self, is_nextn=is_nextn, weight_names=weight_names
+        )
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         if self.model is None:
-            raise AttributeError("load_kv_cache_scales() is not available in encoder-only mode")
+            raise AttributeError(
+                "load_kv_cache_scales() is not available in encoder-only mode"
+            )
         if callable(getattr(self.model, "load_kv_cache_scales", None)):
             self.model.load_kv_cache_scales(quantization_param_path)
         else:
-            logger.warning(f"{self.model.__class__} does not support loading scaling factors.")
+            logger.warning(
+                f"{self.model.__class__} does not support loading scaling factors."
+            )
 
     def get_embed_and_head(self):
         if self.model is None or self.lm_head is None:
-            raise AttributeError("get_embed_and_head() is not available in encoder-only mode")
+            raise AttributeError(
+                "get_embed_and_head() is not available in encoder-only mode"
+            )
         return self.model.embed_tokens.weight, self.lm_head.weight
 
     def set_embed_and_head(self, embed, head):
         if self.model is None or self.lm_head is None:
-            raise AttributeError("set_embed_and_head() is not available in encoder-only mode")
+            raise AttributeError(
+                "set_embed_and_head() is not available in encoder-only mode"
+            )
         del self.model.embed_tokens.weight
         del self.lm_head.weight
         self.model.embed_tokens.weight = embed
