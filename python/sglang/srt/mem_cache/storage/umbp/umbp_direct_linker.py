@@ -196,6 +196,20 @@ class UMBPDirectLinker(UnifiedCacheLinker):
             )
 
         kvcache = params.token_to_kv_pool_allocator.get_kvcache()
+        # Hard-reject UMBP under DCP before any storage config is built: the
+        # UMBP key seams have no DCP-scoped key support, so a default
+        # dcp_rank=0 would silently write rank-colliding keys (every rank
+        # overwriting the same shard objects). Plumbed only when the store
+        # gains DCP-scoped keys.
+        parallel = get_parallel()
+        if parallel.attn_dcp_size > 1:
+            raise NotImplementedError(
+                "UMBP direct linker (--enable-unified-cache-external-linker "
+                "with backend 'mori') does not support --dcp-size > 1: the "
+                "UMBP store has no DCP-scoped key support, so shards from "
+                "different ranks would collide on dcp_rank=0 keys. Run UMBP "
+                "with --dcp-size 1."
+            )
         self._async_offload_index_snapshot = True
         self._offload_index_fallback_warned = False
         self._offload_index_stream = None

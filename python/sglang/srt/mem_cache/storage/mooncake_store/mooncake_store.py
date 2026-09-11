@@ -20,6 +20,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     PoolTransferResult,
+    dcp_key_namespace,
 )
 from sglang.srt.mem_cache.pool_host import HostKVCache, HostTensorAllocator
 from sglang.srt.mem_cache.pool_host.mla import MLATokenToKVPoolHost
@@ -467,6 +468,22 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                 self.attn_cp_rank = 0
                 self.attn_cp_size = 1
 
+            self.registered_pools = {}
+
+            # DCP shard scoping: under decode context parallel every rank owns
+            # a distinct interleaved shard of every page, so its component keys
+            # must carry a rank-scoped namespace (single-writer per
+            # (page, rank)). Appended to BOTH mla/mha suffix bases so every
+            # pool kind inherits it — including the split-heads branch below,
+            # which rebuilds mha_suffix from rank tags. Empty when
+            # dcp_size == 1, keeping dcp=1 keys byte-identical to the
+            # pre-DCP scheme. Note (task 2.4, review finding): buffer-mode
+            # Mooncake does not consume attn_cp_rank in these suffixes while
+            # the direct linker overwrites them with `cp{rank}_pp{rank}` — the
+            # two paths already live in different namespaces for CP/PP; only
+            # the `_dcp` component is kept in parity.
+            self.dcp_suffix = dcp_key_namespace(storage_config)
+
             self.enable_pp = self.pp_size > 1
             if self.enable_pp:
                 self.mha_suffix = f"{self.local_rank}_{self.pp_rank}"
@@ -474,6 +491,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             else:
                 self.mha_suffix = f"{self.local_rank}"
                 self.mla_suffix = ""
+            if self.dcp_suffix:
+                self.mha_suffix += self.dcp_suffix
+                self.mla_suffix += self.dcp_suffix
 
             self.storage_config = storage_config
             self.should_split_heads = storage_config.should_split_heads
@@ -486,8 +506,10 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
                     self.mha_suffix = [f"{rank}_{self.pp_rank}" for rank in target_ranks]
                 else:
                     self.mha_suffix = [f"{rank}" for rank in target_ranks]
-
-            self.registered_pools = {}
+                if self.dcp_suffix:
+                    self.mha_suffix = [
+                        suffix + self.dcp_suffix for suffix in self.mha_suffix
+                    ]
 
             self.gb_per_page = None
             self.prefetch_pgs = []
@@ -606,6 +628,15 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             return keys
         return [f"{self.config_prefix}_{key}" for key in keys]
 
+    # NOTE (double-tag audit): the `_dcp{rank}_{size}` shard tag is applied
+    # EXACTLY ONCE per route, at the deepest single chokepoint — the
+    # mla/mha_suffix composition in __init__ (PR1 seam). Every Mooncake key
+    # route (v2 component keys, v1 _batch_preprocess, generic set/get/exists,
+    # batch_exists queries) composes keys from those suffixes, so an extra
+    # `_dcp_tag_key(s)` pass anywhere below would double-append. PR2's
+    # original per-route tag patches were dropped in favor of the single
+    # suffix-level injection.
+
     def _can_use_group_semantics(self) -> bool:
         return self._use_group_semantics
 
@@ -701,6 +732,11 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             raise ValueError(f"Unsupported Mooncake hybrid pool name: {pool_name}, host_pool={type(host_pool)}")
         key_multiplier = len(suffixes)
         component_keys = [f"{page_key}{suffix}" for page_key in page_keys for suffix in suffixes]
+        # DCP shard tagging happens ONCE, inside `self.mla_suffix` /
+        # `self.mha_suffix` (composed at __init__ from dcp_key_namespace).
+        # Every consumer of this method — buffer-mode v2 I/O, the direct
+        # linker's layer-wise load — inherits the tag from the suffixes; a
+        # second `_dcp_tag_keys` pass here would double-append.
         return component_keys, key_multiplier
 
     def batch_exists_v2(
@@ -906,6 +942,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     def _batch_preprocess(self, keys, host_indices):
         assert len(keys) > 0
         assert len(keys) == len(host_indices) // self.mem_pool_host.page_size
+        # DCP shard tagging rides inside `self.mla_suffix` / `self.mha_suffix`
+        # (composed once at __init__); the v1 seam composes keys from those
+        # suffixes, so no second tag pass here — it would double-append.
         if self.is_mla_backend:
             return self._get_mla_buffer_meta(keys, host_indices)
         else:
@@ -1019,6 +1058,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
     ) -> bool:
         # Only support zero copy set for now
         assert target_location is not None and target_sizes is not None
+        # DCP shard tag rides inside mla/mha_suffix composition (single tag
+        # point; see _get_hybrid_page_component_keys note).
         exist_result = self._batch_exist([key])
         if exist_result[0] == 1:
             return True
@@ -1043,6 +1084,8 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             if keys[i] is None or target_locations[i] is None or target_sizes[i] is None:
                 return False
 
+        # DCP shard tag rides inside mla/mha_suffix composition (single tag
+        # point; see _get_hybrid_page_component_keys note).
         exist_result = self._batch_exist(keys)
         set_keys = []
         set_target_locations = []
@@ -1082,6 +1125,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         target_sizes: Optional[Any] = None,
     ) -> bool:
         assert target_location is not None and target_sizes is not None
+        # DCP shard tag rides inside mla/mha_suffix (single tag point).
         get_result = self._get_batch_zero_copy_impl([key], [target_location], [target_sizes])
         return get_result[0] >= 0
 
@@ -1114,6 +1158,7 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         return len(keys) // key_multiplier
 
     def exists(self, key) -> bool:
+        # DCP shard tag rides inside mla/mha_suffix (single tag point).
         exist_result = self._batch_exist([key])
         return exist_result[0] == 1
 
@@ -1121,6 +1166,9 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         # Apply config prefix if available.
         keys = self._tag_keys(keys)
 
+        # Task 5.1: rank-scoped queries — under DCP this rank probes only its
+        # own `_dcp{rank}_{size}` shard objects; the tag rides inside
+        # mla/mha_suffix composition (single tag point), so no extra pass here.
         if self.is_mla_backend:
             query_keys = [f"{key}_{self.mla_suffix}_k" for key in keys]
             key_multiplier = 1
@@ -1150,6 +1198,20 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
         pass
 
     def clear(self) -> None:
+        # PR2 (task 7.1 shutdown clause): with rank-scoped shard objects in
+        # play, a blanket remove_all() would tear down EVERY rank's shards
+        # from one rank's shutdown path — which is also not single-writer.
+        # Refuse the destructive call when shards are active; lifecycle
+        # deletion for rank-scoped namespaces is the store-side GC follow-up
+        # noted in the proposal's ops section. Legacy clear() unchanged.
+        if self.dcp_suffix:
+            logger.warning(
+                "MooncakeStore.clear() skipped: DCP rank-scoped shards "
+                "(suffix=%r) must not be wiped by one rank's shutdown; "
+                "store-side shard lifecycle deletion is tracked separately.",
+                self.dcp_suffix,
+            )
+            return
         self.store.remove_all()
 
     def _put_batch_zero_copy_impl(

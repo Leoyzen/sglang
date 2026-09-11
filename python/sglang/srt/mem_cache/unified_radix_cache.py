@@ -1770,6 +1770,9 @@ class UnifiedRadixCache(BasePrefixCache):
         if len(prefetch_key) < self.prefetch_threshold:
             return 0
 
+        from sglang.srt.managers.cache_controller import (
+            HICACHE_DCP_CONSENSUS_WATCHDOG_S,
+        )
         from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
             PrefetchOperation,
         )
@@ -1782,12 +1785,44 @@ class UnifiedRadixCache(BasePrefixCache):
         )
         _, storage_hit_count = self.cache_controller._storage_hit_query(operation)
         storage_hit_count_tensor = torch.tensor(storage_hit_count, dtype=torch.int)
-        self._all_reduce_attn_groups(
-            storage_hit_count_tensor, torch.distributed.ReduceOp.MIN
-        )
+        # Task 5.2: min-consensus over logical tokens (tree page_size is the
+        # widened page under DCP). Task 5.3: the attn-group collective covers
+        # exactly the DCP peer set (asserted at controller group creation).
+        # Task 5.5: bounded failure if a peer dies before arriving.
+        cc = self.cache_controller
+        if getattr(cc, "dcp_enabled_shard", False):
+            cc._all_reduce(
+                storage_hit_count_tensor,
+                torch.distributed.ReduceOp.MIN,
+                self._dcp_consensus_groups(),
+                watchdog_timeout=HICACHE_DCP_CONSENSUS_WATCHDOG_S,
+            )
+        else:
+            self._all_reduce_attn_groups(
+                storage_hit_count_tensor, torch.distributed.ReduceOp.MIN
+            )
         storage_hit_count = storage_hit_count_tensor.item()
+        # Task 5.6: floor at LOGICAL page granularity — a partially covered
+        # page is never committed as cacheable state.
         storage_hit_count -= storage_hit_count % self.page_size
         return storage_hit_count
+
+    def _dcp_consensus_groups(self) -> list:
+        """Collective groups covering exactly the DCP peer set (task 5.3).
+
+        DCP peer ranks are constructed as contiguous slices inside each TP
+        group (parallel_state.py), and the controller's custom sync groups
+        were asserted to match those rank sets exactly, so they are the
+        consensus group of record here.
+        """
+        cc = self.cache_controller
+        groups = list(getattr(cc, "prefetch_hits_sync_groups", None) or [])
+        if not groups:
+            raise RuntimeError(
+                "HiCache DCP shard restore requires consensus sync groups "
+                "covering the DCP peer set; none were created at attach."
+            )
+        return groups
 
     def prefetch_from_storage(
         self,
@@ -2460,8 +2495,22 @@ class UnifiedRadixCache(BasePrefixCache):
         chain = operation.all_hash_values
         if chain is None:
             return
+        # Task 5.6: page arithmetic uses the LOGICAL (widened) page size in
+        # every DCP truncation path. The tree's page_size IS that widened
+        # width under DCP, but spell the width explicitly here so a future
+        # refactor cannot silently reintroduce the physical/logical confusion
+        # (the prior move_kv_cache bug class called out in design D4).
+        cc = self.cache_controller
+        logical_page = getattr(cc, "logical_page_size", None) or self.page_size
+        assert logical_page == self.page_size, (
+            "HiCache DCP logical page width drifted from the tree page width: "
+            f"controller={logical_page}, tree={self.page_size}. Belief "
+            "invalidation beyond consensus length must use the widened page."
+        )
         self.storage_existence_cache.invalidate_beyond(
-            PoolName.KV, chain, keep_pages=operation.storage_hit_count // self.page_size
+            PoolName.KV,
+            chain,
+            keep_pages=operation.storage_hit_count // logical_page,
         )
 
     def _account_prefetch_outcome(self, operation, revoked: bool) -> None:

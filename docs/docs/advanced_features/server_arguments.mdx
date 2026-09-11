@@ -2140,6 +2140,12 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`None`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Type: str</td>
     </tr>
+        <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-hicache-dcp-shard`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Admit L3 storage (`--hicache-storage-backend`) together with `--dcp-size > 1`. Each DCP rank backs up and restores its own interleaved KV shard under rank-scoped `_dcp{rank}_{size}` keys. Requires an L3 backend; unsupported combinations (speculative draft pools beyond DSPARK, LMCache, HiSparse, non-MLA models, PD disaggregation, UMBP, `tp_lcm_size` head splitting, Mamba/SWA hole-set pools, `attn_cp_size > 1`) remain hard errors. Switching `--dcp-size` isolates prior DCP L3 objects by design.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
+    </tr>
   </tbody>
 </table>
 

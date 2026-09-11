@@ -13,6 +13,7 @@ from sglang.srt.mem_cache.hicache_storage import (
     HiCacheStorageConfig,
     PoolName,
     PoolTransfer,
+    dcp_key_namespace,
 )
 from sglang.srt.mem_cache.hybrid_cache.hybrid_cache_controller import (
     HybridCacheController,
@@ -32,11 +33,30 @@ logger = logging.getLogger(__name__)
 device_module = get_device_module()
 
 
-def _storage_suffix(*, rank_replicated: bool, tp_rank: int, attn_cp_rank: int, pp_rank: int) -> str:
+def _storage_suffix(
+    *,
+    rank_replicated: bool,
+    tp_rank: int,
+    attn_cp_rank: int,
+    pp_rank: int,
+    dcp_rank: int = 0,
+    dcp_size: int = 1,
+) -> str:
     parts = []
     if not rank_replicated:
         parts.append(f"tp{tp_rank}")
     parts.extend((f"cp{attn_cp_rank}", f"pp{pp_rank}"))
+    # DCP tag rides at the same grammar as the buffer-mode `config_suffix` /
+    # MooncakeStore component namespaces (`_dcp{rank}_{size}`); the joining
+    # underscore belongs to the tag, so strip it here where parts are
+    # underscore-joined. Note: the linker namespace already diverges from
+    # buffer-mode Mooncake today (`cp{rank}_pp{rank}` vs rank-scheme
+    # suffixes) — only the `_dcp` component is required to match (task 2.4);
+    # the divergence is a recorded upstream question, not something this
+    # seam fixes.
+    dcp_tag = dcp_key_namespace(dcp_rank=dcp_rank, dcp_size=dcp_size)
+    if dcp_tag:
+        parts.append(dcp_tag[1:])
     return "_".join(parts)
 
 
@@ -111,8 +131,24 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             tp_rank = torch.distributed.get_rank(group=tp_group)
             tp_size = torch.distributed.get_world_size(group=tp_group)
         rank_replicated = self.pool_group.rank_replicated
-        self.offload_owner = not rank_replicated or tp_rank == 0
-        extra_config, *_ = HybridCacheController.parse_storage_backend_extra_config(get_memory().hicache_storage_backend_extra_config)
+        # PR2 (task 4.3): under DCP every rank owns its own shard keys, so the
+        # offload-owner mask widens to all ranks when the DCP-L3 shard flag is
+        # active. Legacy mask preserved byte-for-byte when the flag is off.
+        parallel = get_parallel()
+        dcp_size = getattr(parallel, "attn_dcp_size", 1)
+        dcp_rank = getattr(parallel, "attn_dcp_rank", 0)
+        enable_hicache_dcp_shard = bool(
+            getattr(get_memory(), "enable_hicache_dcp_shard", False)
+        )
+        dcp_enabled = dcp_size > 1 and enable_hicache_dcp_shard
+        self.dcp_rank = dcp_rank if dcp_enabled else 0
+        self.offload_owner = not rank_replicated or tp_rank == 0 or dcp_enabled
+        extra_config, *_ = HybridCacheController.parse_storage_backend_extra_config(
+            get_memory().hicache_storage_backend_extra_config
+        )
+        # DCP is its own sharding axis: each rank holds a distinct interleaved
+        # shard of each widened page, so storage config and key namespaces must
+        # be rank-scoped (same fields as the buffer-mode construction site).
         storage_config = HiCacheStorageConfig(
             tp_rank=tp_rank,
             tp_size=tp_size,
@@ -125,6 +161,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             is_page_first_layout=False,
             model_name=get_model().model_path,
             extra_config=extra_config,
+            dcp_rank=dcp_rank,
+            dcp_size=dcp_size,
+            enable_hicache_dcp_shard=enable_hicache_dcp_shard,
         )
         if storage is None:
             from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
@@ -141,16 +180,23 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             tp_rank=tp_rank,
             attn_cp_rank=params.attn_cp_rank,
             pp_rank=params.pp_rank,
+            dcp_rank=dcp_rank,
+            dcp_size=dcp_size,
         )
         self.storage.mla_suffix = storage_suffix
         self.storage.mha_suffix = storage_suffix
         logger.info(
-            "Mooncake direct linker storage topology: rank_replicated=%s, tp_rank=%d/%d, offload_owner=%s, suffix=%s",
+            "Mooncake direct linker storage topology: "
+            "rank_replicated=%s, tp_rank=%d/%d, offload_owner=%s, suffix=%s, "
+            "dcp_shard=%s (dcp_rank=%d, dcp_size=%d)",
             rank_replicated,
             tp_rank,
             tp_size,
             self.offload_owner,
             storage_suffix,
+            dcp_enabled,
+            self.dcp_rank,
+            dcp_size,
         )
 
         self.register_buffers()

@@ -181,6 +181,21 @@ class Memory:
         int,
         "Maximum storage prefetch retries per request when --hicache-storage-prefetch-retry-poll-interval is set.",
     ] = 4
+    enable_hicache_dcp_shard: A[
+        bool,
+        Arg(
+            help=(
+                "Admit L3 storage (--hicache-storage-backend) together with "
+                "--dcp-size > 1: each DCP rank backs up and restores its own "
+                "interleaved KV shard under rank-scoped _dcp{rank}_{size} "
+                "keys. Requires an L3 backend; unsupported combinations "
+                "(speculative draft pools beyond DSPARK, LMCache, HiSparse, "
+                "non-MLA models, PD disaggregation, UMBP, tp_lcm_size head "
+                "splitting, Mamba/SWA hole-set pools, attn_cp_size > 1) stay "
+                "hard-rejected."
+            ),
+        ),
+    ] = False
 
     # -------------------------------------------------------------------------
     # Unified Radix Cache

@@ -213,6 +213,27 @@ python3 -m sglang.launch_server \
   - `interface_v1`: 0 (disable) or 1 (enable) to control usage of batch_get_v1 and batch_set_v1 methods
 
 
+### Decode Context Parallelism (DCP) with L3 Storage
+
+By default, combining `--dcp-size > 1` with `--hicache-storage-backend` fails at startup: under DCP each rank holds a distinct interleaved KV shard of every page, and the storage keys are not rank-aware. Passing `--enable-hicache-dcp-shard` admits the combination:
+
+```bash Command
+--dcp-size 4
+--enable-hierarchical-cache
+--hicache-storage-backend mooncake
+--enable-hicache-dcp-shard
+```
+
+Behavior under the flag:
+
+- Each rank writes only its own shard object, under keys suffixed `_dcp{rank}_{size}` (for example `_dcp2_4`). Shards never collide across ranks.
+- The stored-object count scales with the DCP degree: every logical page produces one object per rank. Watch the startup log line that reports the estimated amplification (degree × pages) before sizing the store.
+- Changing `--dcp-size` orphans previously written DCP L3 objects: the key suffix embeds the degree, so a dcp2 run never reads dcp4 objects (and vice versa). This is the same namespace-isolation trade-off as dtype-keyed keys — plan GC on the storage side accordingly.
+
+The flag requires an L3 backend (startup fails otherwise), and unsupported combinations stay hard-rejected regardless of the flag: speculative draft pools beyond DSPARK, LMCache, HiSparse, non-MLA host pools, PD disaggregation with L3, the UMBP/mori direct linker, `tp_lcm_size` head splitting, Mamba/SWA hole-set pools (a per-page mask-intersection consensus is planned as a follow-up), and `attn_cp_size > 1` combined with `dcp_size > 1`.
+
+Context and roadmap: this feature closes the HiCache × DCP composability item tracked in [sgl-project/sglang#29736](https://github.com/sgl-project/sglang/issues/29736). An earlier design discussion that kept a single canonical key layout is in [#33767](https://github.com/sgl-project/sglang/pull/33767); this implementation instead writes shard-native keys (one object per rank), which coexists cleanly with any future canonical-layout scheme because the two namespaces never overlap.
+
 ## Community and Support
 
 - **GitHub Issues**: Report bugs and feature requests

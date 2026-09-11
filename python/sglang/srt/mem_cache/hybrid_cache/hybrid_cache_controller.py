@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any, Callable, List, Optional
 import torch
 
 from sglang.srt.managers.cache_controller import (
+    HICACHE_DCP_CONSENSUS_WATCHDOG_S,
     CacheOperation,
 )
 from sglang.srt.managers.cache_controller import (
@@ -112,6 +113,9 @@ class HybridCacheController(BaseHiCacheController):
     ):
         startup_storage_backend = storage_backend
         self.extra_host_mem_release_queues: dict[PoolName, Queue[torch.Tensor]] = {}
+        # Set by the base __init__ path as well; harmless to set eagerly so
+        # the flag exists even before attach_storage_backend.
+        self._warned_backup_skip = False
         super().__init__(
             token_to_kv_pool_allocator=token_to_kv_pool_allocator,
             mem_pool_host=mem_pool_host,
@@ -691,9 +695,19 @@ class HybridCacheController(BaseHiCacheController):
             pool_hits = count_pool_hits(results)
             operation.pool_storage_result.update_extra_pool_hit_pages(pool_hits)
 
-        if not self.backup_skip:
+        if self.should_write_kv_to_storage():
             super()._page_backup(operation)
         else:
+            if not self._warned_backup_skip:
+                # Ack-but-no-bytes failure mode is invisible in production;
+                # surface it once per process.
+                logger.warning(
+                    "HybridCacheController._page_backup: dropping primary KV "
+                    "backup on tp_rank=%d (MLA backup_skip). Ops are acked "
+                    "with completed_tokens=0 and nothing is persisted.",
+                    self.storage_config.tp_rank,
+                )
+                self._warned_backup_skip = True
             sidecar_ok = bool(backup_transfers)
             if sidecar_ok:
                 for transfer in backup_transfers:
@@ -716,6 +730,11 @@ class HybridCacheController(BaseHiCacheController):
 
     def should_backup(self, transfer: PoolTransfer) -> bool:
         if not self.backup_skip:
+            return True
+
+        # Under the DCP shard path the replicated-MLA premise is gone: every
+        # rank owns an interleaved KV shard and must write it.
+        if self.dcp_enabled_shard:
             return True
 
         # Kimi-K3 Mamba/KDA state is TP-sharded even when the primary MLA KV
@@ -910,6 +929,9 @@ class HybridCacheController(BaseHiCacheController):
                 packed,
                 torch.distributed.ReduceOp.MIN,
                 self.prefetch_completion_sync_groups,
+                watchdog_timeout=(
+                    HICACHE_DCP_CONSENSUS_WATCHDOG_S if self.dcp_enabled_shard else None
+                ),
             )
             for i, pool in enumerate(PoolName):
                 ack.pool_hits[pool.value] = packed[i].item()

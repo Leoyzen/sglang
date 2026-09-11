@@ -23,6 +23,56 @@ logger = logging.getLogger(__name__)
 STORAGE_BATCH_SIZE = 128
 
 
+def dcp_key_namespace(
+    storage_config: Optional[HiCacheStorageConfig] = None,
+    *,
+    dcp_rank: int = 0,
+    dcp_size: int = 1,
+) -> str:
+    """The `_dcp{rank}_{size}` key-namespace tag for a DCP degree.
+
+    Accepts either a ``HiCacheStorageConfig`` or explicit rank/size kwargs.
+    Returns "" when DCP is inactive (``dcp_size <= 1``) so that dcp=1 keys stay
+    byte-identical to pre-DCP keys. Every rank-scoped L3 key seam (file
+    ``config_suffix``, MooncakeStore component-key namespaces) composes this
+    tag so the two consumption paths (buffer-mode and direct-linker) agree on
+    the DCP component of a key.
+    """
+    if storage_config is not None:
+        dcp_rank = storage_config.dcp_rank
+        dcp_size = storage_config.dcp_size
+    if dcp_size <= 1:
+        return ""
+    return f"_dcp{dcp_rank}_{dcp_size}"
+
+
+def dcp_shard_active(storage_config: Optional[Any]) -> bool:
+    """PR2 gate: DCP-rank-scoped shard backup/restore is active.
+
+    New behavior activates only when the feature flag is set AND the degree
+    exceeds one; flag off (or dcp=1) keeps byte-identical legacy behavior on
+    every path this change touches.
+    """
+    return bool(
+        storage_config is not None
+        and getattr(storage_config, "dcp_size", 1) > 1
+        and getattr(storage_config, "enable_hicache_dcp_shard", False)
+    )
+
+
+def dcp_logical_keep_pages(hit_tokens: int, logical_page_size: int) -> int:
+    """Fully-covered logical pages for a token hit length (task 5.6).
+
+    Floor division guarantees a partially-covered page is never treated as
+    cacheable. ``logical_page_size`` MUST be the widened page
+    (``page_size * dcp_size``) that the radix tree pages at under DCP.
+    """
+    assert logical_page_size > 0
+    if hit_tokens <= 0:
+        return 0
+    return hit_tokens // logical_page_size
+
+
 @dataclass
 class HiCacheStorageConfig:
     tp_rank: int
@@ -39,6 +89,17 @@ class HiCacheStorageConfig:
     should_split_heads: bool = False
     extra_config: Optional[dict] = None
     kv_cache_dtype: Optional[str] = None
+    # Decode-context-parallel axis (distinct from attn_cp_*: DCP interleaves
+    # slots WITHIN a page across ranks, while NSA CP slices whole pages).
+    # Defaults describe a non-DCP run so dcp_size=1 keys stay byte-identical
+    # to pre-DCP-suffix keys.
+    dcp_rank: int = 0
+    dcp_size: int = 1
+    # Feature flag admitting L3 storage under --dcp-size > 1 (gating spec,
+    # default off). Read by dcp_shard_active(); plumbed end-to-end from
+    # server_args via the controller/linker construction sites. False keeps
+    # legacy behavior on every path.
+    enable_hicache_dcp_shard: bool = False
 
 
 @dataclass
@@ -405,6 +466,11 @@ class HiCacheFile(HiCacheStorage):
             self.config_suffix += f"_cp{attn_cp_rank}_{attn_cp_size}"
         if storage_config.kv_cache_dtype is not None:
             self.config_suffix += f"_dtype_{storage_config.kv_cache_dtype}"
+        # Under decode context parallel each rank holds a distinct interleaved
+        # shard of every page; scope keys per rank so shards never collide
+        # (single-writer per (page, rank) key). Empty when dcp_size == 1, so
+        # non-DCP keys stay byte-identical to the pre-DCP scheme.
+        self.config_suffix += dcp_key_namespace(storage_config)
 
         if not os.path.exists(self.file_path) and tp_rank == 0 and attn_cp_rank == 0:
             os.makedirs(self.file_path)

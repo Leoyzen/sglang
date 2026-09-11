@@ -200,10 +200,29 @@ class TestTransferEntryPointsTranslate(CustomTestCase):
         torch.testing.assert_close(kwargs["src_indices"], expected)
         torch.testing.assert_close(kwargs["dst_indices"], expected)
 
-    def test_l3_data_page_is_guarded(self):
+    def test_l3_data_page_takes_per_rank_physical_rows(self):
+        # PR2 real-file-backend fix: the dcp_size==1 guard is replaced by
+        # rank-scoped semantics. The controller folds widened logical host
+        # indices (maybe_dcp_kernel_indices) before touching the L3 seams, so
+        # get_data_page/set_from_flat_data_page now accept per-rank physical
+        # row starts and slice exactly this rank's page_size rows — one
+        # physical page per widened page, never the full widened page.
         pool = _make_host_pool(dcp_rank=0)
-        with self.assertRaises(AssertionError):
-            pool.get_data_page(0)
+        self.assertEqual(pool.page_size, PHYSICAL_PAGE)
+        page = pool.get_data_page(2 * PHYSICAL_PAGE, flat=False)
+        # layer_first: [layers, page_size, 1, kv_cache_dim]
+        self.assertEqual(tuple(page.shape)[1], PHYSICAL_PAGE)
+        flat = pool.get_data_page(2 * PHYSICAL_PAGE, flat=True)
+        self.assertEqual(
+            flat.numel(), pool.layer_num * PHYSICAL_PAGE * 1 * pool.kv_cache_dim
+        )
+        # Roundtrip through the set seam with a folded index.
+        dst = pool.get_dummy_flat_data_page()
+        dst.fill_(1.0)
+        pool.set_from_flat_data_page(2 * PHYSICAL_PAGE, dst)
+        torch.testing.assert_close(
+            pool.get_data_page(2 * PHYSICAL_PAGE, flat=True), dst
+        )
 
 
 if __name__ == "__main__":

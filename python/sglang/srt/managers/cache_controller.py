@@ -30,6 +30,8 @@ from sglang.srt.mem_cache.hicache_storage import (
     PoolName,
     PoolTransfer,
     count_pool_hits,
+    dcp_key_namespace,
+    dcp_shard_active,
 )
 
 if TYPE_CHECKING:
@@ -42,7 +44,7 @@ from sglang.srt.layers.dp_attention import (
 )
 from sglang.srt.mem_cache.l2_transfer import L2Transfer, L2TransferEngine
 from sglang.srt.mem_cache.memory_pool import MLATokenToKVPool
-from sglang.srt.runtime_context import get_parallel
+from sglang.srt.runtime_context import get_memory, get_parallel
 from sglang.srt.utils import get_device_module
 
 logger = logging.getLogger(__name__)
@@ -237,6 +239,10 @@ class StorageOperation:
         self.stats_requested_tokens = 0
         # Absolute token offset at which this storage-prefetched span starts.
         self.storage_start = 0
+        # PR2 (task 5.4/6.3): dcp_rank whose storage query raised during this
+        # op's consensus-participating query, or None when none did. Set by
+        # _storage_hit_query; consumed for the truncated-restore warning.
+        self.storage_failure_rank: Optional[int] = None
 
         self.id = StorageOperation.counter
         StorageOperation.counter += 1
@@ -252,6 +258,10 @@ HICACHE_LOAD_POOL_USAGE_FRACTION = 0.9
 # Write-staging floor: writes are deferrable, so the flush gate grows the
 # write window dynamically into whatever load staging is not using.
 HICACHE_WRITE_STAGING_POOL_FRACTION = 0.2
+# PR2 (task 5.5): bounded failure for a pre-collective rank death. The gloo
+# consensus all_reduce gets a watchdog of this many seconds under DCP; the
+# timeout raises inside the waiting thread as an engine-visible failure.
+HICACHE_DCP_CONSENSUS_WATCHDOG_S = 60.0
 
 
 class PrefetchOperation(StorageOperation):
@@ -318,6 +328,15 @@ class HiCacheController:
         self.storage_host_pool = mem_pool_host
         self.write_policy = write_policy
         self.page_size = page_size
+        # DCP shard-backup state (populated at attach; inert until then).
+        # Under DCP the controller's page_size is ALREADY the widened logical
+        # page (kv_cache_builder passes allocator.page_size = base * dcp_size,
+        # and the tree pages at that width), so all consensus/truncation
+        # arithmetic on self.page_size operates on logical tokens natively.
+        self.dcp_enabled_shard = False
+        self.dcp_rank = 0
+        self.dcp_size = 1
+        self.logical_page_size = page_size
         self.io_backend = io_backend
         self.enable_storage = False
         self.storage_backend = None
@@ -388,6 +407,46 @@ class HiCacheController:
             )
         return 0, 1
 
+    def get_dcp_rank_and_size(self) -> tuple[int, int]:
+        """Derive the DCP rank/size from the parallel context (legacy naming
+        follows get_attn_cp_rank_and_size)."""
+        try:
+            parallel = get_parallel()
+        except Exception:
+            return 0, 1
+        if not parallel.dcp_enabled:
+            return 0, 1
+        return parallel.attn_dcp_rank, parallel.attn_dcp_size
+
+    def _assert_dcp_peer_group(self, group) -> None:
+        """Task 5.3: the consensus group must cover EXACTLY the DCP peer set.
+
+        Accepts any object exposing ``.ranks`` (a GroupCoordinator or a plain
+        rank-list handle) or an unregistered torch ProcessGroup handle.
+        DCP ranks are carved inside each TP group as contiguous slices
+        (parallel_state.py: tp_group[start:start+dcp_size]), so a group whose
+        rank set is wider (a whole TP group at dcp<dcp_size) or narrower than
+        the peer set would silently corrupt min()-consensus truncation. Named
+        assertion at group construction, not an assumed invariant.
+        """
+        # A custom-created group handle (pre-registration) exposes only
+        # ``.ranks``; a live group needs the torch rank-extraction path.
+        group_ranks = (
+            torch.distributed.get_process_group_ranks(group)
+            if hasattr(group, "device_group") or hasattr(group, "cpu_group")
+            else list(group.ranks)
+        )
+        dcp_group = get_parallel().dcp_group
+        dcp_ranks = list(dcp_group.ranks)
+        if sorted(group_ranks) != sorted(dcp_ranks):
+            raise AssertionError(
+                "HiCache DCP consensus group membership mismatch: consensus "
+                f"group ranks {sorted(group_ranks)} != DCP peer set "
+                f"{sorted(dcp_ranks)}. The hit-length collective must run over "
+                "exactly the DCP peer set; refusing to build a group that "
+                "would truncate restore lengths on illegal page boundaries."
+            )
+
     def _create_sync_groups(self) -> List[torch.distributed.ProcessGroup]:
         from sglang.srt.distributed.parallel_state import create_custom_parallel_group
 
@@ -408,6 +467,12 @@ class HiCacheController:
             if group_ranks in seen_rank_sets:
                 continue
             seen_rank_sets.add(group_ranks)
+            if self.dcp_enabled_shard:
+                # Task 5.3: assert each participating group covers exactly the
+                # DCP peer set before it can host a consensus collective.
+                self._assert_dcp_peer_group(
+                    type("GroupHandle", (), {"ranks": list(group_ranks)})()
+                )
             groups.append(
                 create_custom_parallel_group(
                     group_ranks=list(group_ranks), backend="gloo"
@@ -429,9 +494,35 @@ class HiCacheController:
         tensor: torch.Tensor,
         op,
         groups: List[torch.distributed.ProcessGroup],
+        *,
+        watchdog_timeout: Optional[float] = None,
     ) -> None:
         for group in groups:
-            torch.distributed.all_reduce(tensor, op=op, group=group)
+            if watchdog_timeout is not None:
+                # Task 5.5: a peer dying before reaching the collective must
+                # surface as a bounded engine-visible failure, never an
+                # indefinite silent stall. gloo has no built-in timeout, so
+                # guard the all_reduce with a daemon timer that raises inside
+                # the waiting thread when the deadline passes.
+                timer = threading.Timer(
+                    watchdog_timeout,
+                    lambda: (_ for _ in ()).throw(  # noqa: B023
+                        TimeoutError(
+                            "HiCache DCP consensus all_reduce timed out after "
+                            f"{watchdog_timeout}s: a DCP peer likely died "
+                            "before reaching the collective (bounded engine "
+                            "failure per dcp-l3-backup spec, task 5.5)."
+                        )
+                    ),
+                )
+                timer.daemon = True
+                timer.start()
+                try:
+                    torch.distributed.all_reduce(tensor, op=op, group=group)
+                finally:
+                    timer.cancel()
+            else:
+                torch.distributed.all_reduce(tensor, op=op, group=group)
 
     def _start_storage_threads(self):
         """Start storage prefetch/backup threads and their queues.
@@ -556,6 +647,31 @@ class HiCacheController:
             # todo: load balancing
             and self.storage_config.tp_rank != 0
         )
+        # PR2 (task 4.1): under DCP+L3 each rank backs up its own interleaved
+        # shard on rank-scoped `_dcp{rank}_{size}` keys, so the replicated-MLA
+        # rank-0-only skip must NOT suppress per-rank writes (flag-gated: a
+        # legacy dcp=1/flag-off deployment keeps the exact old semantics).
+        # Single source of truth for "does this rank write primary KV pages to
+        # L3". Legacy: replicated-MLA rank0-only writes (backup_skip). Under
+        # DCP+shard, KV is interleaved per rank so every rank must write its
+        # own shard. NOTE: subclasses (HybridCacheController) override
+        # _page_backup/backup_thread_func — they must call this helper rather
+        # than re-deriving the condition, or the two copies drift (that drift
+        # silently dropped all rank>0 shard writes once already).
+        if dcp_shard_active(self.storage_config):
+            self.dcp_enabled_shard = True
+            self.dcp_rank = self.storage_config.dcp_rank
+            self.dcp_size = self.storage_config.dcp_size
+            # Widened (logical) page: tree/controller arithmetic width.
+            self.logical_page_size = self.page_size
+            logger.info(
+                "HiCache DCP shard backup enabled: dcp_rank=%d dcp_size=%d "
+                "logical_page_size=%d key_suffix=%r",
+                self.dcp_rank,
+                self.dcp_size,
+                self.logical_page_size,
+                dcp_key_namespace(dcp_rank=self.dcp_rank, dcp_size=self.dcp_size),
+            )
 
         # Use storage backend factory for dynamic backend creation
         from sglang.srt.mem_cache.storage import StorageBackendFactory
@@ -721,6 +837,16 @@ class HiCacheController:
             )
 
         attn_cp_rank, attn_cp_size = self.get_attn_cp_rank_and_size()
+        # Real DCP axis values from the parallel context; the feature flag
+        # arrives via the resolved memory config (end-to-end plumb so
+        # dcp_shard_active() sees it on the storage config). An unpublished
+        # config bag (or a bag predating the flag) keeps the flag off —
+        # fail-open would silently arm shard writes on legacy deployments.
+        dcp_rank, dcp_size = self.get_dcp_rank_and_size()
+        try:
+            enable_hicache_dcp_shard = bool(get_memory().enable_hicache_dcp_shard)
+        except (AttributeError, ValueError):
+            enable_hicache_dcp_shard = False
 
         return HiCacheStorageConfig(
             tp_rank=self.tp_rank,
@@ -738,6 +864,13 @@ class HiCacheController:
             should_split_heads=should_split_heads,
             extra_config=storage_backend_extra_config,
             kv_cache_dtype=str(self.mem_pool_host.dtype),
+            # DCP rides as its own sharding axis (distinct from attn_cp_*):
+            # under DCP every rank holds a distinct interleaved MLA KV shard
+            # of each widened page, so storage keys must be rank-scoped, and
+            # the shard backup gate reads the flag off this config.
+            dcp_rank=dcp_rank,
+            dcp_size=dcp_size,
+            enable_hicache_dcp_shard=enable_hicache_dcp_shard,
         )
 
     def reset(self):
@@ -997,11 +1130,40 @@ class HiCacheController:
         for page in pages:
             self.host_mem_release_queue.put(page)
 
+    def _dcp_shard_kernel_indices(self, host_indices: torch.Tensor) -> torch.Tensor:
+        """Fold widened logical host slots into this rank's kernel indices.
+
+        Under DCP shard backup (``dcp_size > 1``) every batch handed to the
+        page set/get functions is a run of whole widened (logical) pages in
+        the host pool's logical index space, while the host pool's kernels
+        and ``get_data_page``/``set_from_flat_data_page`` operate on this
+        rank's per-rank physical rows (owner rule: keep slots
+        ``% dcp_size == dcp_rank``, then ``// dcp_size``). Reuses
+        ``HostKVCache.maybe_dcp_kernel_indices`` so the storage path applies
+        exactly the same translation as the transfer-boundary paths.
+        Identity (no copy) when DCP is inactive.
+        """
+        if self.dcp_size <= 1:
+            return host_indices
+        assert self.dcp_enabled_shard, (
+            "HiCache DCP storage sharding received widened logical indices "
+            f"(dcp_size={self.dcp_size}) but the shard gate is not active; "
+            "refusing to silently reinterpret the index space."
+        )
+        kernel_indices = self.storage_host_pool.maybe_dcp_kernel_indices(host_indices)
+        assert kernel_indices.numel() == host_indices.numel() // self.dcp_size, (
+            "HiCache DCP shard folding produced "
+            f"{kernel_indices.numel()} kernel slots from "
+            f"{host_indices.numel()} logical slots with dcp_size={self.dcp_size}; "
+            "batches must be runs of whole widened pages."
+        )
+        return kernel_indices
+
     def _page_get_zero_copy(
         self, operation, hash_values, host_indices, extra_info=None
     ) -> int:
         results = self.storage_backend.batch_get_v1(
-            hash_values, host_indices, extra_info
+            hash_values, self._dcp_shard_kernel_indices(host_indices), extra_info
         )
         inc = 0
         for i in range(len(hash_values)):
@@ -1017,6 +1179,11 @@ class HiCacheController:
     def _generic_page_get(
         self, operation, hash_values, host_indices, extra_info=None
     ) -> int:
+        kernel_host_indices = self._dcp_shard_kernel_indices(host_indices)
+        # Per-rank kernel page width: the host pool's page_size is the
+        # per-rank physical page; the controller's page_size is the widened
+        # logical page under DCP (equal when dcp_size == 1).
+        per_rank_page_size = self.storage_host_pool.page_size
         dummy_page_dst = [
             self.storage_host_pool.get_dummy_flat_data_page() for _ in hash_values
         ]
@@ -1033,7 +1200,7 @@ class HiCacheController:
             if operation.is_terminated():
                 break
             self.storage_host_pool.set_from_flat_data_page(
-                host_indices[i * self.page_size],
+                kernel_host_indices[i * per_rank_page_size],
                 page_data[i],
             )
             count += 1
@@ -1108,10 +1275,14 @@ class HiCacheController:
         # Read from KV-derived sidecar pools, if any.
         sidecar_hits: dict[str, int] = {}
         if len(kv_derived_transfers) > 0:
+            # Sidecar v2 backends do per-rank physical page arithmetic on
+            # host_indices (len == len(keys) * host_pool.page_size); fold the
+            # widened controller slots exactly like the KV page functions.
+            sidecar_host_indices = self._dcp_shard_kernel_indices(batch_host_indices)
             current_kv_derived_transfers = [
                 PoolTransfer(
                     name=transfer.name,
-                    host_indices=batch_host_indices,
+                    host_indices=sidecar_host_indices,
                     keys=batch_hashes,
                 )
                 for transfer in kv_derived_transfers
@@ -1176,11 +1347,31 @@ class HiCacheController:
             tokens_to_fetch, last_hash, page_size=self.page_size
         )
         operation.all_hash_values = page_hashes
+        # Task 5.4: a storage exception during a consensus-participating query
+        # must not strand the collective. Normalize to a degraded result (zero
+        # contribution, error logged with the failing-rank identity); every
+        # rank still reaches the MIN all-reduce, which truncates uniformly.
+        storage_failure_rank: Optional[int] = None
 
         for start in range(0, len(page_hashes), STORAGE_BATCH_SIZE):
             batch_hashes = page_hashes[start : start + STORAGE_BATCH_SIZE]
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
-            hit_page_num = self.storage_backend.batch_exists(batch_hashes, extra_info)
+            try:
+                hit_page_num = self.storage_backend.batch_exists(
+                    batch_hashes, extra_info
+                )
+            except Exception as e:
+                if self.dcp_enabled_shard:
+                    storage_failure_rank = self.dcp_rank
+                    logger.error(
+                        "HiCache DCP shard existence check failed on "
+                        "dcp_rank=%d (normalized to hit-length 0): %s",
+                        self.dcp_rank,
+                        e,
+                    )
+                    hit_page_num = 0
+                else:
+                    raise
             hash_value.extend(batch_hashes[:hit_page_num])
             storage_query_count += hit_page_num * self.page_size
             if hit_page_num < len(batch_hashes):
@@ -1188,6 +1379,7 @@ class HiCacheController:
             if prefix_keys and len(prefix_keys) > 0:
                 prefix_keys += batch_hashes
 
+        operation.storage_failure_rank = storage_failure_rank
         return hash_value, storage_query_count
 
     def prefetch_thread_func(self):
@@ -1210,8 +1402,40 @@ class HiCacheController:
                     storage_hit_count_tensor,
                     torch.distributed.ReduceOp.MIN,
                     self.prefetch_hits_sync_groups,
+                    watchdog_timeout=(
+                        HICACHE_DCP_CONSENSUS_WATCHDOG_S
+                        if self.dcp_enabled_shard
+                        else None
+                    ),
                 )
-                storage_hit_count = storage_hit_count_tensor.item()
+                consensus_hit_count = storage_hit_count_tensor.item()
+                if self.dcp_enabled_shard:
+                    # Tasks 5.2 + 6.2: consensus operates on logical tokens;
+                    # per-rank divergence beyond the adopted min is warned with
+                    # per-rank detail so the truncation stays diagnosable.
+                    # (The consensus group was asserted to cover exactly the
+                    # DCP peer set at construction — task 5.3.)
+                    if consensus_hit_count != storage_hit_count:
+                        logger.warning(
+                            "HiCache DCP shard hit-length consensus diverged: "
+                            "dcp_rank=%d local_tokens=%d consensus_tokens=%d "
+                            "(adopting min across dcp_size=%d peers)",
+                            self.dcp_rank,
+                            storage_hit_count,
+                            consensus_hit_count,
+                            self.dcp_size,
+                        )
+                    if (
+                        consensus_hit_count > 0
+                        and operation.storage_failure_rank is not None
+                    ):
+                        logger.warning(
+                            "HiCache DCP shard hit truncated to consensus=%d "
+                            "tokens after storage failure on dcp_rank=%d",
+                            consensus_hit_count,
+                            operation.storage_failure_rank,
+                        )
+                storage_hit_count = consensus_hit_count
 
                 # Record the TP-synced hit count; the scheduler thread decides
                 # at drain time whether to revoke (below threshold) or allocate.
@@ -1242,18 +1466,36 @@ class HiCacheController:
 
     # todo: deprecate
     def _generic_page_set(self, hash_values, host_indices, extra_info=None) -> bool:
+        kernel_host_indices = self._dcp_shard_kernel_indices(host_indices)
+        per_rank_page_size = self.storage_host_pool.page_size
         data = [
-            self.storage_host_pool.get_data_page(host_indices[i * self.page_size])
+            self.storage_host_pool.get_data_page(
+                kernel_host_indices[i * per_rank_page_size]
+            )
             for i in range(len(hash_values))
         ]
         return self.storage_backend.batch_set(hash_values, data)
 
     def _page_set_zero_copy(self, hash_values, host_indices, extra_info=None) -> bool:
         return all(
-            self.storage_backend.batch_set_v1(hash_values, host_indices, extra_info)
+            self.storage_backend.batch_set_v1(
+                hash_values,
+                self._dcp_shard_kernel_indices(host_indices),
+                extra_info,
+            )
         )
 
     # Backup batch by batch
+    def should_write_kv_to_storage(self) -> bool:
+        """Single source of truth: should this rank write primary KV pages to
+        L3? Legacy replicated-MLA semantics let rank0 write alone
+        (backup_skip); under the DCP shard path every rank writes its own
+        interleaved shard, so the skip must not suppress writes. Both this
+        base class and HybridCacheController overrides must consult this
+        helper — a divergent copy silently drops rank>0 shard writes.
+        """
+        return not self.backup_skip or self.dcp_enabled_shard
+
     def _page_backup(self, operation):
         # Backup batch by batch
         prefix_keys = operation.prefix_keys
@@ -1262,6 +1504,25 @@ class HiCacheController:
             batch_host_indices = operation.host_indices[
                 i * self.page_size : (i + len(batch_hashes)) * self.page_size
             ]
+            if self.dcp_enabled_shard:
+                # Task 4.4: single-writer integrity — within one cache
+                # generation, each (page, rank) shard key must be written by
+                # exactly one rank. The check is rank-local (this process can
+                # only produce its own keys) and bounds the double-write blast
+                # radius to cross-generation reuse, which the content-chained
+                # hash grammar treats as distinct generations.
+                for h in batch_hashes:
+                    shard_key = f"{h}{dcp_key_namespace(dcp_rank=self.dcp_rank, dcp_size=self.dcp_size)}"
+                    prev = getattr(operation, "written_shard_keys", None)
+                    if prev is None:
+                        prev = set()
+                        operation.written_shard_keys = prev
+                    assert shard_key not in prev, (
+                        "HiCache DCP single-writer violation: shard key "
+                        f"{shard_key!r} written twice in one generation on "
+                        f"dcp_rank={self.dcp_rank}"
+                    )
+                    prev.add(shard_key)
             # Set one batch token, and record if success.
             # todo: allow partial success
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
@@ -1286,7 +1547,12 @@ class HiCacheController:
                 if operation is None:
                     continue
 
-                if not self.backup_skip:
+                # Task 4.1: under DCP+L3 every rank owns and writes its own
+                # shard — the replicated-MLA rank-0-only skip must not gate
+                # the write path. Uses the shared helper; subclasses that
+                # override backup_thread_func/_page_backup MUST use it too
+                # (see HybridCacheController) or rank>0 writes go missing.
+                if self.should_write_kv_to_storage():
                     self._page_backup(operation)
                 self.ack_backup_queue.put(operation)
 
@@ -1316,5 +1582,8 @@ class HiCacheController:
                 completed_tokens_tensor,
                 torch.distributed.ReduceOp.MIN,
                 self.prefetch_completion_sync_groups,
+                watchdog_timeout=(
+                    HICACHE_DCP_CONSENSUS_WATCHDOG_S if self.dcp_enabled_shard else None
+                ),
             )
             ack.completed_tokens = completed_tokens_tensor.item()

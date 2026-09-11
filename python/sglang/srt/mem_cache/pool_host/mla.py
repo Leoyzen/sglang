@@ -634,11 +634,14 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
             raise ValueError(f"Unsupported IO backend: {io_backend}")
 
     def get_data_page(self, index, flat: bool = True) -> torch.Tensor:
-        assert self.dcp_size == 1, (
-            "HiCache L3 storage paths are not yet DCP-aware (per-rank shards "
-            "need dcp_rank-scoped keys); --hicache-storage-backend with "
-            "--dcp-size > 1 should have been rejected at server start."
-        )
+        # Rank-scoped semantics (PR2 DCP L3 fix): ``index`` is a per-rank
+        # physical row start into this rank's buffer. The cache controller
+        # folds widened logical host indices into per-rank kernel indices
+        # (``HostKVCache.maybe_dcp_kernel_indices``) before every L3 storage
+        # access, and rank-scoped ``_dcp{rank}_{size}`` keys keep shards from
+        # colliding, so each rank writes/reads only its own 1/dcp_size slice
+        # of each widened page. Silent full-page replication is impossible by
+        # construction: dcp>1 callers can only reach here with folded indices.
         if self.layout == "layer_first":
             data_page = self.kv_buffer[:, index : index + self.page_size, :, :]
         elif self.layout == "page_first":
@@ -666,6 +669,9 @@ class MLATokenToKVPoolHost(HiSparseHostPoolMixin, HostKVCache):
         ).flatten()
 
     def set_from_flat_data_page(self, index: int, data_page: torch.Tensor) -> None:
+        # See get_data_page: ``index`` is a per-rank physical row start (the
+        # controller folds logical indices before calling this on the read
+        # path), so no further translation happens here.
         if self.layout == "layer_first":
             self.kv_buffer[:, index : index + self.page_size, :, :] = data_page.reshape(
                 self.layer_num,
