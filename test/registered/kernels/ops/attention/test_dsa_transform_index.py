@@ -265,6 +265,132 @@ class TestDSATransformIndex(CustomTestCase):
         self._check_decode_case(8192, 4096)
         self._check_decode_case(2, 1_000_000)
 
+    def test_dcp_owned_rows_survive_width_bound(self):
+        # Under DCP the page table lives in the WIDENED page domain: its
+        # column width is tree_page * dcp_size and ownership is
+        # slot % dcp_size == rank (see dsa_backend DCP owner filter). The OOB
+        # guard must use THAT table's own width -- deriving the bound from a
+        # folded width (width // dcp_size) would silently drop owned rows
+        # near the top of the widened domain.
+        context_length = 4096
+        dcp_size = 2
+        rows = 4
+        # Flat table: gathered value == index, so ownership is index parity
+        # independent of the row.
+        page_table = (
+            torch.arange(context_length, dtype=torch.int32, device=self.device)
+            .unsqueeze(0)
+            .repeat(rows, 1)
+        )
+        topk_indices = self._make_topk(rows, context_length)
+
+        for dcp_rank in (0, 1):
+            with self.subTest(dcp_rank=dcp_rank):
+                probe = topk_indices.clone()
+                # Park owned and foreign slots at the very top of the widened
+                # domain: the owned one must survive (mapped to its folded
+                # row), the foreign one must be dropped by the owner filter --
+                # and neither may be dropped by the width bound.
+                owned_top = context_length - dcp_size + dcp_rank
+                foreign_top = context_length - dcp_size + (1 - dcp_rank)
+                oob_top = context_length  # first index past the width
+                probe[:, 3] = owned_top
+                probe[:, 4] = foreign_top
+                probe[:, 5] = oob_top
+
+                expected = torch.full_like(probe, -1, dtype=torch.int32)
+                in_width = (probe >= 0) & (probe < context_length)
+                owned = in_width & (probe % dcp_size == dcp_rank)
+                expected[owned] = (probe[owned] // dcp_size).to(torch.int32)
+
+                actual = transform_index_page_table_decode_fast(
+                    page_table=page_table,
+                    topk_indices=probe,
+                    page_size=1,
+                    dcp_size=dcp_size,
+                    dcp_rank=dcp_rank,
+                )
+                torch.cuda.synchronize()
+                torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                # The width bound did not eat the top-of-domain owned row.
+                self.assertTrue(
+                    bool((actual[:, 3] == owned_top // dcp_size).all()),
+                    "owned row at the top of the widened page domain was "
+                    "dropped by the width bound",
+                )
+                self.assertTrue(bool((actual[:, 4] == -1).all()))
+                self.assertTrue(bool((actual[:, 5] == -1).all()))
+
+    def test_dcp_prefill_owned_rows_survive_width_bound(self):
+        context_length = 4096
+        dcp_size = 2
+        extend_lens_cpu = [2, 1]
+        real_num_tokens = sum(extend_lens_cpu)
+        for page_table_is_expanded in (False, True):
+            with self.subTest(page_table_is_expanded=page_table_is_expanded):
+                page_table_rows = (
+                    real_num_tokens if page_table_is_expanded else len(extend_lens_cpu)
+                )
+                page_table = (
+                    torch.arange(context_length, dtype=torch.int32, device=self.device)
+                    .unsqueeze(0)
+                    .repeat(page_table_rows, 1)
+                )
+                topk_indices = self._make_topk(real_num_tokens, context_length)
+
+                for dcp_rank in (0, 1):
+                    with self.subTest(
+                        page_table_is_expanded=page_table_is_expanded,
+                        dcp_rank=dcp_rank,
+                    ):
+                        probe = topk_indices.clone()
+                        owned_top = context_length - dcp_size + dcp_rank
+                        foreign_top = context_length - dcp_size + (1 - dcp_rank)
+                        probe[:, 3] = owned_top
+                        probe[:, 4] = foreign_top
+
+                        if page_table_is_expanded:
+                            source_rows = page_table
+                        else:
+                            request_ids = torch.repeat_interleave(
+                                torch.arange(
+                                    len(extend_lens_cpu),
+                                    dtype=torch.int64,
+                                    device=self.device,
+                                ),
+                                torch.tensor(
+                                    extend_lens_cpu,
+                                    dtype=torch.int64,
+                                    device=self.device,
+                                ),
+                            )
+                            source_rows = page_table[request_ids]
+
+                        expected = torch.full_like(probe, -1, dtype=torch.int32)
+                        gathered = torch.gather(
+                            source_rows, dim=1, index=probe.clamp(min=0)
+                        )
+                        in_width = (probe >= 0) & (probe < context_length)
+                        owned = in_width & (gathered % dcp_size == dcp_rank)
+                        expected[owned] = (gathered[owned] // dcp_size).to(torch.int32)
+
+                        actual = transform_index_page_table_prefill_fast(
+                            page_table=page_table,
+                            topk_indices=probe,
+                            extend_lens_cpu=extend_lens_cpu,
+                            page_size=1,
+                            page_table_is_expanded=page_table_is_expanded,
+                            dcp_size=dcp_size,
+                            dcp_rank=dcp_rank,
+                        )
+                        torch.cuda.synchronize()
+                        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+                        self.assertTrue(
+                            bool((actual[:, 3] == (owned_top // dcp_size)).all()),
+                            "owned row at the top of the widened page domain "
+                            "was dropped by the width bound (prefill)",
+                        )
+
 
 if __name__ == "__main__":
     unittest.main()

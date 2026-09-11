@@ -75,8 +75,12 @@ def _allocate_prefill_result(
     if output_num_tokens is None:
         output_num_tokens = topk_num_tokens
 
-    assert real_num_tokens <= topk_num_tokens, f"sum(extend_lens_cpu) ({real_num_tokens}) exceeds topk_indices rows ({topk_num_tokens})"
-    assert topk_num_tokens <= output_num_tokens, f"topk_indices rows ({topk_num_tokens}) exceeds output_num_tokens ({output_num_tokens})"
+    assert real_num_tokens <= topk_num_tokens, (
+        f"sum(extend_lens_cpu) ({real_num_tokens}) exceeds topk_indices rows ({topk_num_tokens})"
+    )
+    assert topk_num_tokens <= output_num_tokens, (
+        f"topk_indices rows ({topk_num_tokens}) exceeds output_num_tokens ({output_num_tokens})"
+    )
 
     result = torch.empty(
         (output_num_tokens, topk_indices.shape[1]),
@@ -95,6 +99,7 @@ def transform_index_page_table_decode_kernel(
     result_ptr: torch.Tensor,
     page_size: tl.constexpr,
     page_table_row_stride: tl.constexpr,
+    PAGE_TABLE_WIDTH: tl.constexpr,
     dcp_size: tl.constexpr,
     dcp_rank: tl.constexpr,
 ):
@@ -106,7 +111,10 @@ def transform_index_page_table_decode_kernel(
 
     offset = tl.arange(0, TOPK)  # topk should be 2048
     loaded_topk_indices = tl.load(topk_indices_ptr + offset)
-    mask = loaded_topk_indices >= 0
+    # OOB guard only: the width is THAT table's own column domain (widened
+    # DCP page domain when dcp folds pages into it), not a folded/derived
+    # width -- masking on anything narrower would drop owned rows.
+    mask = (loaded_topk_indices >= 0) & (loaded_topk_indices < PAGE_TABLE_WIDTH)
     loaded_kv_indices = tl.load(page_table_ptr + loaded_topk_indices, mask=mask)
     if dcp_size > 1:
         # Keep slots owned by this rank as local rows; others become -1.
@@ -132,6 +140,7 @@ def transform_index_page_table_prefill_kernel(
     result_stride_0: tl.constexpr,
     result_stride_1: tl.constexpr,
     PAGE_TABLE_IS_EXPANDED: tl.constexpr,
+    PAGE_TABLE_WIDTH: tl.constexpr,
     TOPK: tl.constexpr,
     BLOCK_Q: tl.constexpr,
     BLOCK_TOPK: tl.constexpr,
@@ -151,18 +160,24 @@ def transform_index_page_table_prefill_kernel(
     mask = (token_indices[:, None] < query_end) & (topk_offsets[None, :] < TOPK)
 
     loaded_topk_indices = tl.load(
-        topk_indices_ptr + token_indices[:, None] * topk_indices_stride_0 + topk_offsets[None, :] * topk_indices_stride_1,
+        topk_indices_ptr
+        + token_indices[:, None] * topk_indices_stride_0
+        + topk_offsets[None, :] * topk_indices_stride_1,
         mask=mask,
         other=-1,
     )
-    valid_topk_mask = mask & (loaded_topk_indices >= 0)
+    valid_topk_mask = (
+        mask & (loaded_topk_indices >= 0) & (loaded_topk_indices < PAGE_TABLE_WIDTH)
+    )
 
     if PAGE_TABLE_IS_EXPANDED:
         page_table_rows = token_indices
     else:
         page_table_rows = token_indices * 0 + request_id
     loaded_kv_indices = tl.load(
-        page_table_ptr + page_table_rows[:, None] * page_table_stride_0 + loaded_topk_indices * page_table_stride_1,
+        page_table_ptr
+        + page_table_rows[:, None] * page_table_stride_0
+        + loaded_topk_indices * page_table_stride_1,
         mask=valid_topk_mask,
         other=-1,
     )
@@ -171,7 +186,9 @@ def transform_index_page_table_prefill_kernel(
         owned_mask = valid_topk_mask & (loaded_kv_indices % dcp_size == dcp_rank)
         loaded_kv_indices = tl.where(owned_mask, loaded_kv_indices // dcp_size, -1)
     tl.store(
-        result_ptr + token_indices[:, None] * result_stride_0 + topk_offsets[None, :] * result_stride_1,
+        result_ptr
+        + token_indices[:, None] * result_stride_0
+        + topk_offsets[None, :] * result_stride_1,
         loaded_kv_indices,
         mask=mask,
     )
@@ -208,6 +225,9 @@ def transform_index_page_table_decode_fast(
         result,
         page_size,
         page_table_row_stride=page_table.stride(0),
+        # Bound indices by THIS table's own column domain (an OOB guard, not
+        # a semantic width; under DCP the widened page domain owns columns).
+        PAGE_TABLE_WIDTH=page_table.shape[1],
         dcp_size=dcp_size,
         dcp_rank=dcp_rank,
     )
@@ -235,7 +255,9 @@ def transform_index_page_table_prefill_fast(
     # fa3 clamps) already accept the widened table. Keep the >= 2048 floor to
     # catch layout regressions; the DCP owner filter applies per column over
     # the full width.
-    assert topk_indices.shape[1] >= 2048, f"expected prefill topk width >= 2048, got {topk_indices.shape[1]}"
+    assert topk_indices.shape[1] >= 2048, (
+        f"expected prefill topk width >= 2048, got {topk_indices.shape[1]}"
+    )
     real_num_tokens = sum(extend_lens_cpu)
     result = _allocate_prefill_result(topk_indices, real_num_tokens, output_num_tokens)
     if real_num_tokens == 0:
@@ -267,6 +289,9 @@ def transform_index_page_table_prefill_fast(
         result.stride(0),
         result.stride(1),
         PAGE_TABLE_IS_EXPANDED=page_table_is_expanded,
+        # Bound indices by THIS table's own column domain (an OOB guard, not
+        # a semantic width; under DCP the widened page domain owns columns).
+        PAGE_TABLE_WIDTH=page_table.shape[1],
         TOPK=topk_indices.shape[1],
         BLOCK_Q=block_q,
         BLOCK_TOPK=block_topk,
@@ -288,13 +313,14 @@ def transform_index_page_table_decode_ref(
     if result is None:
         result = torch.empty_like(topk_indices, dtype=torch.int32)
     assert result.shape == topk_indices.shape
+    valid_topk_mask = (topk_indices >= 0) & (topk_indices < page_table.shape[1])
     torch.gather(
         page_table.to(result.dtype),
         dim=1,
-        index=topk_indices.clamp(min=0),
+        index=topk_indices.clamp(min=0, max=page_table.shape[1] - 1),
         out=result,
     )
-    result[topk_indices < 0] = -1
+    result[~valid_topk_mask] = -1
     return result
 
 
