@@ -197,6 +197,48 @@ class TestNvidiaKDAAllPrefillWrapper(CustomTestCase):
         ):
             self.assertFalse(NvidiaKDAKernel().supports_prefill)
 
+    def test_sentinel_padding_routes_to_reserved_slot_zero(self):
+        """Negative cache_indices must hit the RESERVED dummy slot (0), never
+        alias the last live slot (#38997): MambaSlotAllocator allocates
+        1..size, so the trailing pool row can be a real request/checkpoint
+        slot whose state an aliased prefill would corrupt.
+        """
+        kernel, calls = self._make_kernel()
+        seq_lens = [2, 3]
+        x = self._inputs(seq_lens)
+        # 5-row pool; slot 4 is LIVE (allocated) and sentinel rows must not
+        # touch it. Slot 0 is the reserved padding sink.
+        states = torch.arange(5 * 128 * 128, dtype=torch.bfloat16).view(5, 1, 128, 128)
+        states_before = states.clone()
+        slots = torch.tensor([1, -1], dtype=torch.int32)
+
+        output = kernel.extend(
+            x["q"],
+            x["k"],
+            x["v"],
+            x["g"],
+            x["beta"],
+            ssm_states=states,
+            cache_indices=slots,
+            query_start_loc=x["query_start_loc"],
+            extend_seq_lens_cpu=seq_lens,
+            A_log=torch.zeros(128, dtype=torch.float32),
+        )
+
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(torch.equal(output, x["v"]))
+        # Live request slot committed (+1 via the fake fwd). The sentinel row
+        # commits its (dummy) state through the reserved slot 0 sink by design;
+        # every LIVE untargeted slot must stay untouched -- in particular slot
+        # 4, the trailing row the old shape[0]-1 routing aliased.
+        self.assertTrue(torch.equal(states[1], states_before[1] + 1))
+        self.assertEqual(bool((states[0] != states_before[0]).any()), True)
+        for slot in (2, 3, 4):
+            self.assertTrue(
+                torch.equal(states[slot], states_before[slot]),
+                f"slot {slot} was scribbled by the sentinel routing",
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
