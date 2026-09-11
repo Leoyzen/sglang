@@ -1257,6 +1257,11 @@ class Envs:
     # Experimental; auto-falls back to eager if the backend's prep is not capturable.
     SGLANG_ENABLE_METADATA_GLUE_GRAPH = EnvBool(False)
     SGLANG_OPT_FUSED_KDA_VERIFY = EnvBool(False)
+    # Kill-switch for the fused KDA decode kernel (K3 and GLM-5.3-Flash); the
+    # model-side stash and readiness flag arm it, covered() gates shapes, and
+    # a shape mismatch falls back to the unfused Triton chain. Default on:
+    # validated against the unfused chain for both model families' geometries.
+    SGLANG_KDA_FUSED_DECODE = EnvBool(True)
     # Permit GLM-5 Next projection fusion in quantized checkpoints only when
     # each source projection resolves to an unquantized linear method.
     SGLANG_OPT_GLM5_NEXT_KDA_PROJECTION_FUSION = EnvBool(False)

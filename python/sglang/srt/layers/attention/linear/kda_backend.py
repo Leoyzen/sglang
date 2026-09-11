@@ -659,7 +659,8 @@ class KDAAttnBackend(MambaAttnBackendBase):
             fused_static = getattr(layer, "_k3_fused_decode_args", None)
             onorm_gate = getattr(layer, "_k3_onorm_gate", None)
             if (
-                fused_static is not None
+                envs.SGLANG_KDA_FUSED_DECODE.get()
+                and fused_static is not None
                 and onorm_gate is not None
                 and mixed_qkv.shape[0] == cache_indices.shape[0]
                 and b.ndim == 3
