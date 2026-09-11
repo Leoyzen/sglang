@@ -151,32 +151,28 @@ class DevicePoolEntry:
         packed: bool = True,
         index_mapper: Callable[[torch.Tensor], torch.Tensor] | None = None,
         dcp_fold_slots: bool = False,
+        # Accepted for source compatibility with old call sites, but the
+        # authoritative per-key slot width is derived LAZILY at I/O time via
+        # `slots_per_key`/`_object_width()` (a construction-time value races
+        # the parallel-context publish behind the prod incident — see
+        # `_object_width` docstring).
         slots_per_key: int | None = None,
     ):
+        if slots_per_key is not None:
+            logger.warning(
+                "DevicePoolEntry(%s): `slots_per_key` at construction is ignored; "
+                "width is resolved lazily at I/O time (drop the argument).",
+                name,
+            )
         self.name = name
         self.indices_from_pool = indices_from_pool
         self.device_pool = device_pool
         self.components = [list(component) for component in components]
         self.layer_mapping = layer_mapping
         self.page_size = page_size
+        self.rows_are_pages = rows_are_pages
         self.packed = packed
         self._index_mapper = index_mapper
-        # Slots of the SOURCE index space covered by one transfer key. Equals
-        # page_size for self-keyed pools; a KV-sourced entry whose row space
-        # is the RAW widened/global slot domain (e.g. the DSA INDEXER
-        # sidecar, whose index-K rows are global-slot replicated and address
-        # raw virtual locs — IndexKeyCache.move) spans dcp_size whole pages
-        # per key under DCP. `MooncakeStore._batch_io_v2` divides
-        # len(host_indices) by this, not page_size, so a widened-domain
-        # entry without it trips the keys==indices//page_size assert
-        # (production: 2028 offload failures at dcp=4). None -> page_size.
-        self.slots_per_key = slots_per_key or page_size
-        # Device rows one transfer key spans in THIS entry's row domain
-        # (slots_per_key // page_size). Identity (1) for page-sized keys; the
-        # widened-domain INDEXER entry under DCP spans dcp_size index rows
-        # per key, which the restore path must group per key — see
-        # `get_prepared_layer_range_meta`.
-        self._rows_per_key = self.slots_per_key // page_size
         # Declare that this entry's slot indices arrive in the DCP-widened
         # logical space and must fold to per-rank rows before row arithmetic
         # (see `_dcp_folding_index_mapper`). Only the sharded target pools
@@ -188,36 +184,92 @@ class DevicePoolEntry:
                     f"Device pool {name} cannot combine index_mapper with dcp_fold_slots."
                 )
             self._index_mapper = _dcp_folding_index_mapper
-        self._page_offsets = torch.arange(page_size)
-        self._row_span = 1 if rows_are_pages else page_size
+        self.dcp_fold_slots = dcp_fold_slots
 
         if not self.components or any(not component for component in self.components):
             raise ValueError(f"Device pool {name} has no storage buffers.")
         self.kv_buffer = [buffer for group in self.components for buffer in group]
         self._row_count = min(buffer.shape[0] for buffer in self.kv_buffer)
 
-        self.buffer_meta = [
+    def _object_width(self) -> int:
+        """Slots one transfer key covers in THIS entry's slot domain, resolved
+        at I/O time because the DCP degree is only published AFTER entry
+        construction.
+
+        - folding entries (dcp_fold_slots: KV latent targets): the FOLDED
+          physical width — `page_size // dcp_size`. Under DCP the entry's
+          page_size is already the widened width (kv_cache_builder passes
+          allocator.page_size = tree_page * dcp_size), while the folded
+          indices it receives carry `page_size // dcp_size` slots per key
+          (16 keys -> 1024 folded physical rows at dcp=4). Resolving at
+          construction reads dcp=1 before the publish and silently keeps the
+          widened width (the exact 3984231c25 regression that left the prod
+          assert firing).
+        - raw widened/global-domain entries (DSA INDEXER sidecar): `page_size`
+          — its index-K rows are global-slot replicated, sized size*dcp_size
+          (IndexKeyCache), addressed in raw widened slots; one key spans one
+          widened page (= page_size slots). Do NOT multiply by dcp_size again
+          (over-declares 4x under the old convention).
+        - self-keyed pools: page_size.
+        dcp=1 => page_size for every kind (byte-identical to today).
+        """
+        if self.dcp_fold_slots:
+            dcp = max(1, _active_dcp_size())
+            return max(1, self.page_size // dcp)
+        return self.page_size
+
+    @property
+    def slots_per_key(self) -> int:
+        """Width (slots) one transfer key covers in the SOURCE index space.
+        This is what `MooncakeStore._batch_io_v2` divides len(host_indices)
+        by (``len(keys) == len(indices) // slots_per_key``); must equal the
+        per-key width of the indices actually handed to the store — folded
+        width for fold entries, page_size otherwise."""
+        return self._object_width()
+
+    @property
+    def _row_span(self) -> int:
+        """Physical buffer rows per transferred object. page-granular pools
+        (rows_are_pages, e.g. the INDEXER index-K) address one row per object;
+        slot-granular pools (KV latents) address `_object_width` rows per
+        object (the folded width for fold entries)."""
+        return 1 if self.rows_are_pages else self._object_width()
+
+    @property
+    def _rows_per_key(self) -> int:
+        """Rows one transfer key spans in THIS entry's row domain — always 1
+        in the corrected convention: each key is folded/reshaped to one
+        contiguous object (`_rows` emits one start row per key), so the
+        restore path groups one multi-range group per key. Identity at
+        dcp=1."""
+        return self.slots_per_key // self._object_width()  # == 1
+
+    def _io_buffers(self):
+        """buffer_meta + component offsets, built lazily because the per-row
+        byte size depends on the I/O-time `_row_span` (fold entries)."""
+        row_span = self._row_span
+        buffer_meta = [
             [
                 (
                     buffer.data_ptr(),
                     buffer.stride(0) * buffer.element_size(),
-                    buffer.nbytes // buffer.shape[0] * self._row_span,
+                    buffer.nbytes // buffer.shape[0] * row_span,
                 )
                 for buffer in component
             ]
             for component in self.components
         ]
-
-        self._component_offsets = []
+        component_offsets = []
         offset = 0
-        for component in self.buffer_meta:
-            if not packed:
+        for component in buffer_meta:
+            if not self.packed:
                 offset = 0
             offsets = []
             for _, _, size in component:
                 offsets.append(offset)
                 offset += size
-            self._component_offsets.append(offsets)
+            component_offsets.append(offsets)
+        return buffer_meta, component_offsets
 
     def get_hybrid_pool_buffer(self) -> list[torch.Tensor]:
         return self.kv_buffer
@@ -227,23 +279,22 @@ class DevicePoolEntry:
 
     def _rows(self, indices: torch.Tensor) -> list[int]:
         slots = indices.detach().to(device="cpu", dtype=torch.int64).flatten()
-        if slots.numel() % self.page_size:
+        width = self._object_width()
+        if slots.numel() % width:
             raise ValueError(
-                f"Pool {self.name} got {slots.numel()} indices, expected a multiple of page_size={self.page_size}."
+                f"Pool {self.name} got {slots.numel()} indices, expected a multiple of object width {width}."
             )
         if not slots.numel():
             return []
 
-        pages = slots.reshape(-1, self.page_size)
+        pages = slots.reshape(-1, width)
         starts = pages[:, 0]
-        if torch.any(starts.remainder(self.page_size)) or not torch.equal(
-            pages, starts[:, None] + self._page_offsets
+        if torch.any(starts.remainder(width)) or not torch.equal(
+            pages, starts[:, None] + torch.arange(width)
         ):
             raise ValueError(f"Pool {self.name} requires aligned contiguous pages.")
         rows = (
-            starts.div(self.page_size, rounding_mode="floor")
-            if self._row_span == 1
-            else starts
+            starts.div(width, rounding_mode="floor") if self._row_span == 1 else starts
         )
         first_row = int(rows.min())
         last_row = int(rows.max()) + self._row_span
@@ -255,17 +306,15 @@ class DevicePoolEntry:
 
     def get_page_buffer_meta(self, indices: torch.Tensor):
         rows = self._rows(indices)
+        buffer_meta, _ = self._io_buffers()
         ptrs = [
             base_ptr + row * row_stride
             for row in rows
-            for component in self.buffer_meta
+            for component in buffer_meta
             for base_ptr, row_stride, _ in component
         ]
         sizes = [
-            size
-            for _ in rows
-            for component in self.buffer_meta
-            for _, _, size in component
+            size for _ in rows for component in buffer_meta for _, _, size in component
         ]
         return ptrs, sizes
 
@@ -277,21 +326,23 @@ class DevicePoolEntry:
         if mapped is None:
             return None
         buffer_indices = [mapped] if isinstance(mapped, int) else list(mapped)
+        buffer_meta, component_offsets = self._io_buffers()
 
         items = []
-        for component, offsets in zip(self.buffer_meta, self._component_offsets):
+        for component, offsets in zip(buffer_meta, component_offsets):
             for buffer_index in buffer_indices:
                 base_ptr, row_stride, size = component[buffer_index]
                 items.append((base_ptr, row_stride, size, offsets[buffer_index]))
 
         ptrs, sizes, offsets = [], [], []
-        # Restore-side dual of `slots_per_key`: a widened-domain entry
-        # produces dcp_size rows per transfer key (raw global slots —
-        # `_rows` sees dcp_size page_size-token index rows per key), while
-        # Mooncake aligns range groups to COMPONENT KEYS. Group the rows so
-        # one key gets one multi-range group carrying all its rows — the
-        # same per-key list shape `_pack_multi_buffer_meta` produces on the
-        # offload side. Identity when slots_per_key == page_size.
+        # One multi-range GROUP per key (`_rows_per_key` is always 1 in the
+        # corrected convention: every key is folded/reshaped to one contiguous
+        # object, so `_rows`/`prepare_locations` emit one start row per key).
+        # Mooncake aligns range groups to COMPONENT KEYS, so we group the
+        # rows one per key — the same per-key list shape
+        # `_pack_multi_buffer_meta` produces on the offload side. Identity at
+        # dcp=1 (rows_per_key==1) reduces to the historical one-row-per-key
+        # shape.
         rows_per_group = self._rows_per_key
         if len(locations) % rows_per_group:
             raise ValueError(
@@ -301,8 +352,7 @@ class DevicePoolEntry:
             key_rows = locations[group_start : group_start + rows_per_group]
             # One multi-range GROUP per key: concatenate every row's ranges
             # (row-major over the component items) so Mooncake's
-            # keys↔groups zip stays key-aligned. dcp=1: rows_per_group==1,
-            # this reduces to the historical one-row-per-key shape.
+            # keys↔groups zip stays key-aligned.
             key_ptrs, key_sizes, key_offsets = [], [], []
             for row in key_rows:
                 key_ptrs.extend(
@@ -601,10 +651,12 @@ def _build_dsa_device_pool_group(
             # page (`params.page_size == tree page * dcp_size`, see
             # kv_cache_builder.py CacheInitParams) and translate_indices folds
             # it down to THIS entry's physical rows: one key covers
-            # `page_size // dcp_size` folded slots. Declaring the widened
-            # width (the default) made `_batch_io_v2`'s keys==indices//spk
-            # assert fail 64-vs-256 (production DBGDBG: keys=16 host_idx=1024).
-            slots_per_key=max(1, page_size // _active_dcp_size()),
+            # `page_size // dcp_size` folded slots (production DBGDBG:
+            # keys=16 host_idx=1024 page_size=256 -> 64/key). The width is
+            # derived LAZILY at I/O time by `_object_width()` — a
+            # construction-time read races the parallel publish and silently
+            # keeps the widened width (3984231c25 regression), so no
+            # `slots_per_key` is declared here.
         ),
         DevicePoolEntry(
             name=PoolName.INDEXER,
@@ -625,8 +677,9 @@ def _build_dsa_device_pool_group(
             # tree page * dcp_size`, kv_cache_builder.py CacheInitParams) —
             # one key spans exactly one widened page = `page_size` slots.
             # Multiplying by dcp_size again would over-declare the width
-            # 4x (production DBGDBG round-trip evidence).
-            slots_per_key=page_size,
+            # 4x (production DBGDBG round-trip evidence). The width is
+            # derived LAZILY by `_object_width()` (== page_size for
+            # non-folding entries), so no `slots_per_key` is declared.
         ),
     ]
     return DevicePoolGroup(
@@ -862,8 +915,8 @@ def _build_mamba_device_pool_group(
                 # dcp_size`, kv_cache_builder.py CacheInitParams), so one key
                 # = one widened page = `page_size` slots — do NOT multiply by
                 # dcp_size again (over-declares 4x; see the DSA-group
-                # comment).
-                slots_per_key=page_size,
+                # comment). Width is derived LAZILY by `_object_width()`,
+                # so no `slots_per_key` is declared.
             )
         )
         # num_layers stays len(union_layers): every entry's mapping keys are

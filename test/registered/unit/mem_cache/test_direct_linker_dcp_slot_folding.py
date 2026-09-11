@@ -52,8 +52,13 @@ from sglang.test.test_utils import CustomTestCase
 register_cpu_ci(est_time=5, suite="base-a-test-cpu")
 
 _PHYS_ROWS = 8  # per-rank physical rows of the fake KV entry
-_WIDENED_SLOTS = 2 * _PHYS_ROWS  # dcp=2 widened logical space
-_PAGE = 2  # tree page (physical rows per page); widened page = 4 slots
+_DCP = 2
+_WIDENED_SLOTS = _DCP * _PHYS_ROWS  # dcp=2 widened logical space
+_PAGE = 2  # tree page (physical rows per page)
+# What kv_cache_builder hands the linker under DCP: allocator.page_size is the
+# WIDENED page (tree page * dcp_size) — the production 256 at tree 64 / dcp 4.
+# The fixture must model that, or the lazy width resolution is not exercised.
+_WIDENED_PAGE = _PAGE * _DCP  # 4 slots
 
 
 @contextmanager
@@ -123,7 +128,9 @@ class TestResolvedTransfersFold(CustomTestCase):
 
     def _mamba_group(self):
         group = _build_mamba_device_pool_group(
-            _fake_latent_hybrid_kvcache(), page_size=_PAGE, params=_fake_params()
+            _fake_latent_hybrid_kvcache(),
+            page_size=_WIDENED_PAGE,
+            params=_fake_params(),
         )
         return group
 
@@ -316,9 +323,10 @@ class TestBufferIdentities(CustomTestCase):
             )
 
     def test_indexer_slots_per_key_contract(self):
-        """The INDEXER entry declares dcp_size pages per key (global-slot
-        index-K domain), so the _batch_io_v2 keys==indices//width assert
-        holds at dcp>1; default entries keep slots_per_key == page_size."""
+        """Non-folding entries (INDEXER global-slot / self-keyed) keep
+        slots_per_key == page_size; only `dcp_fold_slots` entries narrow to
+        the folded width. The width is resolved LAZILY at I/O time, so the
+        _batch_io_v2 keys==indices//width assert holds under DCP."""
         # Default: page-sized keys (folded/self-keyed pools).
         default_entry = DevicePoolEntry(
             name=PoolName.KV,
@@ -330,11 +338,9 @@ class TestBufferIdentities(CustomTestCase):
             rows_are_pages=False,
         )
         self.assertEqual(default_entry.slots_per_key, 4)
-        # INDEXER-style widened-domain entry: one key spans dcp pages.
-        from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
-            _active_dcp_size,
-        )
-
+        # INDEXER-style widened-domain entry: raw widened indices, one key
+        # spans one widened page — slots_per_key == page_size (no dcp multiply;
+        # the page_size is already the widened width).
         widened = DevicePoolEntry(
             name=PoolName.INDEXER,
             indices_from_pool=PoolName.KV,
@@ -343,12 +349,10 @@ class TestBufferIdentities(CustomTestCase):
             layer_mapping={0: 0},
             page_size=4,
             rows_are_pages=True,
-            slots_per_key=4 * _active_dcp_size(),
         )
-        dcp = _active_dcp_size()
-        # Simulate the _batch_io_v2 division with dcp widened slots per key.
+        self.assertEqual(widened.slots_per_key, 4)
         n_keys = 3
-        host_indices = torch.arange(n_keys * 4 * dcp)
+        host_indices = torch.arange(n_keys * 4)
         self.assertEqual(len(host_indices) // widened.slots_per_key, n_keys)
 
 
@@ -516,13 +520,38 @@ class TestKvFoldedSlotsPerKey(CustomTestCase):
             page_size=widened_page,
             rows_are_pages=False,
             dcp_fold_slots=True,
-            slots_per_key=max(1, widened_page // dcp),
         )
-        # Exact production shape: 16 tree keys -> widened 4096 slots ->
-        # folded 1024. The _batch_io_v2 assert: len(keys) == len(idx)//spk.
+        # Width is resolved LAZILY at I/O time under the live degree: the
+        # folded page (256 // 4 = 64 slots/key), NOT the widened 256 that a
+        # construction-time read produced (the 3984231c25 regression).
         n_keys, folded = 16, 1024
-        self.assertEqual(folded // entry.slots_per_key, n_keys)
-        self.assertEqual(entry.slots_per_key, 64)
+        with _parallel_dcp(dcp):
+            self.assertEqual(entry.slots_per_key, 64)
+            # Exact production shape: 16 tree keys -> widened 4096 slots ->
+            # folded 1024. The _batch_io_v2 assert: len(keys) == len(idx)//spk.
+            self.assertEqual(folded // entry.slots_per_key, n_keys)
+
+    def test_construction_without_published_dcp_is_not_baked(self):
+        """A construction-time read must NOT freeze a width: building the
+        entry with NO published parallel context yields the dcp=1 identity
+        (page_size) at read time, and only narrows once the degree is
+        published. Guards against re-introducing the 3984231c25 race."""
+        dcp = 4
+        widened_page = 64 * dcp
+        entry = DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=object(),
+            components=[[torch.zeros((16, 3))]],
+            layer_mapping={0: 0},
+            page_size=widened_page,
+            rows_are_pages=False,
+            dcp_fold_slots=True,
+        )
+        # No parallel context: identity (page_size), never a wrong baked value.
+        self.assertEqual(entry.slots_per_key, widened_page)
+        with _parallel_dcp(dcp):
+            self.assertEqual(entry.slots_per_key, widened_page // dcp)
 
     def test_indexer_not_multiplied_again(self):
         # INDEXER receives RAW widened indices; its page_size is already the
@@ -537,7 +566,6 @@ class TestKvFoldedSlotsPerKey(CustomTestCase):
             layer_mapping={0: 0},
             page_size=widened_page,
             rows_are_pages=True,
-            slots_per_key=widened_page,
         )
         n_keys = 3
         raw_widened = n_keys * widened_page

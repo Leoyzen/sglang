@@ -46,7 +46,11 @@ class TestDevicePoolEntry(CustomTestCase):
         pointers, sizes = pool.get_page_buffer_meta(indices)
         self.assertEqual(
             pointers,
-            [buffer[row].data_ptr() for row in locations for buffer in (k0, k2, v0, v2)],
+            [
+                buffer[row].data_ptr()
+                for row in locations
+                for buffer in (k0, k2, v0, v2)
+            ],
         )
         self.assertEqual(sizes, [6, 10, 14, 22] * 2)
         self.assertIsNone(pool.get_prepared_layer_range_meta(locations, 1))
@@ -86,7 +90,7 @@ class TestDevicePoolEntry(CustomTestCase):
             rows_are_pages=False,
         )
         for indices, error in (
-            (torch.tensor([0]), "multiple of page_size"),
+            (torch.tensor([0]), "multiple of object width"),
             (torch.tensor([1, 2]), "aligned contiguous pages"),
             (torch.tensor([0, 2]), "aligned contiguous pages"),
             (torch.tensor([8, 9]), "exceeds buffer shapes"),
@@ -120,10 +124,14 @@ class TestDevicePoolGroup(CustomTestCase):
 
         resolved = group.resolve_transfers([transfer])
 
-        self.assertEqual([item.name for item in resolved], [PoolName.KV, PoolName.INDEXER])
+        self.assertEqual(
+            [item.name for item in resolved], [PoolName.KV, PoolName.INDEXER]
+        )
         self.assertEqual(resolved[0].host_indices.tolist(), [0, 1, 4, 5])
         self.assertEqual(resolved[1].host_indices.tolist(), [100, 101, 104, 105])
-        self.assertTrue(all(item.hit_policy == PoolHitPolicy.ALL_PAGES for item in resolved))
+        self.assertTrue(
+            all(item.hit_policy == PoolHitPolicy.ALL_PAGES for item in resolved)
+        )
 
     def test_partial_side_pool_requires_explicit_opt_in(self):
         entry = SimpleNamespace(
@@ -140,7 +148,9 @@ class TestDevicePoolGroup(CustomTestCase):
         )
 
         self.assertEqual(group.resolve_transfers([transfer]), [])
-        resolved = group.resolve_transfers([transfer], allow_partial=True, allow_missing_kv=True)
+        resolved = group.resolve_transfers(
+            [transfer], allow_partial=True, allow_missing_kv=True
+        )
 
         self.assertEqual(len(resolved), 1)
         self.assertEqual(resolved[0].name, PoolName.SWA)
@@ -167,10 +177,20 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         kvcache.start_layer = 1
         kvcache.end_layer = 4
         kvcache.swa_page_size = 2
-        kvcache.swa_kv_pool = SimpleNamespace(kv_buffer=[torch.zeros((8, 3), dtype=torch.uint8) for _ in range(3)])
-        kvcache.c4_kv_pool = SimpleNamespace(kv_buffer=[torch.zeros((8, 5), dtype=torch.uint8) for _ in range(2)])
-        kvcache.c4_indexer_kv_pool = SimpleNamespace(index_k_with_scale_buffer=[torch.zeros((8, 7), dtype=torch.uint8) for _ in range(2)])
-        kvcache.c128_kv_pool = SimpleNamespace(kv_buffer=[torch.zeros((8, 11), dtype=torch.uint8)])
+        kvcache.swa_kv_pool = SimpleNamespace(
+            kv_buffer=[torch.zeros((8, 3), dtype=torch.uint8) for _ in range(3)]
+        )
+        kvcache.c4_kv_pool = SimpleNamespace(
+            kv_buffer=[torch.zeros((8, 5), dtype=torch.uint8) for _ in range(2)]
+        )
+        kvcache.c4_indexer_kv_pool = SimpleNamespace(
+            index_k_with_scale_buffer=[
+                torch.zeros((8, 7), dtype=torch.uint8) for _ in range(2)
+            ]
+        )
+        kvcache.c128_kv_pool = SimpleNamespace(
+            kv_buffer=[torch.zeros((8, 11), dtype=torch.uint8)]
+        )
         kvcache.layer_mapping = [
             DeepSeekV4LayerItem(0, -1),
             DeepSeekV4LayerItem(4, 0),
@@ -225,7 +245,9 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
             pool.page_size = 2
             pool.layer_num = 1
             pool.kv_buffer = [torch.zeros((8, kv_width), dtype=torch.uint8)]
-            pool.index_key_cache = SimpleNamespace(buffer=[torch.zeros((4, index_width), dtype=torch.uint8)])
+            pool.index_key_cache = SimpleNamespace(
+                buffer=[torch.zeros((4, index_width), dtype=torch.uint8)]
+            )
             return pool
 
         kvcache = dsa_pool(3, 7)
@@ -251,13 +273,19 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                 PoolName.INDEXER: PoolName.KV,
             },
         )
-        _, sizes, offsets = group.entry_map[PoolName.KV].get_prepared_layer_range_meta([0], 0)
+        _, sizes, offsets = group.entry_map[PoolName.KV].get_prepared_layer_range_meta(
+            [0], 0
+        )
         self.assertEqual(sizes, [[6, 26]])
         self.assertEqual(offsets, [[0, 16]])
-        _, sizes, offsets = group.entry_map[PoolName.INDEXER].get_prepared_layer_range_meta([0], 0)
+        _, sizes, offsets = group.entry_map[
+            PoolName.INDEXER
+        ].get_prepared_layer_range_meta([0], 0)
         self.assertEqual(sizes, [[7, 17]])
         self.assertEqual(offsets, [[0, 18]])
-        _, sizes, offsets = group.entry_map[PoolName.INDEXER].get_prepared_layer_range_meta([0], 1)
+        _, sizes, offsets = group.entry_map[
+            PoolName.INDEXER
+        ].get_prepared_layer_range_meta([0], 1)
         self.assertEqual(sizes, [[11, 23]])
         self.assertEqual(offsets, [[7, 35]])
 
@@ -297,14 +325,18 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                 ),
             ):
                 if linker_enabled and not nextn_layers:
-                    with self.assertRaisesRegex(NotImplementedError, "only supports packed"):
+                    with self.assertRaisesRegex(
+                        NotImplementedError, "only supports packed"
+                    ):
                         spec.BaseSpecWorker._build_hicache_draft_plan(worker)
                     self.assertEqual(target.mtp_draft_device_pools, ())
                 else:
                     plan = spec.BaseSpecWorker._build_hicache_draft_plan(worker)
                     self.assertEqual(
                         plan.mode,
-                        spec.HiCacheDraftMode.PACKED if nextn_layers else spec.HiCacheDraftMode.SIDECAR,
+                        spec.HiCacheDraftMode.PACKED
+                        if nextn_layers
+                        else spec.HiCacheDraftMode.SIDECAR,
                     )
                     self.assertEqual(plan.device_pools, (draft.token_to_kv_pool,))
                     self.assertEqual(
@@ -403,7 +435,9 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         # device layer 3 is the draft latent (3 target latents + depth 0).
         self.assertEqual(kv.layer_mapping[0], (0, 3))
         self.assertEqual(kv.layer_mapping[2], 1)
-        _, sizes, _ = kv.get_prepared_layer_range_meta(kv.prepare_locations(torch.tensor([0])), 0)
+        _, sizes, _ = kv.get_prepared_layer_range_meta(
+            kv.prepare_locations(torch.tensor([0])), 0
+        )
         # Layer 0 resolves TWO buffers: target latent + draft latent.
         self.assertEqual(len(sizes[0]), 2)
         # The packed draft pointer must be the DRAFT buffer, not a v-buffer:
@@ -440,14 +474,19 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         self.assertEqual(set(group.entry_map), {PoolName.KV, PoolName.MAMBA})
         kv = group.entry_map[PoolName.KV]
         self.assertEqual(kv.layer_mapping[0], (0, 3))
-        _, sizes, _ = kv.get_prepared_layer_range_meta(kv.prepare_locations(torch.tensor([0])), 0)
+        _, sizes, _ = kv.get_prepared_layer_range_meta(
+            kv.prepare_locations(torch.tensor([0])), 0
+        )
         self.assertEqual(len(sizes[0]), 2)
 
         # Component-GROUP full pool (nested per-layer lists) flattens too.
         kvcache2, params2 = self._mamba_assembler_target()
         wrapper2 = HybridLinearKVPool.__new__(HybridLinearKVPool)
         wrapper2.full_kv_pool = SimpleNamespace(
-            kv_buffer=[[torch.zeros((16, 5), dtype=torch.uint8)], [torch.zeros((16, 7), dtype=torch.uint8)]],
+            kv_buffer=[
+                [torch.zeros((16, 5), dtype=torch.uint8)],
+                [torch.zeros((16, 7), dtype=torch.uint8)],
+            ],
         )
         params2.mtp_draft_device_pools = (wrapper2,)
         group2 = resolve_hybrid_device_pool_group(
@@ -468,7 +507,6 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         packed tuple (target_comp, N + depth) would resolve into the target's
         v-buffers (index 3 = v[0]) instead of the draft buffers, corrupting
         every packed restore. Startup must refuse, not mis-store."""
-        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
         kvcache, params = self._mamba_assembler_target()
         # Swap the latent list for the k/v split: 3 k + 3 v = 6 flat buffers
@@ -483,7 +521,9 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                 kv_buffer=[torch.zeros((16, 9), dtype=torch.uint8)],
             ),
         )
-        with self.assertRaisesRegex(NotImplementedError, "MHA-layout mamba-hybrid targets"):
+        with self.assertRaisesRegex(
+            NotImplementedError, "MHA-layout mamba-hybrid targets"
+        ):
             resolve_hybrid_device_pool_group(
                 kvcache=kvcache,
                 page_size=1,
@@ -515,7 +555,9 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                 kv_buffer=[torch.zeros((8, 9), dtype=torch.uint8)],
             ),
         )
-        with self.assertRaisesRegex(ValueError, r"rows \(8\) must cover kv rows \(16\)"):
+        with self.assertRaisesRegex(
+            ValueError, r"rows \(8\) must cover kv rows \(16\)"
+        ):
             resolve_hybrid_device_pool_group(
                 kvcache=kvcache,
                 page_size=1,
@@ -570,6 +612,7 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         collapse with empty draft pools at the assembler).
         """
         from sglang.srt.configs.model_config import ModelImpl
+        from sglang.srt.mem_cache import kv_cache_builder
         from sglang.srt.runtime_context import get_memory, reset_context
         from sglang.srt.server_args import (
             ServerArgs,
@@ -577,9 +620,10 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         )
         from sglang.srt.speculative import base_spec_worker as spec
         from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
-        from sglang.srt.mem_cache import kv_cache_builder
 
-        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy", page_size=1))
+        set_global_server_args_for_scheduler(
+            ServerArgs(model_path="dummy", page_size=1)
+        )
         self.addCleanup(reset_context)
 
         model_config = SimpleNamespace(
@@ -618,7 +662,10 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         tp_worker = SimpleNamespace(
             is_hybrid_swa=False,
             model_runner=target_runner,
-            get_memory_pool=lambda: (object(), SimpleNamespace(get_kvcache=lambda: object())),
+            get_memory_pool=lambda: (
+                object(),
+                SimpleNamespace(get_kvcache=lambda: object()),
+            ),
         )
 
         captured = {}
@@ -655,7 +702,14 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                 attn_cp_cpu_group=None,
                 enable_metrics=False,
                 enable_kv_cache_events=False,
-                ps=SimpleNamespace(pp_rank=0, pp_size=1, attn_cp_rank=0, attn_cp_size=1, tp_size=1, tp_rank=0),
+                ps=SimpleNamespace(
+                    pp_rank=0,
+                    pp_size=1,
+                    attn_cp_rank=0,
+                    attn_cp_size=1,
+                    tp_size=1,
+                    tp_rank=0,
+                ),
                 tp_group=None,
                 pp_group=SimpleNamespace(cpu_group=None),
                 enable_hierarchical_cache=False,
@@ -682,7 +736,9 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
 
         def _darwin_mmap(fileno, alloc_bytes, flags):
             # Strip Linux-only MAP_POPULATE (darwin rejects the bit).
-            return _pymmap.mmap(fileno, alloc_bytes, flags=flags & ~0x08000, prot=_PROT_RW)
+            return _pymmap.mmap(
+                fileno, alloc_bytes, flags=flags & ~0x08000, prot=_PROT_RW
+            )
 
         class _FakeCudart:
             def cudaHostRegister(self, ptr, size, flags):
@@ -696,17 +752,19 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
 
         from sglang.srt.environ import envs
         from sglang.srt.mem_cache.hicache_storage import PoolName
-        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
         from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
             build_hybrid_mamba_stack,
         )
+        from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
         from sglang.srt.runtime_context import get_memory, reset_context
         from sglang.srt.server_args import (
             ServerArgs,
             set_global_server_args_for_scheduler,
         )
 
-        set_global_server_args_for_scheduler(ServerArgs(model_path="dummy", page_size=1))
+        set_global_server_args_for_scheduler(
+            ServerArgs(model_path="dummy", page_size=1)
+        )
         self.addCleanup(reset_context)
 
         # Shared fakes: latent-per-layer mamba-hybrid target + wrapper draft
@@ -754,11 +812,17 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
 
         with (
             envs.SGLANG_HUGEPAGE_SIZE.override(""),
-            patch("sglang.srt.mem_cache.storage.mmap.mmap_allocator._mmap_prefaulted", side_effect=_darwin_mmap),
+            patch(
+                "sglang.srt.mem_cache.storage.mmap.mmap_allocator._mmap_prefaulted",
+                side_effect=_darwin_mmap,
+            ),
             mock.patch.object(torch.cuda, "cudart", return_value=_FakeCudart()),
             # The machines' psutil free-RAM budget: the fakes ask for KBs, but
             # a CI box may report negative free memory — stub the gate out.
-            patch("sglang.srt.mem_cache.pool_host.base.host_memory_budget_bytes", return_value=1 << 30),
+            patch(
+                "sglang.srt.mem_cache.pool_host.base.host_memory_budget_bytes",
+                return_value=1 << 30,
+            ),
             get_memory().override(
                 hicache_ratio=2.0,
                 hicache_mem_layout="page_first",
@@ -782,7 +846,9 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
             )
             # (a) the linker KV entry packs the draft's UNWRAPPED inner buffer.
             self.assertIn(PoolName.KV, linker_group.entry_map)
-            self.assertIs(linker_group.entry_map[PoolName.KV].kv_buffer[3], draft_inner_kv_buffer)
+            self.assertIs(
+                linker_group.entry_map[PoolName.KV].kv_buffer[3], draft_inner_kv_buffer
+            )
 
             # --- Consumer (ii): the hicache host stack ---
             host_group, controller = build_hybrid_mamba_stack(
@@ -792,7 +858,9 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                     attn_cp_cache_group=None,
                     attn_tp_cache_group=None,
                     pp_cache_group=None,
-                    token_to_kv_pool_allocator=SimpleNamespace(get_kvcache=lambda: target),
+                    token_to_kv_pool_allocator=SimpleNamespace(
+                        get_kvcache=lambda: target
+                    ),
                     req_to_token_pool=SimpleNamespace(
                         mamba_pool=mamba_pool,
                         mamba_map={1: 0, 3: 1},
@@ -821,7 +889,9 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
             # = 6 layers; the controller reflects the full union (5).
             host_kv = host_group.entry_map[PoolName.KV]
             self.assertEqual(len(host_kv.host_pool.mtp_draft_device_pools), 1)
-            self.assertIs(host_kv.host_pool.packed_device_kv_buffers[3], draft_inner_kv_buffer)
+            self.assertIs(
+                host_kv.host_pool.packed_device_kv_buffers[3], draft_inner_kv_buffer
+            )
             self.assertEqual(host_kv.host_pool.layer_num, 4)  # 3 target + 1 draft
             self.assertEqual(controller.layer_num, 5)  # full union (no draft)
             # The layer mapper resolves the draft depth at transfer id
