@@ -38,6 +38,37 @@ def _is_hybrid_linear_kv_pool(pool: Any) -> bool:
     )
 
 
+_warned_packed_draft_under_dcp = False
+
+
+def _warn_packed_draft_under_dcp(draft_buffers: Sequence[torch.Tensor]) -> None:
+    """One-shot warning: packed MTP draft buffers share the KV entry's folded
+    target row domain under DCP, so their persisted rows land on folded
+    positions instead of the draft's raw virtual locs. Roundtrips are
+    self-consistent (no aliasing, no OOB) but restored draft latents are
+    misplaced — EAGLE verify keeps outputs correct; only speculative
+    acceptance degrades. Full draft-split (dedicated DRAFT entry keyed on the
+    widened page) is the follow-up. Identity risk-free at dcp=1 (no warning,
+    packed layout unchanged)."""
+    global _warned_packed_draft_under_dcp
+    if _warned_packed_draft_under_dcp or not draft_buffers:
+        return
+    try:
+        dcp_size = get_parallel().attn_dcp_size
+    except RuntimeError:
+        return
+    if dcp_size <= 1:
+        return
+    _warned_packed_draft_under_dcp = True
+    logger.warning(
+        "Direct linker under DCP (dcp_size=%d): packed MTP draft KV/index rows "
+        "share the folded target row domain, so persisted draft latents are "
+        "misplaced on restore. Output correctness is preserved by verify; "
+        "expect degraded speculative acceptance on L3-restored prefixes.",
+        dcp_size,
+    )
+
+
 def _dcp_folding_index_mapper(indices: torch.Tensor) -> torch.Tensor:
     """Fold widened DCP logical slots into this rank's physical rows.
 
@@ -497,6 +528,7 @@ def _build_dsa_device_pool_group(
     ]
     if len(draft_kv_buffers) != len(draft_indexer_buffers):
         raise ValueError("DSA MTP KV and indexer draft layer counts must match.")
+    _warn_packed_draft_under_dcp(draft_kv_buffers)
     layer_mapping = _with_packed_draft_mapping(
         {layer: layer for layer in range(num_layers)},
         target_device_layer_num=num_layers,
@@ -695,6 +727,7 @@ def _build_mamba_device_pool_group(
         target_label=PoolName.KV.value,
         draft_label="MTP draft KV",
     )
+    _warn_packed_draft_under_dcp(draft_kv_buffers)
     entries = [
         DevicePoolEntry(
             name=PoolName.KV,
