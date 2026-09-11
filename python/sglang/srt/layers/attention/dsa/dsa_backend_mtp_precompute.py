@@ -122,7 +122,13 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         """Precompute metadata for normal decode mode."""
         max_len = self.decode_cuda_graph_metadata[bs].page_table_1.shape[1]
 
-        if (_is_cuda or _is_hip) and self.dsa_index_kpool <= 1:
+        if (_is_cuda or _is_hip) and (
+            self.dsa_index_kpool <= 1
+            or (
+                not _is_hip
+                and getattr(self, "experimental_kpool_metadata_fusion", False)
+            )
+        ):
             from sglang.kernels.ops.attention.dsa_metadata import (
                 fused_dsa_decode_metadata,
             )
@@ -160,6 +166,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
                 max_len=max_len,
                 dsa_index_topk=self.dsa_index_topk,
                 real_page_size=self.real_page_size,
+                index_kpool=self.dsa_index_kpool,
             )
             seqlens_expanded = cache_seqlens
             seqlens_expanded_size = bs
@@ -245,7 +252,13 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
         max_seqlen_k = self.decode_cuda_graph_metadata[bs].page_table_1.shape[1]
         seqlens_expanded_size = bs * self.speculative_num_draft_tokens
 
-        if (_is_cuda or _is_hip) and self.dsa_index_kpool <= 1:
+        if (_is_cuda or _is_hip) and (
+            self.dsa_index_kpool <= 1
+            or (
+                not _is_hip
+                and getattr(self, "experimental_kpool_metadata_fusion", False)
+            )
+        ):
             from sglang.kernels.ops.attention.dsa_metadata import (
                 fused_dsa_target_verify_metadata,
             )
@@ -298,6 +311,7 @@ class DeepseekSparseAttnBackendMTPPrecomputeMixin:
                 dsa_index_topk=self.dsa_index_topk,
                 real_page_size=self.real_page_size,
                 next_n=self.speculative_num_draft_tokens,
+                index_kpool=self.dsa_index_kpool,
             )
 
             flashmla_metadata = None
