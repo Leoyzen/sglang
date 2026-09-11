@@ -5,7 +5,14 @@ import os
 import tempfile
 import unittest
 
-from sglang.srt.model_loader.weight_utils import filter_duplicate_safetensors_files
+import torch
+from safetensors.torch import save_file
+
+from sglang.srt.model_loader.weight_utils import (
+    engram_aware_fastsafetensors_weights_iterator,
+    filter_duplicate_safetensors_files,
+    split_engram_shards,
+)
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -129,6 +136,108 @@ class TestFilterDuplicateSafetensorsFiles(CustomTestCase):
             index_file=INDEX_NAME,
         )
         self.assertEqual(result, [single])
+
+
+class TestSplitEngramShards(CustomTestCase):
+    """Engram shards must bypass the fastsafetensors GPU staging path."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.folder = self._tmp.name
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def _write_engram_index(self):
+        _write_index(
+            self.folder,
+            {
+                "model.layers.0.mlp.experts.weight": (
+                    "model-00001-of-00002.safetensors"
+                ),
+                "model.layers.1.engram.embed.weight": (
+                    "model-00002-of-00002.safetensors"
+                ),
+                "model.layers.1.engram.embed.scale": (
+                    "model-00002-of-00002.safetensors"
+                ),
+            },
+        )
+
+    def test_index_routes_engram_shard_to_cpu(self):
+        self._write_engram_index()
+        a = _touch(self.folder, "model-00001-of-00002.safetensors")
+        b = _touch(self.folder, "model-00002-of-00002.safetensors")
+
+        gpu_files, cpu_files = split_engram_shards([a, b], self.folder)
+
+        self.assertEqual(gpu_files, [a])
+        self.assertEqual(cpu_files, [b])
+
+    def test_index_without_engram_keeps_all_on_gpu(self):
+        _write_index(
+            self.folder,
+            {"model.layers.0.mlp.experts.weight": ("model-00001-of-00001.safetensors")},
+        )
+        a = _touch(self.folder, "model-00001-of-00001.safetensors")
+
+        gpu_files, cpu_files = split_engram_shards([a], self.folder)
+
+        self.assertEqual(gpu_files, [a])
+        self.assertEqual(cpu_files, [])
+
+    def test_header_scan_fallback_without_index(self):
+        engram_shard = os.path.join(self.folder, "engram.safetensors")
+        plain_shard = os.path.join(self.folder, "plain.safetensors")
+        save_file({"model.layers.1.engram.embed.weight": torch.zeros(2)}, engram_shard)
+        save_file({"model.layers.0.mlp.weight": torch.zeros(2)}, plain_shard)
+
+        gpu_files, cpu_files = split_engram_shards(
+            [plain_shard, engram_shard], self.folder
+        )
+
+        self.assertEqual(gpu_files, [plain_shard])
+        self.assertEqual(cpu_files, [engram_shard])
+
+    def test_empty_input(self):
+        self.assertEqual(split_engram_shards([], self.folder), ([], []))
+
+    def test_engram_aware_iterator_routes_shards_in_order(self):
+        self._write_engram_index()
+        a = _touch(self.folder, "model-00001-of-00002.safetensors")
+        b = _touch(self.folder, "model-00002-of-00002.safetensors")
+
+        import sglang.srt.model_loader.weight_utils as wu
+
+        calls = []
+
+        def fake_fst(files, **kwargs):
+            calls.append(("fst", list(files)))
+            yield "fst.tensor", torch.zeros(1)
+
+        def fake_st(files, **kwargs):
+            calls.append(("st", list(files)))
+            yield "engram.tensor", torch.zeros(1)
+
+        orig_fst = wu.fastsafetensors_weights_iterator
+        orig_st = wu.safetensors_weights_iterator
+        wu.fastsafetensors_weights_iterator = fake_fst
+        wu.safetensors_weights_iterator = fake_st
+        try:
+            names = [
+                name
+                for name, _ in engram_aware_fastsafetensors_weights_iterator(
+                    [a, b], self.folder
+                )
+            ]
+        finally:
+            wu.fastsafetensors_weights_iterator = orig_fst
+            wu.safetensors_weights_iterator = orig_st
+
+        self.assertEqual(names, ["fst.tensor", "engram.tensor"])
+        self.assertEqual([kind for kind, _ in calls], ["fst", "st"])
+        self.assertEqual(calls[0][1], [a])
+        self.assertEqual(calls[1][1], [b])
 
 
 if __name__ == "__main__":

@@ -108,6 +108,7 @@ from sglang.srt.model_loader.weight_utils import (
     buffered_multi_thread_safetensors_weights_iterator,
     download_safetensors_index_file_from_hf,
     download_weights_from_hf,
+    engram_aware_fastsafetensors_weights_iterator,
     fastsafetensors_weights_iterator,
     filter_duplicate_safetensors_files,
     filter_files_not_needed_for_inference,
@@ -655,11 +656,26 @@ class DefaultModelLoader(BaseModelLoader):
 
             if self.load_config.load_format == LoadFormat.FASTSAFETENSORS:
                 enable_gds = extra_config.get("enable_gds", True)
-                weights_iterator = fastsafetensors_weights_iterator(
-                    hf_weights_files,
-                    enable_gds=enable_gds,
-                    drop_cache_after_load=weight_loader_drop_cache_after_load,
-                )
+                if envs.SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE.get():
+                    # Engram tables are host-resident; keep their shards off
+                    # the fastsafetensors GPU staging path (see
+                    # split_engram_shards) so a single ~95 GiB table cannot
+                    # OOM the device buffer.
+                    weights_iterator = engram_aware_fastsafetensors_weights_iterator(
+                        hf_weights_files,
+                        hf_folder,
+                        enable_gds=enable_gds,
+                        drop_cache_after_load=weight_loader_drop_cache_after_load,
+                        disable_mmap=weight_loader_disable_mmap,
+                        prefetch=start_iterator_prefetch,
+                        prefetch_num_threads=prefetch_num_threads,
+                    )
+                else:
+                    weights_iterator = fastsafetensors_weights_iterator(
+                        hf_weights_files,
+                        enable_gds=enable_gds,
+                        drop_cache_after_load=weight_loader_drop_cache_after_load,
+                    )
             elif use_multithread:
                 weights_iterator = buffered_multi_thread_safetensors_weights_iterator(
                     hf_weights_files,

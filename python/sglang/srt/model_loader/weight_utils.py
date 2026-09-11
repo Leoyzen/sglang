@@ -1165,6 +1165,108 @@ def safetensors_weights_iterator(
             _drop_file_cache_after_load(st_file)
 
 
+def _shard_has_engram_tensor(path: str) -> bool:
+    """Whether a checkpoint shard holds any Engram tensor (``*.engram.*``)."""
+    try:
+        with safetensors.safe_open(path, framework="pt", device="cpu") as f:
+            return any(".engram." in key for key in f.keys())
+    except Exception as e:  # pragma: no cover - defensive, unreadable shard
+        logger.debug("Could not inspect %s for engram tensors: %s", path, e)
+        return False
+
+
+def split_engram_shards(
+    hf_weights_files: List[str], hf_folder: Optional[str] = None
+) -> Tuple[List[str], List[str]]:
+    """Partition shards into ``(gpu_files, cpu_files)`` for Engram host offload.
+
+    With ``SGLANG_ENABLE_DSV41_ENGRAM_HOST_TABLE`` the Engram tables live in
+    host memory and their ``weight_loader`` expects CPU/mmap tensors. The
+    fastsafetensors loader stages whole shards on the GPU (it allocates a
+    device buffer the size of the shard's data section), so a single ~95 GiB
+    Engram tensor OOMs even though the destination is host memory. Route any
+    shard containing an Engram tensor to the CPU/mmap path instead.
+
+    Shard membership is read from the safetensors index when available,
+    falling back to a header scan so single-file checkpoints also work.
+    """
+    if not hf_weights_files:
+        return [], []
+
+    index_file = (
+        os.path.join(hf_folder, "model.safetensors.index.json") if hf_folder else None
+    )
+    engram_basenames: Optional[set] = None
+    if index_file and os.path.isfile(index_file):
+        try:
+            with open(index_file) as f:
+                weight_map = json.load(f).get("weight_map", {})
+            engram_basenames = {
+                os.path.basename(shard)
+                for name, shard in weight_map.items()
+                if ".engram." in name
+            }
+        except (OSError, ValueError) as e:
+            logger.debug("Could not read %s for engram shards: %s", index_file, e)
+            engram_basenames = None
+
+    gpu_files: List[str] = []
+    cpu_files: List[str] = []
+    for path in hf_weights_files:
+        if engram_basenames is not None:
+            is_engram = os.path.basename(path) in engram_basenames
+        else:
+            is_engram = _shard_has_engram_tensor(path)
+        (cpu_files if is_engram else gpu_files).append(path)
+    return gpu_files, cpu_files
+
+
+def engram_aware_fastsafetensors_weights_iterator(
+    hf_weights_files: List[str],
+    hf_folder: Optional[str] = None,
+    *,
+    enable_gds: bool = True,
+    drop_cache_after_load: bool = False,
+    disable_mmap: bool = False,
+    prefetch: bool = False,
+    prefetch_num_threads: int = 4,
+) -> Generator[Tuple[str, torch.Tensor], None, None]:
+    """fastsafetensors iterator that keeps Engram shards off the GPU.
+
+    Non-Engram shards use the fast GPU loader; Engram-containing shards are
+    streamed from the CPU/mmap iterator so their (host-resident) tables never
+    allocate a device staging buffer. Falls back to plain fastsafetensors when
+    no Engram shard is present.
+    """
+    gpu_files, cpu_files = split_engram_shards(hf_weights_files, hf_folder)
+    if not cpu_files:
+        yield from fastsafetensors_weights_iterator(
+            gpu_files,
+            enable_gds=enable_gds,
+            drop_cache_after_load=drop_cache_after_load,
+        )
+        return
+
+    logger.info(
+        "Engram host table enabled: routing %d shard(s) to the CPU/mmap loader "
+        "to avoid GPU staging: %s",
+        len(cpu_files),
+        [os.path.basename(f) for f in cpu_files],
+    )
+    yield from fastsafetensors_weights_iterator(
+        gpu_files,
+        enable_gds=enable_gds,
+        drop_cache_after_load=drop_cache_after_load,
+    )
+    yield from safetensors_weights_iterator(
+        cpu_files,
+        disable_mmap=disable_mmap,
+        prefetch=prefetch,
+        prefetch_num_threads=prefetch_num_threads,
+        drop_cache_after_load=drop_cache_after_load,
+    )
+
+
 def fastsafetensors_weights_iterator(
     hf_weights_files: List[str],
     enable_gds: bool = True,
@@ -1217,7 +1319,13 @@ def fastsafetensors_weights_iterator(
                     t = fb.get_tensor(k)
                     yield k, t
             finally:
-                pass
+                # Release the device buffer before the loader itself: it can
+                # hold up to a whole shard, and keeping it alive until
+                # `loader.close()` doubles peak device memory
+                # (foundation-model-stack/fastsafetensors#94).
+                close_fb = getattr(fb, "close", None)
+                if close_fb is not None:
+                    close_fb()
         finally:
             loader.close()
         if drop_cache_after_load:
