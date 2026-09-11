@@ -1,4 +1,4 @@
-"""Fully fused KDA decode step (Kimi K3 batched decode fast path).
+"""Fully fused KDA decode step (Kimi K3 / GLM-5.3-Flash batched decode fast path).
 
 One kernel replaces the three-kernel decode chain
 ``causal_conv1d_update -> kda_packed_decode -> rms_norm_gated``: it reads the
@@ -11,12 +11,13 @@ Kernel body vendored from the NVIDIA x Moonshot Kimi K3 optimization package
 (see csrc/attention/kda_fused_decode.cuh for provenance and the list of
 integration patches). Specialized for the K3 KDA decode regime:
 K = V = 128, kernel width 4, no lower bound, T = 1 per request.
-The JIT currently instantiates local head counts H = HV in {12, 6, 3}
-(TP8, TP16, and TP32).
+The JIT instantiates local head counts H = HV in {12, 6, 3} (K3 TP8/TP16/TP32)
+and {16, 64} (GLM-5.3-Flash TP4 / unsharded — same head_dim 128, width 4, and
+sigmoid-gated output-norm regime).
 
 The model must hand off the output-norm gate (attempt-and-verify stash on the
-attention layer, see kimi_k3.py), and a covered() check gates supported inputs.
-Everything else falls back to the unfused chain.
+attention layer, see kimi_k3.py / glm5_next.py), and a covered() check gates
+supported inputs. Everything else falls back to the unfused chain.
 """
 
 from __future__ import annotations
@@ -35,7 +36,9 @@ from sglang.kernels.jit.utils import (
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
 
-_SUPPORTED_HEADS = {3, 6, 12}
+# K3: 12/6/3 local heads at TP8/16/32. GLM-5.3-Flash: 16 local heads at TP4,
+# 64 unsharded (its KDA decode regime matches K3: head_dim 128, conv width 4).
+_SUPPORTED_HEADS = {3, 6, 12, 16, 64}
 _CONV_STATE_W = 3  # kernel width 4 -> 3 cached tokens
 
 
@@ -60,10 +63,11 @@ def covered(
     cache_indices: torch.Tensor,
     onorm_g: torch.Tensor,
 ) -> bool:
-    """The kernel is compiled for the K3 KDA decode regime: H heads of 128,
-    packed [T, 3*H*128] qkv rows, transposed [slots, 3, 3*H*128] conv pool, fp32
-    [slots, H, 128, 128] ssm pool (inner-contiguous, any slot pitch — the
-    kernel reads the real slot stride), one token per request."""
+    """The kernel is compiled for the K3 / GLM-5.3-Flash KDA decode regimes:
+    H heads of 128, packed [T, 3*H*128] qkv rows, transposed [slots, 3,
+    3*H*128] conv pool, fp32 [slots, H, 128, 128] ssm pool (inner-contiguous,
+    any slot pitch — the kernel reads the real slot stride), one token per
+    request."""
     if ssm_states.ndim < 4:
         return False
     H, V, K = ssm_states.shape[-3:]
