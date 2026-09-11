@@ -49,7 +49,10 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_model, get_parallel, get_serving
-from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
+from sglang.srt.speculative.ragged_verify import (
+    resolve_ragged_verify_layout,
+    row_map_from_qo_indptr,
+)
 from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
 
@@ -214,29 +217,6 @@ def _assert_ragged_verify_path_supports_engram() -> None:
     )
 
 
-def _torch_row_map_from_qo_indptr(
-    qo_indptr: torch.Tensor, num_tokens: int, bs: int
-) -> torch.Tensor:
-    """Per-token request row from the ragged verify layout's qo_indptr.
-
-    Built with searchsorted over a fixed shape (no repeat_interleave: its
-    output shape depends on data, which cuda graph replay cannot tolerate).
-    Bisect-right over the full indptr puts token t in the last row starting at
-    or before it, so zero-length rows are skipped naturally; tokens past the
-    capped layout's final cumsum (its tail pad) clamp into the last row. The
-    pad tokens hash to garbage rows but have no consumer: their logits are
-    scattered away and verify never commits them to history.
-    """
-    return (
-        torch.searchsorted(
-            qo_indptr,
-            torch.arange(num_tokens, device=qo_indptr.device),
-            right=True,
-        )
-        - 1
-    ).clamp_max(bs - 1)
-
-
 def compute_engram_hash_ids(
     tokens: torch.Tensor,
     blocked: torch.Tensor,
@@ -369,9 +349,7 @@ class EngramHasher(nn.Module):
                 # (the capped layout's tail pad, input_ids=0) land in the last
                 # row; their hash has no consumer: logits are scattered away and
                 # verify never commits them to history.
-                row = _torch_row_map_from_qo_indptr(
-                    layout.qo_indptr_device, num_tokens, bs
-                )
+                row = row_map_from_qo_indptr(layout.qo_indptr_device, num_tokens, bs)
                 starts = layout.qo_indptr_device[:bs]
                 kmode = MODE_EXTEND
                 block = 1

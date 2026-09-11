@@ -3,13 +3,15 @@
 Compact ragged verify packs each request's verify tokens into per-request
 runs of unequal length (planner budget trimming), while the uniform
 target-verify path assumes one equal block per request. The ragged-aware
-EngramHasher.forward derives the per-token request row from the layout's
-qo_indptr (searchsorted, fixed shape) and hashes with MODE_EXTEND semantics.
-These tests pin that path to a hand-rolled ground truth on CPU only -- no
-triton, no CUDA -- so they run in the base-a CPU suite.
+EngramHasher.forward and the V4.1 low-ratio token_req_indices derive the
+per-token request row from the layout's qo_indptr (searchsorted, fixed
+shape) instead of expanding a uniform block. These tests pin that path to a
+hand-rolled ground truth on CPU only -- no triton, no CUDA -- so they run
+in the base-a CPU suite.
 """
 
 import unittest
+from types import SimpleNamespace
 
 import torch
 
@@ -17,7 +19,9 @@ from sglang.kernels.ops.embeddings.engram_hash import (
     MODE_EXTEND,
     MODE_VERIFY,
 )
-from sglang.srt.layers.engram import _torch_row_map_from_qo_indptr
+from sglang.srt.layers.attention.dsv4.dsv41_sparse import token_req_indices
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
+from sglang.srt.speculative.ragged_verify import row_map_from_qo_indptr
 from sglang.test.ci.ci_register import register_cpu_ci
 from sglang.test.test_utils import CustomTestCase
 
@@ -85,7 +89,7 @@ class TestRaggedEngramRowMap(CustomTestCase):
         mapping; tokens past the last cumsum clamp into the last row (the
         capped layout's tail pad -- no consumer reads their hash)."""
         indptr = torch.tensor([0, 6, 6, 12, 15])
-        row = _torch_row_map_from_qo_indptr(indptr, num_tokens=17, bs=4)
+        row = row_map_from_qo_indptr(indptr, num_tokens=17, bs=4)
         self.assertEqual(row[:6].tolist(), [0] * 6)
         self.assertEqual(row[6:12].tolist(), [2] * 6)
         self.assertEqual(row[12:].tolist(), [3] * 5)
@@ -99,9 +103,7 @@ class TestRaggedEngramRowMap(CustomTestCase):
                 lens, seed=abs(hash(tuple(lens))) % 2**31
             )
 
-            row = _torch_row_map_from_qo_indptr(
-                indptr, num_tokens=ids.numel(), bs=len(lens)
-            )
+            row = row_map_from_qo_indptr(indptr, num_tokens=ids.numel(), bs=len(lens))
             ragged_ids, ragged_toks = hasher._torch_hash_ids(
                 ids,
                 pos,
@@ -157,6 +159,63 @@ class TestRaggedEngramRowMap(CustomTestCase):
                         torch.equal(got_ids, want_ids),
                         f"lens={lens} row={r}: hash mismatch",
                     )
+
+
+def _verify_forward_batch(lens, num_tokens):
+    """A minimal forward batch for token_req_indices under TARGET_VERIFY.
+
+    spec_info carries the ragged layout when one is wanted; the layout's
+    device tensors are built the same way the decode graph runner stages
+    them (full indptr, first bs entries = per-row starts)."""
+    indptr = torch.tensor([0] + list(torch.cumsum(torch.tensor(lens), 0)))
+    total = int(indptr[-1])
+    assert total == num_tokens
+    fake = SimpleNamespace()
+    fake.forward_mode = ForwardMode.TARGET_VERIFY
+    fake.req_pool_indices = torch.arange(100, 100 + len(lens), dtype=torch.int64)
+    fake.spec_info = SimpleNamespace(
+        draft_token_num=6,
+        ragged_verify_layout=SimpleNamespace(qo_indptr_device=indptr),
+    )
+    return fake
+
+
+class TestTokenReqIndicesRaggedVerify(CustomTestCase):
+    def test_ragged_layout_maps_rows_via_qo_indptr(self):
+        """lens [6,5,6,5,0,6] + ghost pad: every token must resolve to its
+        request's req_pool_indices row; zero-length rows skip, the ghost tail
+        clamps into the last row (its hash/logit rows have no consumer)."""
+        lens = [6, 5, 6, 5, 0, 6]
+        num_tokens = sum(lens)
+        fb = _verify_forward_batch(lens, num_tokens)
+
+        got = token_req_indices(fb, num_tokens=num_tokens)
+        # Per-row expectation: each nonempty row's tokens take that row's req
+        # id; the ghost tail already belongs to the last row through indptr.
+        want = torch.cat(
+            [
+                torch.full((width,), int(fb.req_pool_indices[r]))
+                for r, width in enumerate(lens)
+                if width > 0
+            ]
+        )
+        self.assertEqual(got.shape[0], num_tokens)
+        self.assertTrue(torch.equal(got, want), (got.tolist(), want.tolist()))
+
+    def test_no_layout_keeps_uniform_expansion(self):
+        """Without a layout (eager/static verify) the pre-fix uniform block
+        expansion must be preserved exactly."""
+        bs, block = 3, 6
+        num_tokens = bs * block
+        fb = SimpleNamespace()
+        fb.forward_mode = ForwardMode.TARGET_VERIFY
+        fb.req_pool_indices = torch.arange(7, 7 + bs, dtype=torch.int64)
+        fb.spec_info = SimpleNamespace(draft_token_num=block, ragged_verify_layout=None)
+
+        got = token_req_indices(fb, num_tokens=num_tokens)
+        want = fb.req_pool_indices.repeat_interleave(block)
+        self.assertEqual(got.shape[0], num_tokens)
+        self.assertTrue(torch.equal(got, want), got.tolist())
 
 
 if __name__ == "__main__":

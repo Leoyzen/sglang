@@ -20,6 +20,10 @@ from sglang.srt.layers.attention.dsv4.torch_quant import (
 )
 from sglang.srt.layers.linear import ReplicatedLinear
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
+from sglang.srt.speculative.ragged_verify import (
+    resolve_ragged_verify_layout,
+    row_map_from_qo_indptr,
+)
 from sglang.srt.utils import add_prefix
 
 
@@ -66,6 +70,22 @@ def token_req_indices(forward_batch, *, num_tokens=None) -> torch.Tensor:
     if forward_batch.forward_mode.is_decode():
         return req
     if forward_batch.forward_mode.is_target_verify():
+        # Ragged verify (compact capture / replay): tokens are packed into
+        # per-request runs of unequal length, so the row comes from the
+        # layout's qo_indptr. Both operands are graph-stable: the layout's
+        # device tensors are staged in place at replay (see the decode graph
+        # runner's _stage_ragged_verify_layout) and req is the padded slots
+        # buffer -- bs here is that slot count, matching the layout rows.
+        layout = resolve_ragged_verify_layout(forward_batch)
+        if layout is not None:
+            assert num_tokens is not None, (
+                "ragged target-verify needs the token count to expand into"
+            )
+            return req[
+                row_map_from_qo_indptr(
+                    layout.qo_indptr_device, num_tokens, req.shape[0]
+                )
+            ]
         return torch.repeat_interleave(
             req, int(forward_batch.spec_info.draft_token_num), output_size=num_tokens
         )
