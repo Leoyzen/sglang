@@ -131,18 +131,29 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             tp_rank = torch.distributed.get_rank(group=tp_group)
             tp_size = torch.distributed.get_world_size(group=tp_group)
         rank_replicated = self.pool_group.rank_replicated
-        # PR2 (task 4.3): under DCP every rank owns its own shard keys, so the
-        # offload-owner mask widens to all ranks when the DCP-L3 shard flag is
-        # active. Legacy mask preserved byte-for-byte when the flag is off.
+        # PR2 (task 4.3) under BUFFER-MODE semantics: DCP ranks back up their
+        # own shards on rank-scoped keys. The direct-linker analog: the pool
+        # group's rank_replicated flag decides ownership, EXCEPT the mamba
+        # group which is NOT replicated (mamba state is TP-sharded per rank)
+        # while its KEYS ride the shared `_dcp{rank}_{size}` namespace — so a
+        # nonzero-TP rank still owns its mamba objects. Ownership stays the
+        # legacy mask (`not rank_replicated or tp_rank == 0`); the DCP shard
+        # flag is NOT consulted here because the linker never enters the
+        # buffer-mode "replicated MLA, rank0-only backup" regime (each rank
+        # registers its own GPU buffer, so each rank is always the owner of
+        # its slice). See `_dcp_folding_index_mapper` for the slot-side.
         parallel = get_parallel()
         dcp_size = getattr(parallel, "attn_dcp_size", 1)
         dcp_rank = getattr(parallel, "attn_dcp_rank", 0)
-        enable_hicache_dcp_shard = bool(
-            getattr(get_memory(), "enable_hicache_dcp_shard", False)
-        )
-        dcp_enabled = dcp_size > 1 and enable_hicache_dcp_shard
+        dcp_enabled = dcp_size > 1
         self.dcp_rank = dcp_rank if dcp_enabled else 0
-        self.offload_owner = not rank_replicated or tp_rank == 0 or dcp_enabled
+        # Offload ownership: every rank of a non-replicated group owns its
+        # own keys (they carry the rank-scoped DCP + TP suffix), and a
+        # replicated group (DSV4/DSA view duplication) elects tp_rank 0.
+        # The buffer-mode `enable_hicache_dcp_shard` flag deliberately does
+        # NOT widen this mask — the linker has no rank-0-only shortcut to
+        # re-enable; every rank's keys are unique.
+        self.offload_owner = not rank_replicated or tp_rank == 0
         extra_config, *_ = HybridCacheController.parse_storage_backend_extra_config(
             get_memory().hicache_storage_backend_extra_config
         )
@@ -163,7 +174,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             extra_config=extra_config,
             dcp_rank=dcp_rank,
             dcp_size=dcp_size,
-            enable_hicache_dcp_shard=enable_hicache_dcp_shard,
+            # The linker needs no buffer-mode shard flag: keys are rank-scoped
+            # via the suffix namespace and slots fold in the pool group.
+            enable_hicache_dcp_shard=False,
         )
         if storage is None:
             from sglang.srt.mem_cache.storage.mooncake_store.mooncake_store import (
@@ -202,12 +215,18 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.register_buffers()
         self.layer_done_counter = LayerWiseLoadCounter(self.num_layers)
         if PoolName.MAMBA in self.pools:
-            params.req_to_token_pool.register_layer_transfer_counter(self.layer_done_counter)
+            params.req_to_token_pool.register_layer_transfer_counter(
+                self.layer_done_counter
+            )
         self.pending_loads: dict[str, list[PoolTransfer]] = {}
         self.gc_frozen = False
-        self.load_queue: Queue[tuple[int, dict[str, list[PoolTransfer]], object] | None] = Queue()
+        self.load_queue: Queue[
+            tuple[int, dict[str, list[PoolTransfer]], object] | None
+        ] = Queue()
         self.completed_loads: Queue[list[str]] = Queue()
-        self.offload_queue: Queue[tuple[list[PoolTransfer], int, object] | None] = Queue()
+        self.offload_queue: Queue[tuple[list[PoolTransfer], int, object] | None] = (
+            Queue()
+        )
         self.offload_results: Queue[bool] = Queue()
         self.stats = {"lookup": 0, "load": 0, "offload": 0}
         self.load_thread = threading.Thread(
@@ -234,7 +253,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 seen.add(allocation)
                 result = self.storage.store.register_buffer(*allocation)
                 if result not in (0, None):
-                    raise RuntimeError(f"Failed to register GPU KV buffer with Mooncake, error code: {result}.")
+                    raise RuntimeError(
+                        f"Failed to register GPU KV buffer with Mooncake, error code: {result}."
+                    )
 
     def lookup(self, rid: str, transfers: list[PoolTransfer]) -> list[int]:
         expanded = self.pool_group.resolve_transfers(transfers)
@@ -252,7 +273,17 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 rid,
                 len(page_keys),
                 [str(k) for k in page_keys[:2]],
-                [(t.name, t.hit_policy, len(t.keys or ()), len(t.host_indices or []) if t.host_indices is not None else None) for t in expanded],
+                [
+                    (
+                        t.name,
+                        t.hit_policy,
+                        len(t.keys or ()),
+                        len(t.host_indices or [])
+                        if t.host_indices is not None
+                        else None,
+                    )
+                    for t in expanded
+                ],
             )
         result = self.storage.batch_exists_v2(page_keys, expanded)
         restorable = result.restorable_prefix_pages or []
@@ -262,7 +293,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                 "LINKER-DBG lookup-result rid=%s restorable=%s page_exists_head=%s",
                 rid,
                 restorable[-5:],
-                getattr(result, "page_exists", None)[:5] if getattr(result, "page_exists", None) is not None else None,
+                getattr(result, "page_exists", None)[:5]
+                if getattr(result, "page_exists", None) is not None
+                else None,
             )
         if restorable:
             logger.info(
@@ -287,12 +320,16 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         "validated" and the async load path retains its own semantics.
         """
         try:
-            resolved = self.pool_group.resolve_transfers(transfers, allow_partial=True, allow_missing_kv=True)
+            resolved = self.pool_group.resolve_transfers(
+                transfers, allow_partial=True, allow_missing_kv=True
+            )
             if not resolved:
                 return True
             key_strs: list[str] = []
             for transfer in resolved:
-                component_keys, _ = self.storage._get_hybrid_page_component_keys(list(transfer.keys), transfer)
+                component_keys, _ = self.storage._get_hybrid_page_component_keys(
+                    list(transfer.keys), transfer
+                )
                 key_strs.extend(self.storage._tag_keys(component_keys))
             if not key_strs:
                 return True
@@ -317,7 +354,9 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         # Query establishes a boundary at which every component is restorable;
         # insert then removes pages already resident in L1. Loading is therefore
         # intentionally partial and may contain only a side pool such as SWA.
-        expanded = self.pool_group.resolve_transfers(transfers, allow_partial=True, allow_missing_kv=True)
+        expanded = self.pool_group.resolve_transfers(
+            transfers, allow_partial=True, allow_missing_kv=True
+        )
         if not expanded:
             return False
         if rid in self.pending_loads:
@@ -375,16 +414,24 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             finally:
                 self.load_queue.task_done()
 
-    def load_layer_wise(self, counter_index: int, request_transfers: list[list[PoolTransfer]]) -> None:
+    def load_layer_wise(
+        self, counter_index: int, request_transfers: list[list[PoolTransfer]]
+    ) -> None:
         started = []
         try:
             batches: dict[PoolName, tuple[list[str], list[int]]] = {}
             for transfers in request_transfers:
                 for transfer in transfers:
                     keys, locations = batches.setdefault(transfer.name, ([], []))
-                    component_keys, _ = self.storage._get_hybrid_page_component_keys(list(transfer.keys), transfer)
+                    component_keys, _ = self.storage._get_hybrid_page_component_keys(
+                        list(transfer.keys), transfer
+                    )
                     keys.extend(self.storage._tag_keys(component_keys))
-                    locations.extend(self.pools[transfer.name].prepare_locations(transfer.host_indices))
+                    locations.extend(
+                        self.pools[transfer.name].prepare_locations(
+                            transfer.host_indices
+                        )
+                    )
             for keys, _ in batches.values():
                 result = self.storage.store.batch_get_session_start(keys)
                 failed = [key for key, code in zip(keys, result) if code != 0]
@@ -405,12 +452,16 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     failed_get_cache = getattr(self.storage, "failed_get_cache", None)
                     if failed_get_cache is not None:
                         failed_get_cache.update_batch([], failed)
-                    raise RuntimeError(f"Mooncake get session start failed: keys={len(keys)}, failed={len(failed)}, results={result}")
+                    raise RuntimeError(
+                        f"Mooncake get session start failed: keys={len(keys)}, failed={len(failed)}, results={result}"
+                    )
                 started.append(keys)
 
             for layer in range(self.num_layers):
                 for name, (keys, locations) in batches.items():
-                    meta = self.pools[name].get_prepared_layer_range_meta(locations, layer)
+                    meta = self.pools[name].get_prepared_layer_range_meta(
+                        locations, layer
+                    )
                     if meta is None:
                         continue
                     ptrs, sizes, offsets = meta
@@ -421,23 +472,39 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                         offsets,
                     )
                     expected = [sum(item) for item in sizes]
-                    if result is None or isinstance(result, int) or list(result) != expected:
-                        raise RuntimeError(f"Mooncake range get failed for pool={name}, layer={layer}: transferred={result}, expected={expected}")
+                    if (
+                        result is None
+                        or isinstance(result, int)
+                        or list(result) != expected
+                    ):
+                        raise RuntimeError(
+                            f"Mooncake range get failed for pool={name}, layer={layer}: transferred={result}, expected={expected}"
+                        )
                     # Checksum probe: after an INDEXER layer lands, sum the
                     # restored rows. Zero-sum rows mean the DMA wrote nothing
                     # (or the remote object was zero/stale) — the smoking gun
                     # for restore-side index corruption. Gated by
                     # SGLANG_LINKER_DEBUG_KEY.
-                    if name == PoolName.INDEXER and _os.environ.get("SGLANG_LINKER_DEBUG_KEY"):
+                    if name == PoolName.INDEXER and _os.environ.get(
+                        "SGLANG_LINKER_DEBUG_KEY"
+                    ):
                         try:
                             entry = self.pools[name]
                             mapped = entry.layer_mapping.get(layer)
                             if mapped is not None:
-                                buf = entry.components[0][mapped if isinstance(mapped, int) else mapped[0]]
+                                buf = entry.components[0][
+                                    mapped if isinstance(mapped, int) else mapped[0]
+                                ]
                                 if buf.shape[0]:
                                     rows = torch.as_tensor(locations, dtype=torch.long)
                                     rows = rows.clamp_max(buf.shape[0] - 1)
-                                    cs = buf[rows].view(torch.uint8).to(torch.int64).sum().item()
+                                    cs = (
+                                        buf[rows]
+                                        .view(torch.uint8)
+                                        .to(torch.int64)
+                                        .sum()
+                                        .item()
+                                    )
                                     logger.info(
                                         "LINKER-DBG idx-checksum layer=%d rows=%d checksum=%d",
                                         layer,
@@ -487,7 +554,10 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     logger.info(
                         "LINKER-DBG offload tokens=%d pools=%s first_keys=%s",
                         tokens,
-                        {name: (t.keys[:2], t.hit_policy) for name, t in ((x.name, x) for x in expanded)},
+                        {
+                            name: (t.keys[:2], t.hit_policy)
+                            for name, t in ((x.name, x) for x in expanded)
+                        },
                         [str(k) for k in next(iter(expanded)).keys[:2]],
                     )
                 results = self.storage.batch_set_v2(expanded)

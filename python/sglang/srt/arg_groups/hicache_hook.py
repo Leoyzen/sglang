@@ -47,6 +47,15 @@ def handle_hicache(server_args: Any):
                 "different ranks would collide on dcp_rank=0 keys. Run UMBP "
                 "with --dcp-size 1."
             )
+        # Mooncake direct linker under DCP is SUPPORTED (no shard flag
+        # required): its component keys are composed from the per-rank
+        # `mla_suffix`/`mha_suffix`, which carry the `_dcp{rank}_{size}`
+        # namespace, so the KEY space is rank-scoped with no cross-rank
+        # collisions; and the pool group folds the widened logical slots to
+        # per-rank physical rows at `resolve_transfers`
+        # (`linker_pool_assembler._dcp_folding_index_mapper`), mirroring
+        # `HostKVCache.maybe_dcp_kernel_indices`. The mamba state pool is
+        # replicated and slot-granular, so it is untouched by the folding.
         return
 
     # Skip all normalization when neither hicache nor decode-offload path is active.
