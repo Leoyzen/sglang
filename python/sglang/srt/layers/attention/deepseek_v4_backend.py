@@ -1270,14 +1270,19 @@ class DeepseekV4AttnBackend(
                 cp_metadata = forward_batch.attn_cp_metadata
             assert cp_metadata is not None
             padded_num_tokens = sum(cp_metadata.per_rank_actual_token)
-            if (
-                swa_replay_start is not None
-                and swa_replay_start.shape[0] < padded_num_tokens
-            ):
-                swa_replay_start = torch.nn.functional.pad(
-                    swa_replay_start,
-                    (0, padded_num_tokens - swa_replay_start.shape[0]),
-                )
+        if (
+            swa_replay_start is not None
+            and swa_replay_start.shape[0] < padded_num_tokens
+        ):
+            # Padded extends (padding rows beyond the real tail tokens) widen
+            # seq_lens_casual past the per-request floor rows. Floor the pad
+            # rows too (value 0) so the window clamp below stays
+            # shape-consistent; pad rows carry seq_lens_casual=1, so floored=1
+            # leaves their window length untouched.
+            swa_replay_start = torch.nn.functional.pad(
+                swa_replay_start,
+                (0, padded_num_tokens - swa_replay_start.shape[0]),
+            )
 
         seq_lens_casual, req_pool_indices_repeated = self.expand_prefill_casually(
             num_tokens=num_tokens,
