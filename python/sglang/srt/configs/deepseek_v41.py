@@ -20,6 +20,24 @@ def _config_dict(config):
     return config.to_dict() if isinstance(config, PretrainedConfig) else dict(config)
 
 
+def dsv41_vision_enabled(config) -> bool:
+    """Whether the V4.1 vision tower should exist in this process.
+
+    The tower is built whenever the checkpoint declares one
+    (``vision_n_layers > 0``), except when serving as a text-only model via
+    ``--language-model-only``: ModelConfig folds that flag onto ``hf_config``
+    (configs/model_config.py), so the tower is skipped, its weights are left
+    unloaded, and multimodal requests are rejected upstream. Keep every V4.1
+    ``vision_n_layers``-keyed gate on this helper so the flag disables all of
+    them consistently.
+    """
+    return (
+        config.model_type == "deepseek_v41"
+        and getattr(config, "vision_n_layers", 0) > 0
+        and not getattr(config, "language_model_only", False)
+    )
+
+
 def normalize_deepseek_v41_config(values):
     values = dict(values)
     text = values.pop("text_config", None)

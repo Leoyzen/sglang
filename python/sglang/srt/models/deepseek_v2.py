@@ -42,6 +42,7 @@ from sglang.srt.batch_overlap.two_batch_overlap import (
     MaybeTboDeepEPDispatcher,
     model_forward_maybe_tbo,
 )
+from sglang.srt.configs.deepseek_v41 import dsv41_vision_enabled
 from sglang.srt.configs.model_config import (
     compute_mla_mscale_scaling,
     dsa_layer_skips_topk,
@@ -514,7 +515,7 @@ class MoEGate(nn.Module):
         else:
             self.e_score_correction_bias = None
         self.e_score_correction_bias_vl = None
-        if config.model_type == "deepseek_v41" and config.vision_n_layers > 0:
+        if dsv41_vision_enabled(config):
             self.e_score_correction_bias_vl = nn.Parameter(
                 torch.empty(config.n_routed_experts, dtype=torch.float32),
                 requires_grad=False,
