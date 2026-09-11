@@ -4055,7 +4055,25 @@ class MLATokenToKVPool(KVCache):
         for kv_cache in self.kv_buffer:
             kv_cache[tgt_loc_flat] = kv_cache[src_loc_flat]
 
+    def _localize_dcp_indices(self, indices: torch.Tensor) -> torch.Tensor:
+        """Map DCP-widened req_to_token ids to this rank's physical pool rows.
+
+        Retraction's CPU backup/restore gathers req_to_token entries, which
+        under dcp_size>1 live in the DCP-widened virtual space, while this
+        SHARDED pool addresses per-rank rows by the physical id. Apply the
+        same owner rule the write kernels use (`loc % dcp == rank` ->
+        `loc // dcp`): non-owned ids belong to a peer rank's shard and must
+        not touch this buffer.
+        """
+        parallel = get_parallel()
+        if not parallel.dcp_enabled:
+            return indices
+        dcp = parallel.attn_dcp_size
+        owned = indices % dcp == parallel.attn_dcp_rank
+        return indices[owned] // dcp
+
     def get_cpu_copy(self, indices, mamba_indices=None, req_pool_index=None):
+        indices = self._localize_dcp_indices(indices)
         current_platform.synchronize()
         kv_cache_cpu = []
         chunk_size = self.cpu_offloading_chunk_size
@@ -4071,6 +4089,7 @@ class MLATokenToKVPool(KVCache):
         return kv_cache_cpu
 
     def load_cpu_copy(self, kv_cache_cpu, indices, mamba_indices=None, req_pool_index=None):
+        indices = self._localize_dcp_indices(indices)
         current_platform.synchronize()
         chunk_size = self.cpu_offloading_chunk_size
         for layer_id in range(self.layer_num):
