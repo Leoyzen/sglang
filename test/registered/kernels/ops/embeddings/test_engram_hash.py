@@ -6,6 +6,7 @@ import torch
 from sglang.kernels.ops.embeddings.engram_hash import (
     MODE_DECODE,
     MODE_EXTEND,
+    MODE_VERIFY,
     engram_hash_ids,
     engram_hash_ids_and_commit,
 )
@@ -324,3 +325,98 @@ def test_extend_with_scheduler_history_and_image_spans():
         starts=starts,
         **_common(image=True),
     )
+
+
+def _ragged_row_map(lens):
+    """The layout tensors engram.py builds for a ragged verify forward.
+
+    Returns (qo_indptr, row, starts) with the row map produced exactly the way
+    EngramHasher.forward's target-verify branch does: searchsorted over the
+    full qo_indptr (right=True), minus one, clamped into [0, bs - 1]. This is
+    the reference construction those graphs rely on."""
+    indptr = torch.tensor([0] + list(torch.cumsum(torch.tensor(lens), 0).tolist()))
+    total = int(indptr[-1])
+    row = (torch.searchsorted(indptr, torch.arange(total), right=True) - 1).clamp_max(
+        len(lens) - 1
+    )
+    return indptr, row, indptr[:-1]
+
+
+def test_target_verify_ragged_verify_lens_matches_naive():
+    """Heterogeneous verify lens, zero-length rows and a trailing ghost row
+    through the ragged row/starts + MODE_EXTEND path, against the naive
+    per-token ground truth."""
+    g = torch.Generator().manual_seed(7)
+    # 6 slots: mixed lens, a zero-length row in the middle, an over-budget
+    # tail row holding the capped layout's pad tokens (input_ids=0 there --
+    # hash has no consumer but must not read out of bounds).
+    lens = [6, 5, 6, 5, 0, 6]
+    indptr, row, starts = _ragged_row_map(lens)
+    num_tokens = int(indptr[-1])
+    padded_to = num_tokens + 3  # graph padding after num_real
+    ids = torch.randint(0, VOCAB, (padded_to,), generator=g)
+    # The capped layout's tail pad tokens carry input_ids=0 (no consumer).
+    ghost = slice(int(indptr[-2]), int(indptr[-1]))
+    ids[ghost] = 0
+    ids[padded_to - 1] = IMAGE
+    # Per-token positions restart at each row's first token.
+    pos = torch.zeros(padded_to, dtype=torch.int64)
+    for r in range(len(lens)):
+        for t in range(int(indptr[r]), int(indptr[r + 1])):
+            pos[t] = (t - int(indptr[r])) * 7 + r
+    history = torch.randint(
+        0, VOCAB, (len(lens) + 2, N - 1), generator=g, dtype=torch.int32
+    )
+    history[4] = 42  # the zero-length row's slot: never read through row
+    history[-1] = 9  # the spare pad row (EngramHasher.pad_row analogue)
+    _check(
+        ids,
+        pos,
+        mode=MODE_EXTEND,
+        history=history,
+        num_real=num_tokens,
+        req_slots=torch.arange(len(lens)),
+        block=1,
+        row=row,
+        starts=starts,
+        **_common(),
+    )
+
+
+def test_target_verify_ragged_matches_uniform_block():
+    """The ragged path must reproduce the uniform MODE_VERIFY result when every
+    row has exactly the same length: the two k modes only differ in how they
+    derive (row, offset) from t."""
+    g = torch.Generator().manual_seed(11)
+    block = 6
+    bs = 4
+    history = torch.randint(0, VOCAB, (bs + 2, N - 1), generator=g, dtype=torch.int32)
+    ids = torch.randint(0, VOCAB, (bs * block,), generator=g)
+    pos = torch.arange(bs * block) % block
+    common = dict(
+        history=history,
+        num_real=bs * block,
+        req_slots=torch.arange(bs),
+        **_common(seed=3),
+    )
+    uniform_ids, uniform_toks = engram_hash_ids(
+        ids.cuda(),
+        pos.cuda(),
+        mode=MODE_VERIFY,
+        block=block,
+        row=None,
+        starts=None,
+        **{k: (v.cuda() if torch.is_tensor(v) else v) for k, v in common.items()},
+    )
+    _, row, starts = _ragged_row_map([block] * bs)
+    ragged_ids, ragged_toks = engram_hash_ids(
+        ids.cuda(),
+        pos.cuda(),
+        mode=MODE_EXTEND,
+        block=1,
+        row=row.cuda(),
+        starts=starts.cuda(),
+        **{k: (v.cuda() if torch.is_tensor(v) else v) for k, v in common.items()},
+    )
+    assert torch.equal(ragged_toks.cpu(), uniform_toks.cpu())
+    assert torch.equal(ragged_ids.cpu(), uniform_ids.cpu())

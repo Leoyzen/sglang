@@ -49,10 +49,18 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.managers.schedule_batch import MM_PAD_SHIFT_VALUE
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.runtime_context import get_model, get_parallel, get_serving
+from sglang.srt.speculative.ragged_verify import resolve_ragged_verify_layout
 from sglang.srt.utils import add_prefix
 from sglang.srt.utils.hf_transformers.tokenizer import get_tokenizer
 
 logger = logging.getLogger(__name__)
+
+# The target-verify branch of forward() is ragged-aware: when spec_info
+# carries a RaggedVerifyLayout it derives the per-token request row from the
+# layout's qo_indptr (searchsorted, fixed shape) and hashes with MODE_EXTEND
+# semantics, instead of asserting a uniform block. The startup guard below
+# reads this flag; flipping it False simulates the pre-fix regression.
+_TARGET_VERIFY_ENGRAM_PATH_IS_RAGGED_AWARE = True
 
 
 def _find_next_prime(start: int, seen_primes: set[int]) -> int:
@@ -174,6 +182,61 @@ def build_engram_layout(config) -> Optional[EngramLayout]:
     )
 
 
+def _assert_ragged_verify_path_supports_engram() -> None:
+    """Fail fast if the engram + compact-ragged-verify combination regressed.
+
+    The target-verify branch of forward() consumes the layout's qo_indptr via
+    a searchsorted row map when spec_info carries one. If DSPARK speculation
+    and SGLANG_RAGGED_VERIFY_MODE=compact are both configured, that ragged
+    path is load bearing: a regression would either assert during graph
+    capture or, worse, silently mis-slice hash rows at replay. from_config
+    is the one spot that sees the engram config in the process that will run
+    those graphs; the spec namespace read fails closed if nothing was
+    published (unit tests, offline tools -- nothing there can hit the broken
+    combination).
+    """
+    from sglang.srt.runtime_context import get_context, get_spec
+    from sglang.srt.speculative.ragged_verify import ragged_verify_compact_enabled
+
+    if not ragged_verify_compact_enabled():
+        return
+    if not get_context().is_config_namespace_published("spec"):
+        return
+    if not get_spec().speculative_algorithm:
+        return
+    # The ragged-aware branch (searchsorted row map + MODE_EXTEND) resolves
+    # before the uniform-width assert; this build ships it, so the guard only
+    # fires if that branch was removed or reordered.
+    assert _TARGET_VERIFY_ENGRAM_PATH_IS_RAGGED_AWARE, (
+        "engram + compact ragged verify requires the ragged-aware engram path "
+        "(this build supports it); if you see this, the guard or the path "
+        "regressed"
+    )
+
+
+def _torch_row_map_from_qo_indptr(
+    qo_indptr: torch.Tensor, num_tokens: int, bs: int
+) -> torch.Tensor:
+    """Per-token request row from the ragged verify layout's qo_indptr.
+
+    Built with searchsorted over a fixed shape (no repeat_interleave: its
+    output shape depends on data, which cuda graph replay cannot tolerate).
+    Bisect-right over the full indptr puts token t in the last row starting at
+    or before it, so zero-length rows are skipped naturally; tokens past the
+    capped layout's final cumsum (its tail pad) clamp into the last row. The
+    pad tokens hash to garbage rows but have no consumer: their logits are
+    scattered away and verify never commits them to history.
+    """
+    return (
+        torch.searchsorted(
+            qo_indptr,
+            torch.arange(num_tokens, device=qo_indptr.device),
+            right=True,
+        )
+        - 1
+    ).clamp_max(bs - 1)
+
+
 def compute_engram_hash_ids(
     tokens: torch.Tensor,
     blocked: torch.Tensor,
@@ -246,6 +309,7 @@ class EngramHasher(nn.Module):
 
     @classmethod
     def from_config(cls, config, layout: EngramLayout) -> EngramHasher:
+        _assert_ragged_verify_path_supports_engram()
         # The compressed token map is built with the HF normalizers, so the HF
         # tokenizer backend is used here whatever the serving backend is.
         tokenizer = get_tokenizer(
@@ -293,12 +357,31 @@ class EngramHasher(nn.Module):
             kmode = MODE_DECODE
             commit_rows, commit_last = req_slots, None
         elif mode.is_target_verify():
-            block = int(forward_batch.spec_info.draft_token_num)
-            assert num_tokens == bs * block, (
-                "engram target-verify expects one equal block per request, got "
-                f"{num_tokens} tokens for {bs} requests of {block}"
-            )
-            kmode = MODE_VERIFY
+            layout = resolve_ragged_verify_layout(forward_batch)
+            if layout is not None:
+                # Ragged verify (compact capture / replay): the packed tokens are
+                # sliced by the layout's qo_indptr, not by a uniform block. The
+                # captured layout's device tensors are staged in place at replay
+                # (see _stage_ragged_verify_layout), so these pointers stay stable
+                # inside the graph. row is built with searchsorted over a fixed
+                # shape -- never repeat_interleave, whose output shape depends on
+                # data and would break graph replay. Tokens past the last cumsum
+                # (the capped layout's tail pad, input_ids=0) land in the last
+                # row; their hash has no consumer: logits are scattered away and
+                # verify never commits them to history.
+                row = _torch_row_map_from_qo_indptr(
+                    layout.qo_indptr_device, num_tokens, bs
+                )
+                starts = layout.qo_indptr_device[:bs]
+                kmode = MODE_EXTEND
+                block = 1
+            else:
+                block = int(forward_batch.spec_info.draft_token_num)
+                assert num_tokens == bs * block, (
+                    "engram target-verify expects one equal block per request, got "
+                    f"{num_tokens} tokens for {bs} requests of {block}"
+                )
+                kmode = MODE_VERIFY
             commit_rows = commit_last = None
         else:
             assert mode.is_extend(), (
