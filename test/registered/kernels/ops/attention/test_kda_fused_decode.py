@@ -1,26 +1,31 @@
-"""Kimi-K3 fused KDA decode must match the existing unfused decode chain.
+"""Fused KDA decode must match the existing unfused decode chain.
 
 The fused kernel replaces:
 
     causal_conv1d_update -> kda_packed_decode -> sigmoid-gated RMSNorm
 
-This file covers the local head layouts used by Kimi-K3 TP8/TP16/TP32:
-H = 12/6/3. The H=6 and H=3 cases are the branches added by the fixed-head
-dispatch in ``kda_fused_decode.cuh``.
+This file covers the local head layouts used by:
+
+* Kimi-K3 TP8/TP16/TP32: H = 12/6/3. The H=6 and H=3 cases are the
+  branches added by the fixed-head dispatch in ``kda_fused_decode.cuh``.
+* GLM-5.3-Flash (glm5_next) TP4 / unsharded: H = 16/64 — the widened
+  instantiations of the same fixed-head dispatch. GLM Flash's KDA layers
+  share the K3 regime (head_dim 128, conv width 4, per-K forget gate,
+  sigmoid-gated output RMSNorm), differing only in per-rank head count.
 """
 
 import pytest
 import torch
 
 from sglang.kernels.ops.attention import kda_fused_decode
-from sglang.kernels.ops.attention.fla.fused_norm_gate import rms_norm_gated
 from sglang.kernels.ops.attention.fla.fused_recurrent import (
     fused_recurrent_kda_packed_decode,
 )
+from sglang.kernels.ops.attention.fla.fused_norm_gate import rms_norm_gated
 from sglang.kernels.ops.mamba.causal_conv1d_triton import causal_conv1d_update
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=8, stage="base-b-kernel-unit", runner_config="1-gpu-large")
+register_cuda_ci(est_time=10, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 _HEAD_DIM = 128
 _CONV_STATE_W = 3
@@ -124,14 +129,16 @@ def _run_unfused_reference(
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")
 @pytest.mark.parametrize(
-    "heads,tp_size",
+    "heads,family",
     [
-        pytest.param(3, 32, id="tp32_h3"),
-        pytest.param(6, 16, id="tp16_h6"),
-        pytest.param(12, 8, id="tp8_h12"),
+        pytest.param(3, "k3", id="tp32_h3"),
+        pytest.param(6, "k3", id="tp16_h6"),
+        pytest.param(12, "k3", id="tp8_h12"),
+        pytest.param(16, "glm", id="glm_tp4_h16"),
+        pytest.param(64, "glm", id="glm_full_h64"),
     ],
 )
-def test_kda_fused_decode_matches_unfused_chain(heads: int, tp_size: int):
+def test_kda_fused_decode_matches_unfused_chain(heads: int, family: str):
     (
         mixed_qkv,
         a,
@@ -145,7 +152,7 @@ def test_kda_fused_decode_matches_unfused_chain(heads: int, tp_size: int):
         a_log,
         dt_bias,
         onorm_weight,
-    ) = _make_case(heads=heads, seed=20260731 + tp_size)
+    ) = _make_case(heads=heads, seed=20260731 + heads)
 
     conv_ref = conv_states.clone()
     conv_fused = conv_states.clone()
@@ -202,7 +209,7 @@ def test_kda_fused_decode_matches_unfused_chain(heads: int, tp_size: int):
     torch.cuda.synchronize()
 
     # JIT log breadcrumb for PR/CI evidence that the fused fixed-head branch ran.
-    print(f"K3 fused KDA decode test used fused path: TP{tp_size}, H={heads}")
+    print(f"Fused KDA decode test used fused path: {family}, H={heads}")
 
     torch.testing.assert_close(fused, ref, rtol=2e-2, atol=2e-2)
     torch.testing.assert_close(state_fused, state_ref, rtol=2e-2, atol=2e-2)
