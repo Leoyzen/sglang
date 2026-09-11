@@ -92,14 +92,18 @@ def _allocate_prefill_result(
     return result
 
 
-@triton.jit
+# The OOB width bound must not bake into the cubin: expanded EAGLE page
+# tables (and kpool-tail widening) give every context length its own
+# table width, and a constexpr would recompile the kernel per width.
+# Bind it as a runtime scalar like page_table_stride_0 below.
+@triton.jit(do_not_specialize=["page_table_width"])
 def transform_index_page_table_decode_kernel(
     page_table_ptr: torch.Tensor,
     topk_indices_ptr: torch.Tensor,
     result_ptr: torch.Tensor,
+    page_table_width,
     page_size: tl.constexpr,
     page_table_row_stride: tl.constexpr,
-    PAGE_TABLE_WIDTH: tl.constexpr,
     dcp_size: tl.constexpr,
     dcp_rank: tl.constexpr,
 ):
@@ -114,7 +118,7 @@ def transform_index_page_table_decode_kernel(
     # OOB guard only: the width is THAT table's own column domain (widened
     # DCP page domain when dcp folds pages into it), not a folded/derived
     # width -- masking on anything narrower would drop owned rows.
-    mask = (loaded_topk_indices >= 0) & (loaded_topk_indices < PAGE_TABLE_WIDTH)
+    mask = (loaded_topk_indices >= 0) & (loaded_topk_indices < page_table_width)
     loaded_kv_indices = tl.load(page_table_ptr + loaded_topk_indices, mask=mask)
     if dcp_size > 1:
         # Keep slots owned by this rank as local rows; others become -1.
@@ -127,20 +131,22 @@ def transform_index_page_table_decode_kernel(
 # Expanded EAGLE page tables are contiguous, so their row stride changes with
 # the exact context length. Treating it as constexpr creates one cubin per
 # observed length and grows the loaded-module set in long-lived processes.
-@triton.jit(do_not_specialize=["page_table_stride_0"])
+# The OOB width bound is runtime-bound for the same reason: the table's
+# column domain tracks the context length too.
+@triton.jit(do_not_specialize=["page_table_stride_0", "page_table_width"])
 def transform_index_page_table_prefill_kernel(
     page_table_ptr: torch.Tensor,
     topk_indices_ptr: torch.Tensor,
     cu_seqlens_q_ptr: torch.Tensor,
     result_ptr: torch.Tensor,
     page_table_stride_0,
+    page_table_width,
     page_table_stride_1: tl.constexpr,
     topk_indices_stride_0: tl.constexpr,
     topk_indices_stride_1: tl.constexpr,
     result_stride_0: tl.constexpr,
     result_stride_1: tl.constexpr,
     PAGE_TABLE_IS_EXPANDED: tl.constexpr,
-    PAGE_TABLE_WIDTH: tl.constexpr,
     TOPK: tl.constexpr,
     BLOCK_Q: tl.constexpr,
     BLOCK_TOPK: tl.constexpr,
@@ -167,7 +173,7 @@ def transform_index_page_table_prefill_kernel(
         other=-1,
     )
     valid_topk_mask = (
-        mask & (loaded_topk_indices >= 0) & (loaded_topk_indices < PAGE_TABLE_WIDTH)
+        mask & (loaded_topk_indices >= 0) & (loaded_topk_indices < page_table_width)
     )
 
     if PAGE_TABLE_IS_EXPANDED:
@@ -223,11 +229,12 @@ def transform_index_page_table_decode_fast(
         page_table,
         topk_indices,
         result,
+        # Runtime-bound OOB guard: THIS table's own column domain (an OOB
+        # guard, not a semantic width; under DCP the widened page domain owns
+        # columns). Runtime binding avoids a recompile per table width.
+        page_table.shape[1],
         page_size,
         page_table_row_stride=page_table.stride(0),
-        # Bound indices by THIS table's own column domain (an OOB guard, not
-        # a semantic width; under DCP the widened page domain owns columns).
-        PAGE_TABLE_WIDTH=page_table.shape[1],
         dcp_size=dcp_size,
         dcp_rank=dcp_rank,
     )
@@ -283,15 +290,16 @@ def transform_index_page_table_prefill_fast(
         cu_seqlens_q,
         result,
         page_table.stride(0),
+        # Runtime-bound OOB guard: THIS table's own column domain (an OOB
+        # guard, not a semantic width; under DCP the widened page domain owns
+        # columns). Runtime binding avoids a recompile per table width.
+        page_table.shape[1],
         page_table.stride(1),
         topk_indices.stride(0),
         topk_indices.stride(1),
         result.stride(0),
         result.stride(1),
         PAGE_TABLE_IS_EXPANDED=page_table_is_expanded,
-        # Bound indices by THIS table's own column domain (an OOB guard, not
-        # a semantic width; under DCP the widened page domain owns columns).
-        PAGE_TABLE_WIDTH=page_table.shape[1],
         TOPK=topk_indices.shape[1],
         BLOCK_Q=block_q,
         BLOCK_TOPK=block_topk,
