@@ -369,7 +369,12 @@ class TestIndexerSlotsPerKey(CustomTestCase):
     dcp>1, page_size otherwise) and _batch_io_v2 divides by that.
     """
 
-    _IDX_PAGE = 4  # stand-in for the 64-token index kernel page
+    # Production DCP page_size is ALREADY the widened width (kv_cache_builder
+    # passes allocator.page_size = tree_page 64 x dcp_size 4 = 256). Kernel
+    # index rows stay fixed 64-token pages (4 kernel rows per widened page).
+    _TREE_PAGE = 64
+    _DCP = 4
+    _IDX_PAGE = _TREE_PAGE * _DCP
 
     def _dsa_group(self):
         kvcache = SimpleNamespace(
@@ -407,19 +412,21 @@ class TestIndexerSlotsPerKey(CustomTestCase):
             group = self._dsa_group()
             entry = group.entry_map[PoolName.INDEXER]
             kv = group.entry_map[PoolName.KV]
-            self.assertEqual(entry.slots_per_key, self._IDX_PAGE * 4)
-            self.assertEqual(kv.slots_per_key, self._IDX_PAGE)
+            # page_size is already widened; one key spans exactly one widened
+            # page — no extra dcp multiply (old convention double-counted).
+            self.assertEqual(entry.slots_per_key, self._IDX_PAGE)
+            self.assertEqual(kv.slots_per_key, self._IDX_PAGE // self._DCP)
             n_keys = 3
             # Raw widened indices for 3 whole widened pages (the batch shape
             # the linker hands the store), starting at a HIGH logical slot —
             # the production crash region.
-            start = self._IDX_PAGE * 4 * 5
+            start = self._IDX_PAGE * 5
             host_indices = torch.arange(start, start + n_keys * entry.slots_per_key)
             rows = entry.prepare_locations(host_indices)
-            # Global-slot domain: every widened slot is a real index row —
-            # dcp_size rows per key, NO folding.
-            self.assertEqual(len(rows), n_keys * 4)
-            self.assertTrue(max(rows) < self._IDX_PAGE * 16)
+            # Global-slot domain, no folding: one widened page == one
+            # row-unit in this fixture's page grid (page_size == widened).
+            self.assertEqual(len(rows), n_keys)
+            self.assertTrue(max(rows) < 16)
             # The _batch_io_v2 assertion, computed exactly as the store does.
             slots_per_key = getattr(entry, "slots_per_key", None) or self._IDX_PAGE
             self.assertEqual(n_keys, len(host_indices) // slots_per_key)
@@ -429,11 +436,11 @@ class TestIndexerSlotsPerKey(CustomTestCase):
             # buffers per component key.
             ptrs, sizes = entry.get_page_buffer_meta(host_indices)
             n_bufs = 3
-            self.assertEqual(len(ptrs), n_keys * 4 * n_bufs)
+            self.assertEqual(len(ptrs), n_keys * n_bufs)
             self.assertEqual(len(ptrs), len(sizes))
             self.assertTrue(all(p != 0 for p in ptrs))
             nbuf = len(ptrs) // n_keys
-            self.assertEqual(nbuf, 4 * n_bufs)
+            self.assertEqual(nbuf, n_bufs)
             self.assertEqual(len(ptrs) % n_keys, 0)
 
     def test_indexer_restore_groups_rows_per_key(self):
@@ -449,12 +456,13 @@ class TestIndexerSlotsPerKey(CustomTestCase):
             meta = entry.get_prepared_layer_range_meta(locations, layer=0)
         self.assertIsNotNone(meta)
         ptrs, sizes, offsets = meta
-        # One GROUP per key, each carrying dcp_size row ranges of one buffer
-        # (layer 0 maps to a single component buffer in the packed mapping).
+        # One GROUP per key; slots_per_key == page_size → one row per key
+        # (rows_per_key == 1), each group covering the layer's component
+        # buffers in the packed mapping.
         self.assertEqual(len(ptrs), n_keys)
         self.assertEqual(len(ptrs), len(sizes))
         self.assertEqual(len(ptrs), len(offsets))
-        self.assertTrue(all(len(g) == 4 * 2 for g in ptrs))
+        self.assertTrue(all(len(g) == 1 * 2 for g in ptrs))
         self.assertTrue(all(len(g) == len(s) for g, s in zip(ptrs, sizes)))
 
     def test_indexer_dcp_one_identity(self):
@@ -482,3 +490,55 @@ class TestIndexerSlotsPerKey(CustomTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestKvFoldedSlotsPerKey(CustomTestCase):
+    """Incident regression (production DBGDBG, glm-dcp-0907 @ 0fe17cfb53):
+    KV entry (dcp_fold_slots=True) must declare its FOLDED slot width —
+    widened tree page // dcp_size — not the widened page itself. Under DCP
+    CacheInitParams.page_size is already the widened width (kv_cache_builder
+    passes allocator.page_size = tree_page * dcp_size), so the default
+    slots_per_key==page_size over-declared 4x at dcp4 and tripped
+    _batch_io_v2's keys==indices//slots_per_key assert (observed: keys=16,
+    host_idx=1024, spk=256, page_size=64 server / 256 entry).
+    """
+
+    def test_production_shape(self):
+        dcp = 4
+        tree_page = 64
+        widened_page = tree_page * dcp  # 256 == entry page_size under DCP
+        entry = DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=object(),
+            components=[[torch.zeros((16, 3))]],
+            layer_mapping={0: 0},
+            page_size=widened_page,
+            rows_are_pages=False,
+            dcp_fold_slots=True,
+            slots_per_key=max(1, widened_page // dcp),
+        )
+        # Exact production shape: 16 tree keys -> widened 4096 slots ->
+        # folded 1024. The _batch_io_v2 assert: len(keys) == len(idx)//spk.
+        n_keys, folded = 16, 1024
+        self.assertEqual(folded // entry.slots_per_key, n_keys)
+        self.assertEqual(entry.slots_per_key, 64)
+
+    def test_indexer_not_multiplied_again(self):
+        # INDEXER receives RAW widened indices; its page_size is already the
+        # widened width, so slots_per_key == page_size (no extra multiply).
+        dcp = 4
+        widened_page = 64 * dcp
+        entry = DevicePoolEntry(
+            name=PoolName.INDEXER,
+            indices_from_pool=PoolName.KV,
+            device_pool=object(),
+            components=[[torch.zeros((16, 3))]],
+            layer_mapping={0: 0},
+            page_size=widened_page,
+            rows_are_pages=True,
+            slots_per_key=widened_page,
+        )
+        n_keys = 3
+        raw_widened = n_keys * widened_page
+        self.assertEqual(raw_widened // entry.slots_per_key, n_keys)

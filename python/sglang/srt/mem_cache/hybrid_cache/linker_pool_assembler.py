@@ -597,6 +597,14 @@ def _build_dsa_device_pool_group(
             # (Only the target buffers fold; DSA draft pools above are
             # packed-replicated and not DCP-supported on the direct linker.)
             dcp_fold_slots=True,
+            # Under DCP the tree page arriving here is the allocator's WIDENED
+            # page (`params.page_size == tree page * dcp_size`, see
+            # kv_cache_builder.py CacheInitParams) and translate_indices folds
+            # it down to THIS entry's physical rows: one key covers
+            # `page_size // dcp_size` folded slots. Declaring the widened
+            # width (the default) made `_batch_io_v2`'s keys==indices//spk
+            # assert fail 64-vs-256 (production DBGDBG: keys=16 host_idx=1024).
+            slots_per_key=max(1, page_size // _active_dcp_size()),
         ),
         DevicePoolEntry(
             name=PoolName.INDEXER,
@@ -611,11 +619,14 @@ def _build_dsa_device_pool_group(
             # memory_pool.py DSATokenToKVPool.__init__) — its row space is
             # the raw virtual one and must NOT fold. (Production bug class:
             # the 0907 incident's over-folded INDEXER entry; see
-            # `_dcp_folding_index_mapper`.) Because it receives the SAME
-            # widened transfer indices as the folded KV entry, one key spans
-            # dcp_size source pages here — declare that via slots_per_key
-            # so `MooncakeStore._batch_io_v2` divides by the right width.
-            slots_per_key=page_size * _active_dcp_size(),
+            # `_dcp_folding_index_mapper`.) Because it does NOT fold, its
+            # indices stay in the widened/global domain, where the entry's
+            # page_size is ALREADY the widened width (`params.page_size ==
+            # tree page * dcp_size`, kv_cache_builder.py CacheInitParams) —
+            # one key spans exactly one widened page = `page_size` slots.
+            # Multiplying by dcp_size again would over-declare the width
+            # 4x (production DBGDBG round-trip evidence).
+            slots_per_key=page_size,
         ),
     ]
     return DevicePoolGroup(
@@ -846,9 +857,13 @@ def _build_mamba_device_pool_group(
                 page_size=page_size,
                 rows_are_pages=True,
                 # Same global-slot index-K domain as the pure-DSA group above:
-                # raw widened indices, no folding, dcp_size source pages per
-                # key (slots_per_key), see the DSA-group comment.
-                slots_per_key=page_size * _active_dcp_size(),
+                # raw widened indices, no folding. The entry's page_size is
+                # already the widened width (`params.page_size == tree page *
+                # dcp_size`, kv_cache_builder.py CacheInitParams), so one key
+                # = one widened page = `page_size` slots — do NOT multiply by
+                # dcp_size again (over-declares 4x; see the DSA-group
+                # comment).
+                slots_per_key=page_size,
             )
         )
         # num_layers stays len(union_layers): every entry's mapping keys are
