@@ -108,6 +108,7 @@ from sglang.srt.utils.common import (
     LazyValue,
     add_prefix,
     log_info_on_rank0,
+    rank0_log,
     make_layers,
     set_weight_attrs,
 )
@@ -517,6 +518,62 @@ class Glm5NextLinearAttention(nn.Module):
         )
 
         self.attn.lower_bound = config.linear_attn_config.get("gate_lower_bound", None)
+        # Set by _prepare_fused_decode() once weights are loaded (same
+        # attempt-and-verify handoff as Kimi-K3, see kimi_k3.py).
+        self._kda_fused_decode_ready = False
+
+    def _prepare_fused_decode(self) -> None:
+        """Static inputs for the fused KDA decode kernel
+        (kernels/ops/attention/kda_fused_decode). Mirrors Kimi-K3's
+        ``_prepare_fused_decode``: per-segment transposed fp32 conv weights
+        [4, seg], dense fp32 conv bias, fp32 output-norm weight — stashed on
+        the attention layer for the KDA backend; when the shapes do not match
+        the compiled kernel the stash stays unset and decode keeps the
+        unfused chain. Called once from load_weights (after all weights are
+        loaded, before cuda graph capture)."""
+        if not _is_cuda:
+            return
+        layer = self.attn
+        w = layer.conv_weights
+        seg = self.local_num_heads * self.head_dim
+        if (
+            w is None
+            or w.ndim != 2
+            or w.shape != (3 * seg, self.conv_size)
+            or w.dtype != torch.float32
+            or layer.A_log is None
+            or layer.A_log.numel() != self.local_num_heads
+            or layer.A_log.dtype != torch.float32
+            or layer.dt_bias is None
+            or tuple(layer.dt_bias.shape) != (seg,)
+            or layer.dt_bias.dtype != torch.float32
+        ):
+            rank0_log(
+                "GLM fused KDA decode disabled: unexpected conv/A_log/dt_bias "
+                f"layout (conv {None if w is None else tuple(w.shape)}, "
+                f"A_log {None if layer.A_log is None else tuple(layer.A_log.shape)}, "
+                f"dt_bias {None if layer.dt_bias is None else tuple(layer.dt_bias.shape)})"
+            )
+            return
+        # Conv weights/bias stay fp32 (checkpoint dtype; the kernel loads
+        # them as fp32, matching the triton chain's precision exactly).
+        wt = w.t().contiguous()  # [4, 3*seg]
+        bias = layer.bias
+        conv_bias = (
+            bias.float().contiguous()
+            if bias is not None
+            else torch.zeros(3 * seg, dtype=torch.float32, device=w.device)
+        )
+        layer._k3_fused_decode_args = (
+            wt[:, :seg].contiguous(),
+            wt[:, seg : 2 * seg].contiguous(),
+            wt[:, 2 * seg :].contiguous(),
+            conv_bias,
+            layer.A_log.detach().reshape(-1),  # view; kernel wants [H]
+            self.o_norm.weight.data.float().contiguous(),
+            float(self.o_norm.eps),
+        )
+        self._kda_fused_decode_ready = True
 
     def forward_qkvbfg(self, hidden_states: torch.Tensor, forward_batch: ForwardBatch):
         qkv, _ = self.qkv_proj(hidden_states)
@@ -572,6 +629,18 @@ class Glm5NextLinearAttention(nn.Module):
             forget_gate = forget_gate.unsqueeze(0)
         beta = beta.unsqueeze(0)
 
+        # Fused KDA handoff (attempt-and-verify, same mechanism as Kimi-K3):
+        # offer the output-norm gate so the covered decode kernel can fold
+        # gated RMSNorm into the recurrence. If the backend leaves the stash
+        # unconsumed (env off or shape not covered), apply o_norm here as
+        # before.
+        fused_onorm = self._kda_fused_decode_ready and (
+            forward_batch.forward_mode.is_decode()
+        )
+        if fused_onorm:
+            self.attn._k3_onorm_gate = g_proj_states
+            self.attn._k3_onorm_consumed = False
+
         core_attn_out = self.attn(
             forward_batch,
             mixed_qkv=mixed_qkv,
@@ -579,8 +648,12 @@ class Glm5NextLinearAttention(nn.Module):
             b=beta,
         )
 
-        norm_gate = g_proj_states.unflatten(-1, (-1, self.head_dim))
-        core_attn_out = self.o_norm(core_attn_out, norm_gate)
+        if fused_onorm:
+            self.attn._k3_onorm_gate = None
+            fused_onorm = self.attn._k3_onorm_consumed
+        if not fused_onorm:
+            norm_gate = g_proj_states.unflatten(-1, (-1, self.head_dim))
+            core_attn_out = self.o_norm(core_attn_out, norm_gate)
         core_attn_out = core_attn_out.squeeze(0).flatten(-2)
 
         return self.o_proj(core_attn_out)[0]
@@ -1644,6 +1717,20 @@ class Glm5NextForConditionalGeneration(nn.Module):
                         param, "weight_loader", default_weight_loader
                     )
                     weight_loader(param, loaded_weight)
+
+        # Post-load: stash the fused KDA decode statics (merged conv taps /
+        # output-norm weight). Net memory ~0 (views + small dense buffers);
+        # must run after all weights are loaded and before cuda graph capture.
+        if not getattr(self, "encoder_only", False):
+            layers = (
+                [self.model.decoder] if is_nextn else self.model.layers
+            )
+            for layer in layers:
+                if isinstance(layer, PPMissingLayer):
+                    continue
+                self_attn = getattr(layer, "self_attn", None)
+                if isinstance(self_attn, Glm5NextLinearAttention):
+                    self_attn._prepare_fused_decode()
 
         if getattr(self, "encoder_only", False):
             run_post = False
