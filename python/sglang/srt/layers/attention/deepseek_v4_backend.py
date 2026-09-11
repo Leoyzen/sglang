@@ -810,7 +810,11 @@ def _tail_rows(
     t: torch.Tensor, *, token_indices: torch.Tensor, contiguous_start: Optional[int]
 ) -> torch.Tensor:
     if contiguous_start is not None:
-        return t[contiguous_start:]
+        # Bound the view at the real tail-row count: a padded extend keeps
+        # trailing pad rows past the extend length, and leaking them into
+        # the tail breaks the row counts of every downstream consumer
+        # (repeat_interleave over extend_seq_lens, the window clamp, ...).
+        return t[contiguous_start : contiguous_start + token_indices.numel()]
     return t[token_indices]
 
 
