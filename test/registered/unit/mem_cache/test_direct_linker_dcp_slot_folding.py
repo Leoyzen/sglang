@@ -39,6 +39,7 @@ from sglang.srt.mem_cache.hicache_storage import (
 from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     DevicePoolEntry,
     DevicePoolGroup,
+    _build_dsa_device_pool_group,
     _build_mamba_device_pool_group,
     _build_mamba_swa_device_pool_group,
     _dcp_folding_index_mapper,
@@ -313,6 +314,170 @@ class TestBufferIdentities(CustomTestCase):
                 index_mapper=lambda t: t,
                 dcp_fold_slots=True,
             )
+
+    def test_indexer_slots_per_key_contract(self):
+        """The INDEXER entry declares dcp_size pages per key (global-slot
+        index-K domain), so the _batch_io_v2 keys==indices//width assert
+        holds at dcp>1; default entries keep slots_per_key == page_size."""
+        # Default: page-sized keys (folded/self-keyed pools).
+        default_entry = DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=object(),
+            components=[[torch.zeros((8, 3))]],
+            layer_mapping={0: 0},
+            page_size=4,
+            rows_are_pages=False,
+        )
+        self.assertEqual(default_entry.slots_per_key, 4)
+        # INDEXER-style widened-domain entry: one key spans dcp pages.
+        from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
+            _active_dcp_size,
+        )
+
+        widened = DevicePoolEntry(
+            name=PoolName.INDEXER,
+            indices_from_pool=PoolName.KV,
+            device_pool=object(),
+            components=[[torch.zeros((8, 3))]],
+            layer_mapping={0: 0},
+            page_size=4,
+            rows_are_pages=True,
+            slots_per_key=4 * _active_dcp_size(),
+        )
+        dcp = _active_dcp_size()
+        # Simulate the _batch_io_v2 division with dcp widened slots per key.
+        n_keys = 3
+        host_indices = torch.arange(n_keys * 4 * dcp)
+        self.assertEqual(len(host_indices) // widened.slots_per_key, n_keys)
+
+
+if __name__ == "__main__":
+    unittest.main()
+
+
+class TestIndexerSlotsPerKey(CustomTestCase):
+    """Incident regression (glm-dcp-0907 @ 7cb9a4e326, GLM-5.3-Flash pod
+    dcp_size=4, page_size=64): the INDEXER entry's index-K buffer is
+    GLOBAL-slot addressed (replicated, sized size*dcp_size — IndexKeyCache),
+    so resolve_transfers hands it RAW widened indices and `_rows` correctly
+    yields dcp_size rows per key. But `MooncakeStore._batch_io_v2` asserted
+    ``len(keys) == len(host_indices) // page_size``, which over-counts by
+    dcp_size for widened-domain entries → 2028 consecutive offload failures
+    at ``mooncake_store.py:851``. Fix: DevicePoolEntry declares
+    ``slots_per_key`` (page_size * dcp_size for the INDEXER entries under
+    dcp>1, page_size otherwise) and _batch_io_v2 divides by that.
+    """
+
+    _IDX_PAGE = 4  # stand-in for the 64-token index kernel page
+
+    def _dsa_group(self):
+        kvcache = SimpleNamespace(
+            kv_buffer=[
+                torch.zeros((self._IDX_PAGE * 16, 5), dtype=torch.uint8)
+                for _ in range(2)
+            ],
+            index_k_with_scale_buffer=[
+                torch.zeros((self._IDX_PAGE * 16, 3), dtype=torch.uint8)
+                for _ in range(2)
+            ],
+            layer_num=2,
+            page_size=self._IDX_PAGE,
+        )
+        draft = SimpleNamespace(
+            page_size=self._IDX_PAGE,
+            kv_buffer=[
+                torch.zeros((self._IDX_PAGE * 16, 5), dtype=torch.uint8)
+                for _ in range(1)
+            ],
+            index_k_with_scale_buffer=[
+                torch.zeros((self._IDX_PAGE * 16, 3), dtype=torch.uint8)
+                for _ in range(1)
+            ],
+        )
+        return _build_dsa_device_pool_group(kvcache, self._IDX_PAGE, (draft,))
+
+    def test_indexer_slot_width_matches_batch_io_v2_assertion(self):
+        """dcp=4: one key spans dcp_size*page_size raw slots → dcp_size rows.
+        Replays the exact division `_batch_io_v2` asserts with the same
+        slots_per_key the store reads via getattr."""
+        with _parallel_dcp(4, rank=0):
+            # Construction-time slot width: the group must be built with the
+            # parallel context PUBLISHED (production assembles at startup).
+            group = self._dsa_group()
+            entry = group.entry_map[PoolName.INDEXER]
+            kv = group.entry_map[PoolName.KV]
+            self.assertEqual(entry.slots_per_key, self._IDX_PAGE * 4)
+            self.assertEqual(kv.slots_per_key, self._IDX_PAGE)
+            n_keys = 3
+            # Raw widened indices for 3 whole widened pages (the batch shape
+            # the linker hands the store), starting at a HIGH logical slot —
+            # the production crash region.
+            start = self._IDX_PAGE * 4 * 5
+            host_indices = torch.arange(start, start + n_keys * entry.slots_per_key)
+            rows = entry.prepare_locations(host_indices)
+            # Global-slot domain: every widened slot is a real index row —
+            # dcp_size rows per key, NO folding.
+            self.assertEqual(len(rows), n_keys * 4)
+            self.assertTrue(max(rows) < self._IDX_PAGE * 16)
+            # The _batch_io_v2 assertion, computed exactly as the store does.
+            slots_per_key = getattr(entry, "slots_per_key", None) or self._IDX_PAGE
+            self.assertEqual(n_keys, len(host_indices) // slots_per_key)
+            # Offload-side meta closes: dcp_size multi-range rows per key,
+            # each row expanding to one ptr per flat buffer (3 here: 2 target
+            # + 1 draft). _pack_multi_buffer_meta regroups len(ptrs)//n_keys
+            # buffers per component key.
+            ptrs, sizes = entry.get_page_buffer_meta(host_indices)
+            n_bufs = 3
+            self.assertEqual(len(ptrs), n_keys * 4 * n_bufs)
+            self.assertEqual(len(ptrs), len(sizes))
+            self.assertTrue(all(p != 0 for p in ptrs))
+            nbuf = len(ptrs) // n_keys
+            self.assertEqual(nbuf, 4 * n_bufs)
+            self.assertEqual(len(ptrs) % n_keys, 0)
+
+    def test_indexer_restore_groups_rows_per_key(self):
+        """Restore-side dual: load_layer_wise prepares one row-group per
+        component key, so `batch_get_into_multi_buffer_ranges` aligns with
+        the session-start key list (keys == len(groups))."""
+        with _parallel_dcp(4, rank=0):
+            group = self._dsa_group()
+            entry = group.entry_map[PoolName.INDEXER]
+            n_keys = 2
+            host_indices = torch.arange(n_keys * entry.slots_per_key)
+            locations = entry.prepare_locations(host_indices)
+            meta = entry.get_prepared_layer_range_meta(locations, layer=0)
+        self.assertIsNotNone(meta)
+        ptrs, sizes, offsets = meta
+        # One GROUP per key, each carrying dcp_size row ranges of one buffer
+        # (layer 0 maps to a single component buffer in the packed mapping).
+        self.assertEqual(len(ptrs), n_keys)
+        self.assertEqual(len(ptrs), len(sizes))
+        self.assertEqual(len(ptrs), len(offsets))
+        self.assertTrue(all(len(g) == 4 * 2 for g in ptrs))
+        self.assertTrue(all(len(g) == len(s) for g, s in zip(ptrs, sizes)))
+
+    def test_indexer_dcp_one_identity(self):
+        """dcp=1: slots_per_key == page_size and restore grouping is the
+        historical one-row-per-key behavior."""
+        with _parallel_dcp(1):
+            group = self._dsa_group()
+            entry = group.entry_map[PoolName.INDEXER]
+            self.assertEqual(entry.slots_per_key, self._IDX_PAGE)
+            self.assertEqual(entry._rows_per_key, 1)
+            n_keys = 2
+            n_bufs = 3
+            host_indices = torch.arange(n_keys * self._IDX_PAGE)
+            ptrs, _ = entry.get_page_buffer_meta(host_indices)
+            self.assertEqual(len(ptrs), n_keys * n_bufs)
+            locations = entry.prepare_locations(host_indices)
+            ptrs_r, sizes_r, offsets_r = entry.get_prepared_layer_range_meta(
+                locations, layer=0
+            )
+            # One group per key; layer 0's packed mapping covers the target
+            # buffer plus the packed draft buffer (2 ranges), one row each.
+            self.assertEqual(len(ptrs_r), n_keys)
+            self.assertEqual(len(ptrs_r[0]), 2)
 
 
 if __name__ == "__main__":

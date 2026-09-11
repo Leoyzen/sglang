@@ -41,6 +41,20 @@ def _is_hybrid_linear_kv_pool(pool: Any) -> bool:
 _warned_packed_draft_under_dcp = False
 
 
+def _active_dcp_size() -> int:
+    """Best-effort published DCP degree for ENTRY CONSTRUCTION defaults.
+
+    Returns 1 when no parallel context is published (unit-test harness) or
+    on a RuntimeError from the reader — entry construction must not crash
+    over bookkeeping; correctness of folding itself is still fail-closed in
+    `_dcp_folding_index_mapper`.
+    """
+    try:
+        return max(1, int(get_parallel().attn_dcp_size))
+    except (RuntimeError, AttributeError, TypeError):
+        return 1
+
+
 def _warn_packed_draft_under_dcp(draft_buffers: Sequence[torch.Tensor]) -> None:
     """One-shot warning: packed MTP draft buffers share the KV entry's folded
     target row domain under DCP, so their persisted rows land on folded
@@ -137,6 +151,7 @@ class DevicePoolEntry:
         packed: bool = True,
         index_mapper: Callable[[torch.Tensor], torch.Tensor] | None = None,
         dcp_fold_slots: bool = False,
+        slots_per_key: int | None = None,
     ):
         self.name = name
         self.indices_from_pool = indices_from_pool
@@ -146,6 +161,22 @@ class DevicePoolEntry:
         self.page_size = page_size
         self.packed = packed
         self._index_mapper = index_mapper
+        # Slots of the SOURCE index space covered by one transfer key. Equals
+        # page_size for self-keyed pools; a KV-sourced entry whose row space
+        # is the RAW widened/global slot domain (e.g. the DSA INDEXER
+        # sidecar, whose index-K rows are global-slot replicated and address
+        # raw virtual locs — IndexKeyCache.move) spans dcp_size whole pages
+        # per key under DCP. `MooncakeStore._batch_io_v2` divides
+        # len(host_indices) by this, not page_size, so a widened-domain
+        # entry without it trips the keys==indices//page_size assert
+        # (production: 2028 offload failures at dcp=4). None -> page_size.
+        self.slots_per_key = slots_per_key or page_size
+        # Device rows one transfer key spans in THIS entry's row domain
+        # (slots_per_key // page_size). Identity (1) for page-sized keys; the
+        # widened-domain INDEXER entry under DCP spans dcp_size index rows
+        # per key, which the restore path must group per key — see
+        # `get_prepared_layer_range_meta`.
+        self._rows_per_key = self.slots_per_key // page_size
         # Declare that this entry's slot indices arrive in the DCP-widened
         # logical space and must fold to per-rank rows before row arithmetic
         # (see `_dcp_folding_index_mapper`). Only the sharded target pools
@@ -254,20 +285,39 @@ class DevicePoolEntry:
                 items.append((base_ptr, row_stride, size, offsets[buffer_index]))
 
         ptrs, sizes, offsets = [], [], []
-        for row in locations:
-            row_ptrs = [
-                base_ptr + row * row_stride for base_ptr, row_stride, _, _ in items
-            ]
-            row_sizes = [size for _, _, size, _ in items]
-            row_offsets = [offset for _, _, _, offset in items]
+        # Restore-side dual of `slots_per_key`: a widened-domain entry
+        # produces dcp_size rows per transfer key (raw global slots —
+        # `_rows` sees dcp_size page_size-token index rows per key), while
+        # Mooncake aligns range groups to COMPONENT KEYS. Group the rows so
+        # one key gets one multi-range group carrying all its rows — the
+        # same per-key list shape `_pack_multi_buffer_meta` produces on the
+        # offload side. Identity when slots_per_key == page_size.
+        rows_per_group = self._rows_per_key
+        if len(locations) % rows_per_group:
+            raise ValueError(
+                f"Pool {self.name} got {len(locations)} prepared rows, not a multiple of rows_per_key={rows_per_group}."
+            )
+        for group_start in range(0, len(locations), rows_per_group):
+            key_rows = locations[group_start : group_start + rows_per_group]
+            # One multi-range GROUP per key: concatenate every row's ranges
+            # (row-major over the component items) so Mooncake's
+            # keys↔groups zip stays key-aligned. dcp=1: rows_per_group==1,
+            # this reduces to the historical one-row-per-key shape.
+            key_ptrs, key_sizes, key_offsets = [], [], []
+            for row in key_rows:
+                key_ptrs.extend(
+                    base_ptr + row * row_stride for base_ptr, row_stride, _, _ in items
+                )
+                key_sizes.extend(size for _, _, size, _ in items)
+                key_offsets.extend(offset for _, _, _, offset in items)
             if self.packed:
-                ptrs.append(row_ptrs)
-                sizes.append(row_sizes)
-                offsets.append(row_offsets)
+                ptrs.append(key_ptrs)
+                sizes.append(key_sizes)
+                offsets.append(key_offsets)
             else:
-                ptrs.extend([[value] for value in row_ptrs])
-                sizes.extend([[value] for value in row_sizes])
-                offsets.extend([[value] for value in row_offsets])
+                ptrs.extend([[value] for value in key_ptrs])
+                sizes.extend([[value] for value in key_sizes])
+                offsets.extend([[value] for value in key_offsets])
         return ptrs, sizes, offsets
 
 
@@ -561,7 +611,11 @@ def _build_dsa_device_pool_group(
             # memory_pool.py DSATokenToKVPool.__init__) — its row space is
             # the raw virtual one and must NOT fold. (Production bug class:
             # the 0907 incident's over-folded INDEXER entry; see
-            # `_dcp_folding_index_mapper`.)
+            # `_dcp_folding_index_mapper`.) Because it receives the SAME
+            # widened transfer indices as the folded KV entry, one key spans
+            # dcp_size source pages here — declare that via slots_per_key
+            # so `MooncakeStore._batch_io_v2` divides by the right width.
+            slots_per_key=page_size * _active_dcp_size(),
         ),
     ]
     return DevicePoolGroup(
@@ -791,6 +845,10 @@ def _build_mamba_device_pool_group(
                 layer_mapping=kv_layer_mapping,
                 page_size=page_size,
                 rows_are_pages=True,
+                # Same global-slot index-K domain as the pure-DSA group above:
+                # raw widened indices, no folding, dcp_size source pages per
+                # key (slots_per_key), see the DSA-group comment.
+                slots_per_key=page_size * _active_dcp_size(),
             )
         )
         # num_layers stays len(union_layers): every entry's mapping keys are

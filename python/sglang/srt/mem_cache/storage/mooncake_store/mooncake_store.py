@@ -846,9 +846,15 @@ class MooncakeStore(HiCacheStorage, MooncakeBaseStore):
             host_pool = getattr(self, "registered_pools", {}).get(transfer.name)
             keys = transfer.keys
             page_size = getattr(host_pool, "page_size", 1) or 1
+            # Width of one transfer key in the SOURCE index space: page_size
+            # for folded/self-keyed pools, but dcp_size pages for entries
+            # whose row space is the raw widened/global domain (INDEXER
+            # index-K; see DevicePoolEntry.slots_per_key). Dividing by
+            # page_size alone trips this assert for those entries at dcp>1.
+            slots_per_key = getattr(host_pool, "slots_per_key", None) or page_size
             host_indices = transfer.host_indices
             assert len(keys) > 0
-            assert len(keys) == len(host_indices) // page_size
+            assert len(keys) == len(host_indices) // slots_per_key
 
             tagged_keys = self._tag_keys(keys)
             key_strs, key_multiplier = self._get_hybrid_page_component_keys(keys, transfer)
