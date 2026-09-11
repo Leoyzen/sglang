@@ -33,6 +33,40 @@ from sglang.srt.utils.hf_transformers_utils import check_gguf_file
 
 logger = logging.getLogger(__name__)
 
+# Attention backends allowed to capture prefill CUDA graphs under decode
+# context parallelism (dcp_size > 1); design D3 replaces the blanket
+# disable with backend-conditional gating. Names are the attention-backend
+# strings resolved by ``attention_backends_of`` (the same identifiers the
+# attention registry and ATTENTION_BACKEND_CHOICES use).
+#
+# Initial content is DOCUMENTED INTENT (design D3: the trtllm-mla family,
+# matching #31821's validated kernel stack). Per tasks.md 5.4, production
+# enablement is gated on Section 5 E2E validation (bucket-set parity +
+# rank-divergence audit) — until that lands, treat entries as pending
+# validation. Rollback lever: clear this set to restore the blanket
+# dcp_size > 1 auto-disable (migration-plan step 4).
+DCP_PREFILL_CG_ATTENTION_BACKEND_ALLOWLIST = frozenset(
+    {"trtllm_mla", "flashmla_sparse"}
+)
+
+
+def _resolved_prefill_attention_backend(server_args: Any) -> Any:
+    """The prefill attention backend name at hook-resolution time, with the
+    same access pattern the other backend-aware rules here use (split field
+    falls back to the base backend; ``None`` while still unresolved)."""
+    prefill_backend, _ = attention_backends_of(resolved_view(server_args))
+    return prefill_backend
+
+
+def _dcp_prefill_backend_allowlisted(server_args: Any) -> bool:
+    """Whether the resolved prefill attention backend is on the DCP
+    prefill-CUDA-graph allowlist (design D3). An unresolved (auto) backend
+    is conservatively treated as NOT allowlisted: today's behavior."""
+    return (
+        _resolved_prefill_attention_backend(server_args)
+        in DCP_PREFILL_CG_ATTENTION_BACKEND_ALLOWLIST
+    )
+
 
 def parse_cuda_graph_config(server_args: Any):
     """Resolve cuda_graph_config from explicit JSON, per-phase
@@ -113,6 +147,30 @@ def apply_cuda_graph_compatibility(server_args: Any):
 
     cfg = resolving_view(server_args)
     if (Phase.PREFILL, "backend") in server_args._cuda_graph_config_locked:
+        # opsx 4.2 (spec 'Forced enablement warns'): an explicit prefill
+        # backend lock skips the auto-disable cascade — that contract
+        # (#31532) is preserved. Under DCP the user is then responsible for
+        # the combination, so warn when the backend is not allowlisted
+        # (validated); an allowlisted backend is quiet.
+        if (
+            cfg.dcp_size > 1
+            and cfg.cuda_graph_config.prefill.backend
+            in (Backend.BREAKABLE, Backend.TC_PIECEWISE)
+            and not _dcp_prefill_backend_allowlisted(server_args)
+        ):
+            prefill_attention_backend = _resolved_prefill_attention_backend(server_args)
+            logger.warning(
+                "The prefill CUDA graph (%s) combined with decode context "
+                "parallelism (dcp_size > 1) is unvalidated for this "
+                "attention backend (%s) and was forced on by an explicit "
+                "prefill-backend lock; capture proceeds, but correctness "
+                "and performance are not guaranteed. Allowlisted backends: "
+                "%s. See openspec enable-dcp-bcg-prefill-cudagraph "
+                "(#29736 backend x DCP matrix).",
+                cfg.cuda_graph_config.prefill.backend,
+                prefill_attention_backend,
+                sorted(DCP_PREFILL_CG_ATTENTION_BACKEND_ALLOWLIST),
+            )
         return
 
     # PP prefill graph replay is opt-in. It is most useful for small
@@ -244,10 +302,16 @@ def disable_tc_piecewise_cudagraph_if_incompatible(server_args: Any):
             lambda: resolved_view(server_args).attn_cp_size > 1,
         ),
         ("CUDA graph debug mode", lambda: cfg.debug_cuda_graph),
-        # Capture builds a dummy extend forward with attn_dcp_metadata=None.
+        # DCP (design D3): the capture dummy now binds real DCP metadata
+        # through the shared builder, so capture is allowed for allowlisted
+        # attention backends and keeps today's auto-disable otherwise.
+        # The rule fires when the backend is NOT validated for DCP; the
+        # resolve-time access follows this hook's other backend reads.
         (
             "decode context parallel (dcp_size > 1)",
-            lambda: cfg.dcp_size > 1,
+            lambda: (
+                cfg.dcp_size > 1 and not _dcp_prefill_backend_allowlisted(server_args)
+            ),
         ),
     ]
     for _name, predicate in rules:
@@ -280,6 +344,8 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
     rules = [
         (
             "KDA hybrid linear attention",
+            # GLM-5.3 Flash supports explicit BCG opt-in, but stays off by
+            # default like other KDA models. Explicit backends skip these rules.
             lambda: uses_kda_attention(model_config_of(server_args).hf_config),
         ),
         # DSV4 is BCG-compatible but introduces heavy memory pressure: the
@@ -296,10 +362,15 @@ def disable_breakable_cudagraph_if_incompatible(server_args: Any):
                 and not supports_prefill_cp_bcg(server_args)
             ),
         ),
-        # Capture builds a dummy extend forward with attn_dcp_metadata=None.
+        # DCP (design D3): backend-conditional like the tc_piecewise rule —
+        # allowlisted backends capture (the shared builder + persistent DCP
+        # buffers wire real metadata into the captured segments); others
+        # keep today's auto-disable.
         (
             "decode context parallel (dcp_size > 1)",
-            lambda: cfg.dcp_size > 1,
+            lambda: (
+                cfg.dcp_size > 1 and not _dcp_prefill_backend_allowlisted(server_args)
+            ),
         ),
         # TBO capture is unsupported.
         (
@@ -397,6 +468,51 @@ def disable_prefill_cuda_graph_for_deepseek_trtllm_mla(server_args: Any):
             cfg.cuda_graph_config, Phase.PREFILL, backend=Backend.DISABLED
         ),
     )
+
+
+def apply_glm5_chunked_prefill_default(server_args: Any):
+    """Set the opted-in GLM BCG chunk default before memory budgeting."""
+    cfg = resolving_view(server_args)
+    if (
+        get_platform().is_cuda
+        and (Phase.PREFILL, "backend") in server_args._cuda_graph_config_locked
+        and cfg.cuda_graph_config.prefill.backend == Backend.BREAKABLE
+        and cfg.chunked_prefill_size is None
+        and "Glm5NextForConditionalGeneration"
+        in model_config_of(server_args).hf_config.architectures
+    ):
+        declare_resolution(
+            server_args,
+            "_apply_glm5_chunked_prefill_default",
+            chunked_prefill_size=4096,
+        )
+
+
+def apply_glm5_prefill_cuda_graph_policy(server_args: Any):
+    """Set capture sizes for explicitly enabled GLM breakable prefill graphs."""
+    cfg = resolving_view(server_args)
+    if (
+        cfg.cuda_graph_config.prefill.backend != Backend.BREAKABLE
+        or "Glm5NextForConditionalGeneration"
+        not in model_config_of(server_args).hf_config.architectures
+    ):
+        return
+    locked = server_args._cuda_graph_config_locked
+    if any((Phase.PREFILL, key) in locked for key in ("max_bs", "bs")):
+        return
+    # Capacity defaults have already populated buckets. Replace the unlocked
+    # ceiling and its buckets together.
+    declare_resolution(
+        server_args,
+        "_apply_glm5_prefill_cuda_graph_policy",
+        cuda_graph_config=with_phase(
+            cfg.cuda_graph_config,
+            Phase.PREFILL,
+            max_bs=4096,
+            bs=generate_prefill_cuda_graph_batch_sizes(4096),
+        ),
+    )
+    apply_deepep_adjustments(server_args)
 
 
 def apply_deepep_adjustments(server_args: Any):

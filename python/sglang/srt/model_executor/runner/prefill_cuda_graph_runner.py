@@ -90,10 +90,14 @@ from sglang.srt.model_executor.forward_batch_info import (
     prefill_graph_tolerates_sum_len,
 )
 from sglang.srt.model_executor.forward_context import ForwardContext, forward_context
+from sglang.srt.model_executor.model_runner_components.dcp_prefill_metadata import (
+    PrefillDcpBuffers,
+)
 from sglang.srt.model_executor.runner.base_cuda_graph_runner import (
     BaseCudaGraphRunner,
     freeze_gc,
 )
+from sglang.srt.model_executor.runner.eager_runner import EagerRunner
 from sglang.srt.model_executor.runner.shape_key import ShapeKey
 from sglang.srt.model_executor.runner_backend.breakable_cuda_graph_backend import (
     BreakableCudaGraphBackend,
@@ -237,6 +241,15 @@ class _ChunkedPrefixCaptureBuffers:
     starts_cpu: torch.Tensor
     seq_lens_cpu: torch.Tensor
     kv_indices: torch.Tensor  # (max_chunks, prefix_chunk_capacity)
+
+
+class _DcpCaptureAbort(RuntimeError):
+    """Raised to abort prefill CG capture when DCP metadata prep failed.
+
+    The caller (capture_prefill_graph) catches this and falls back to the
+    eager runner for the run, per spec 'Metadata prep failure aborts
+    capture cleanly'. Internal signal only — not part of any public API.
+    """
 
 
 def prefill_failure_msg(backend_name: str) -> str:
@@ -417,6 +430,12 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self._capture_lora = False
         self.enable_cp_v2_bcg_capture = False
         self.prefill_cp_bcg_input: Optional[PrefillCPBCGInput] = None
+        # Set when prefill DCP metadata preparation raises during capture
+        # (opsx 3.2): turns the generic capture failure into a clean
+        # disable-for-the-run with eager fallback.
+        self.dcp_metadata_prep_failed = False
+        # One-shot log latch for replay-time DCP metadata failures.
+        self._dcp_replay_failure_logged = False
         # TcPiecewise does its compile pass during backend construction.
         # Wrap only that path with the prefill CUDA graph failure hint.
         try:
@@ -522,6 +541,32 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             )
             self.prefill_cp_bcg_input = PrefillCPBCGInput.create(self)
 
+        # Persistent DCP metadata buffers (opsx 2.3): allocated BEFORE
+        # capture, owned alongside the runner's static input buffers. The
+        # captured segments address these by pointer; replay refreshes them
+        # in place (see load_batch). Allocated only when DCP is active —
+        # inert otherwise.
+        self.dcp_buffers: Optional[PrefillDcpBuffers] = None
+        if model_runner.ps.attn_dcp_size > 1 and hasattr(
+            model_runner.model, "prepare_context_parallel_metadata_for_dcp"
+        ):
+            kv_buffer_shape = model_runner.token_to_kv_pool.get_kv_buffer_shape()[0]
+            self.dcp_buffers = PrefillDcpBuffers(
+                device=torch.device(self.device),
+                max_bs=self.max_bs,
+                max_num_tokens=self.max_num_tokens,
+                kv_cache_dim=int(kv_buffer_shape[-1]),
+                kv_cache_dtype=model_runner.kv_cache_dtype,
+            )
+            logger.info(
+                "Allocated persistent prefill DCP metadata buffers: "
+                "bs=%d, max_num_tokens=%d, kv_cache_dim=%d, dtype=%s.",
+                self.max_bs,
+                self.max_num_tokens,
+                int(kv_buffer_shape[-1]),
+                model_runner.kv_cache_dtype,
+            )
+
         # Static hidden_states buffer giving the captured graph a stable
         # address; load_batch refreshes it from live spec_info at replay.
         # Draft consumes aux-concatenated hidden states from the target
@@ -576,7 +621,23 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # --- capture --------------------------------------------------
         self.device_module.synchronize()
         self.model_runner.tp_group.barrier()
-        self.capture()
+        try:
+            self.capture()
+        except RuntimeError as exc:
+            if not getattr(self, "dcp_metadata_prep_failed", False):
+                raise
+            # opsx 3.2 (spec 'Metadata prep failure aborts capture cleanly'):
+            # DCP metadata preparation raised during capture. Abort capture,
+            # disable the prefill CUDA graph for this run, and let the caller
+            # fall back to the eager runner — never serve silently wrong
+            # outputs from a DCP-less graph.
+            logger.error(
+                "Prefill CUDA graph capture aborted: prefill DCP metadata "
+                "preparation failed (%s). Disabling the prefill CUDA graph "
+                "for this run; serving falls back to eager prefill.",
+                exc,
+            )
+            raise _DcpCaptureAbort(RuntimeError.__str__(exc)) from exc
 
         self.raw_num_tokens = 0
         self.raw_bs = 0
@@ -1061,18 +1122,82 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             capture_batch, in_capture=False
         )
 
+    def _bind_dcp_views_for_breakable_contract(
+        self, forward_batch: ForwardBatch
+    ) -> ForwardBatch:
+        """Route the persistent DCP views into the BCG captured-metadata
+        contract (opsx 3.1).
+
+        Opt-in backends (``use_captured_forward_metadata_for_breakable_cuda_graph``)
+        build their metadata from the batch's ``attn_dcp_metadata`` and hold
+        its tensor addresses across graph breaks. Under DCP the captured
+        segments must address the persistent ``PrefillDcpBuffers`` storage —
+        never ephemeral planner allocations — so capture-time planning reads
+        the bound views (see capture_prepare) and this hook re-asserts the
+        binding right before backend metadata planning. Replay refresh
+        already writes into the same storage (load_batch, opsx 2.4), so the
+        addresses captured at break boundaries stay live.
+
+        Returns the batch carrying the persistent-view metadata. No-op
+        (passthrough) when DCP is off or no persistent buffers exist.
+        """
+        dcp_buffers = getattr(self, "dcp_buffers", None)
+        if dcp_buffers is None or self.model_runner.ps.attn_dcp_size <= 1:
+            return forward_batch
+        current = forward_batch.attn_dcp_metadata
+        if current is None:
+            return forward_batch
+        # The builder (opsx 2.2/2.4) binds buffer views whenever the storage
+        # exists; if an ephemeral object slipped through (e.g. a caller-built
+        # batch), rebind now so backend planning never sees one-off tensors.
+        persistent = dcp_buffers.bind()
+        for field_name in (
+            "dcp_kv_indptr",
+            "dcp_kv_indices",
+            "dcp_local_prefix_kv_indices",
+            "dcp_kv_buffer",
+        ):
+            stored = getattr(persistent, field_name)
+            live = getattr(current, field_name, None)
+            if live is not None and live.data_ptr() != stored.data_ptr():
+                # Ephemeral tensor: copy content into the static view and
+                # expose the view instead.
+                if live.shape != stored.shape:
+                    width = min(int(live.shape[0]), int(stored.shape[0]))
+                    stored[:width].copy_(live[:width])
+                    stored[width:].zero_()
+                else:
+                    stored.copy_(live)
+                setattr(current, field_name, stored)
+        # Host int lives on the storage: when rebinding an ephemeral object,
+        # its (fresher) value wins and is recorded on the storage; a batch
+        # already bound to the views keeps the storage's value.
+        current.dcp_extend_prefix_lens_sum = int(
+            current.dcp_extend_prefix_lens_sum or 0
+        ) or int(getattr(dcp_buffers, "dcp_extend_prefix_lens_sum", 0) or 0)
+        dcp_buffers.dcp_extend_prefix_lens_sum = current.dcp_extend_prefix_lens_sum
+        return forward_batch
+
     def _init_forward_metadata_for_capture(
         self, forward_batch: ForwardBatch, num_tokens: int
     ) -> None:
         """Capture-time metadata init for the BCG-with-captured-metadata
         contract. For opt-in backends (DSV4), call the BCG-specific entry
         and stash the returned per-bucket metadata object; otherwise fall
-        back to the generic eager init that BCG/TC_PIECEWISE use today."""
+        back to the generic eager init that BCG/TC_PIECEWISE use today.
+
+        Under DCP (opsx 3.1) the batch is first pinned to the persistent
+        DCP buffer views, so the metadata the backend builds from it
+        references storage that stays allocated across capture and replay."""
         attn_backend = self.model_runner.attn_backend
         with forward_context(ForwardContext(attn_backend=attn_backend)):
             if not self.use_captured_attn_metadata:
+                forward_batch = self._bind_dcp_views_for_breakable_contract(
+                    forward_batch
+                )
                 attn_backend.init_forward_metadata(forward_batch)
                 return
+            forward_batch = self._bind_dcp_views_for_breakable_contract(forward_batch)
             metadata = (
                 attn_backend.init_forward_metadata_for_breakable_cuda_graph_capture(
                     forward_batch
@@ -1114,6 +1239,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             attn_backend.init_forward_metadata_out_graph(padded_view)
             return
         if not self.use_captured_attn_metadata:
+            forward_batch = self._bind_dcp_views_for_breakable_contract(forward_batch)
             attn_backend.init_forward_metadata(forward_batch)
             attn_backend.prepare_prefill_shared_read_snapshot(
                 forward_batch, num_qo_tokens=num_tokens
@@ -1121,6 +1247,13 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             return
         assert self.attn_metadata_buffers is not None
         metadata = self.attn_metadata_buffers[num_tokens]
+        # DCP (opsx 3.1): both batches handed to the contract replay carry
+        # the persistent views, so the refreshed backend metadata and any
+        # per-replay assignment stay on the addresses captured at capture.
+        forward_batch = self._bind_dcp_views_for_breakable_contract(forward_batch)
+        static_forward_batch = self._bind_dcp_views_for_breakable_contract(
+            static_forward_batch
+        )
         attn_backend.prepare_forward_metadata_for_breakable_cuda_graph_replay(
             metadata,
             forward_batch,
@@ -1133,6 +1266,68 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         forward_batch.mha_one_shot = True
         forward_batch.mha_return_lse = False
         forward_batch.set_attn_attend_prefix_cache(False)
+
+    def _prepare_capture_dcp_metadata(
+        self, forward_batch: ForwardBatch
+    ) -> Optional[object]:
+        """Bind real prefill DCP metadata onto the capture dummy (opsx 2.2).
+
+        When decode context parallelism is active, the dummy extend must be
+        built through the same metadata preparation path as a real extend —
+        the captured segments read the DCP tensors (indptr/indices, the KV
+        gather buffer, the rank-local prefix indices), so binding ``None``
+        would bake a DCP-less forward into the graph (design D1/D4, spec
+        'DCP metadata present at capture').
+
+        With persistent buffers (opsx 2.3) the fresh planner output is
+        copied into the static views, and the metadata the capture binds is
+        the persistent one — same addresses the captured segments and every
+        later replay address. Requires an active forward context (the
+        caller holds one).
+        """
+        if self.model_runner.ps.attn_dcp_size <= 1:
+            return None
+        # DSA-extend under DCP: the attention call (forward_absorb_core's
+        # attn_mqa_for_dcp_decode branch) must return (attn_output, lse) so
+        # the LSE combine can correct the head-widened output. Inside
+        # breakable/tc_piecewise capture, radix_attention routes through the
+        # unified_attention_with_output custom-op, whose LSE variant is
+        # selected by forward_batch.mha_return_lse — unlike the eager path
+        # (plain backend.forward returning a tuple), this flag decides
+        # whether the tuple contract survives the op boundary. Note this
+        # must be set even when the model's DSA prepare hook returns None
+        # metadata (GLM-style gathered-q DSA extend needs no dense KV
+        # metadata but still returns lse — dsa_backend keys return_lse on
+        # dcp_enabled, not on this flag). Set wherever the DCP extend
+        # surface is armed (capture dummy and replay refresh both funnel
+        # through here).
+        forward_batch.mha_return_lse = True
+        from sglang.srt.model_executor.model_runner_components.dcp_prefill_metadata import (
+            prepare_dcp_extend_metadata,
+        )
+
+        # opsx 3.2: a preparation failure must abort capture cleanly (not
+        # corrupt a graph) — record the signal before re-raising so the
+        # __init__ handler disables the prefill CG for this run.
+        try:
+            fresh = prepare_dcp_extend_metadata(self.model_runner, forward_batch)
+        except Exception as exc:
+            self.dcp_metadata_prep_failed = True
+            logger.error(
+                "Prefill DCP metadata preparation failed during capture "
+                "preparation (%s: %s); capture will be aborted and the "
+                "prefill CUDA graph disabled for this run.",
+                type(exc).__name__,
+                exc,
+            )
+            raise
+        if fresh is None:
+            return None
+        if self.dcp_buffers is not None:
+            bound = self.dcp_buffers.refresh_from(fresh, bs=forward_batch.batch_size)
+            forward_batch.attn_dcp_metadata = bound
+            return bound
+        return fresh
 
     def can_replay_locally(
         self,
@@ -1408,6 +1603,15 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
                 return_pooled_hidden_states=self.capture_return_pooled_hidden_states,
             )
             self.tbo_plugin.capture_one_batch_size(forward_batch, num_tokens=num_tokens)
+        # Bind real DCP metadata onto the dummy extend before any metadata
+        # init or capture: the shared builder is the same path a real extend
+        # takes (design D1/D4). Needs the forward context the way eager has
+        # it, so enter one around the builder call.
+        if self.model_runner.ps.attn_dcp_size > 1:
+            with forward_context(
+                ForwardContext(attn_backend=self.model_runner.attn_backend)
+            ):
+                self._prepare_capture_dcp_metadata(forward_batch)
         return forward_batch, self.model_runner.attn_backend
 
     def capture(self) -> None:
@@ -1501,7 +1705,7 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
 
         # Main's monolithic BCG runner never invokes
         # on_after_cuda_graph_warmup between warmup iterations — the BCG
-        # contract is to keep warmup state untouched and let
+        # contract is to keep warmup metadata untouched and let
         # init_forward_metadata_in_graph (recorded inside the captured
         # forward) do any raw->full upgrade. cg-refactor's runner_backend
         # abstraction exposes a post_warmup_hook for backends that need
@@ -1511,20 +1715,55 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         # corrupt warmup iter 2's metadata read.
         if isinstance(self.backend, BreakableCudaGraphBackend):
             post_warmup_hook = None
+            req_pool = self.model_runner.req_to_token_pool
+            mamba_pool = getattr(req_pool, "mamba_pool", None)
+            if mamba_pool is not None and not prefix_num_chunks:
+                capture_state_indices = req_pool.translate_mamba_indices(
+                    req_pool.get_mamba_indices(forward_batch.req_pool_indices)
+                ).unique()
+
+                def post_warmup_hook():
+                    mamba_pool.clear_slots(capture_state_indices)
+
+                post_warmup_hook()
         else:
             post_warmup_hook = getattr(attn_backend, "on_after_cuda_graph_warmup", None)
-        self.backend.capture_one(
-            shape_key,
-            run_once,
-            # DP padding can install capture-only tensors on this dummy batch;
-            # BCG retains it so their recorded addresses remain valid.
-            capture_inputs=(
-                forward_batch
-                if forward_batch.global_num_tokens_gpu is not None
-                else None
-            ),
-            post_warmup_hook=post_warmup_hook,
-        )
+        # Debug-mode capture audit (opsx 2.2, design D2): when DCP is enabled
+        # and SGLANG_DEBUG_CAPTURE_COLLECTIVE_AUDIT is set, wrap the per-shape
+        # capture in the Section-1 auditor so any NCCL/symm-mem collective
+        # invoked while the stream is capturing (BCG segments / compiled
+        # pieces) aborts capture with a named failure. No-op when the audit
+        # is off; harmless during warmup iterations because the auditor only
+        # records when the stream actually is capturing.
+        if self.model_runner.ps.attn_dcp_size > 1:
+            from sglang.srt.model_executor.model_runner_components.graph_capture_collective_audit import (
+                instrumented_capture_scope,
+            )
+
+            scope = instrumented_capture_scope(f"prefill-bucket-{num_tokens}")
+        else:
+            import contextlib
+
+            scope = contextlib.nullcontext()
+        with scope:
+            self.backend.capture_one(
+                shape_key,
+                run_once,
+                # DP padding can install capture-only tensors on this dummy batch;
+                # BCG retains it so their recorded addresses remain valid.
+                capture_inputs=(
+                    forward_batch
+                    if forward_batch.global_num_tokens_gpu is not None
+                    else None
+                ),
+                post_warmup_hook=post_warmup_hook,
+            )
+            if self.model_runner.ps.attn_dcp_size > 1:
+                from sglang.srt.model_executor.model_runner_components.graph_capture_collective_audit import (
+                    audit_active_capture_segment,
+                )
+
+                audit_active_capture_segment(f"prefill bucket {num_tokens}")
 
     def load_batch(self, forward_batch: ForwardBatch, **kwargs) -> ForwardBatch:
         """Pad, populate static buffers, and build the static_forward_batch
@@ -1756,6 +1995,44 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
             )
             metadata_forward_batch = static_forward_batch
 
+        # In-place refresh of the persistent DCP metadata buffers (opsx 2.4):
+        # compute this batch's DCP metadata through the shared builder and
+        # write it into the static views the captured segments address —
+        # copy_/index writes only, never reallocation (spec: 'Consecutive
+        # replays with different KV layouts'). Runs before attention
+        # metadata planning so init_forward_metadata sees live DCP state.
+        # opsx 3.2: a preparation failure here must not crash serving —
+        # mark the batch and let execute() fall back to eager prefill.
+        if (
+            getattr(self, "dcp_buffers", None) is not None
+            and self.model_runner.ps.attn_dcp_size > 1
+        ):
+            try:
+                with forward_context(
+                    ForwardContext(attn_backend=self.model_runner.attn_backend)
+                ):
+                    refreshed = self._prepare_capture_dcp_metadata(static_forward_batch)
+                if refreshed is not None:
+                    metadata_forward_batch = static_forward_batch
+            except Exception as exc:
+                if not self._dcp_replay_failure_logged:
+                    self._dcp_replay_failure_logged = True
+                    logger.error(
+                        "Prefill DCP metadata preparation failed at replay "
+                        "(%s: %s); this batch falls back to eager prefill "
+                        "and further failures are logged once per run.",
+                        type(exc).__name__,
+                        exc,
+                    )
+                else:
+                    logger.debug(
+                        "Prefill DCP metadata preparation failed at replay "
+                        "(%s: %s); falling back to eager prefill.",
+                        type(exc).__name__,
+                        exc,
+                    )
+                raise _DcpCaptureAbort(str(exc)) from exc
+
         self._prepare_forward_metadata_for_replay(
             metadata_forward_batch, static_forward_batch, static_num_tokens
         )
@@ -1900,6 +2177,21 @@ class PrefillCudaGraphRunner(BaseCudaGraphRunner):
         self, forward_batch: ForwardBatch, **kwargs
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
         self._validate_capture_hidden_mode(forward_batch)
+        try:
+            return self._execute_with_replay_session(forward_batch, **kwargs)
+        except _DcpCaptureAbort:
+            # opsx 3.2 (replay path): DCP metadata preparation failed for
+            # this batch (already logged in load_batch). Fall back to the
+            # eager runner so the server keeps serving — without a graph
+            # that would read stale or missing DCP metadata.
+            eager_runner = self.model_runner.eager_runner
+            if eager_runner is None or isinstance(eager_runner, EagerRunner):
+                raise
+            return eager_runner.execute(forward_batch, **kwargs)
+
+    def _execute_with_replay_session(
+        self, forward_batch: ForwardBatch, **kwargs
+    ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
         with self.backend.replay_session():
             static_forward_batch = self.load_batch(forward_batch, **kwargs)
             static_num_tokens = len(static_forward_batch.input_ids)

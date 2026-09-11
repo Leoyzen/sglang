@@ -184,7 +184,21 @@ def _copy_output(dst: Any, src: Any) -> Any:
     succeeded, otherwise returns src.
     """
     if torch.is_tensor(dst) and torch.is_tensor(src):
-        dst.copy_(src)
+        if dst.shape == src.shape:
+            dst.copy_(src)
+        elif dst.dim() == src.dim() and all(
+            d >= s for d, s in zip(dst.shape, src.shape)
+        ):
+            # Static-shaped bridge (capture-time bucket) receiving a
+            # shorter eager output (replay ran the break body with the
+            # real, unpadded batch visible through the forward context —
+            # e.g. DCP DSA-extend lse rows). Narrow-copy the real prefix;
+            # the padded tail rows are garbage-in-garbage-out downstream
+            # (same contract as _zero_padded_pcg_tail).
+            n = min(dst.shape[0], src.shape[0])
+            dst.narrow(0, 0, n).copy_(src.narrow(0, 0, n))
+        else:
+            dst.copy_(src)
         return dst
 
     if (

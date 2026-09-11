@@ -135,6 +135,21 @@ class DeepseekModelNextN(nn.Module):
         self.shared_head = nn.Module()
         self.shared_head.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+    @property
+    def layers(self):
+        # Expose the single NextN decoder layer as a one-element list so
+        # CUDA-graph layer resolution can discover it. Prefill CUDA graph
+        # capture (capture_prefill_graph -> compute_attention_and_moe_layers)
+        # and _resolve_transformer_layer_model both look for a `layers`
+        # attribute; without this, draft prefill CUDA graph is disabled with
+        # "the draft model does not have a 'layers' attribute".
+        # Layer-id semantics stay consistent: the draft worker runs with
+        # start_layer=0 / end_layer=num_nextn_predict_layers and this layer's
+        # RadixAttention.layer_id is 0.
+        # NOTE: a plain property (not a registered submodule) on purpose, so
+        # named_modules() and checkpoint weight-name mapping are unchanged.
+        return [self.decoder]
+
     def forward(
         self,
         input_ids: torch.Tensor,

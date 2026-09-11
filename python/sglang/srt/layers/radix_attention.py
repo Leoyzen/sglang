@@ -65,8 +65,12 @@ def _zero_padded_pcg_tail(buf: torch.Tensor, context) -> None:
         and pcg_static_tokens > actual_tokens
     ):
         first_dim = buf.shape[0]
-        elems_per_token = buf.numel() // first_dim
-        buf.view(first_dim, elems_per_token)[actual_tokens:].zero_()
+        # narrow+zero_: buf can be a non-viewable layout (BCG graph-pool
+        # segment outputs under DCP replay carry non-standard strides);
+        # narrow is pure stride math and zero_ writes through it, keeping
+        # the same zeroed rows as the old buf.view(...)[actual:].zero_()
+        # without requiring contiguity.
+        buf.narrow(0, actual_tokens, first_dim - actual_tokens).zero_()
 
 
 def _zero_skipped_attn_outputs(*bufs: Optional[torch.Tensor]) -> None:
@@ -409,7 +413,26 @@ def _unified_attention_with_output_impl(
         assert isinstance(ret, torch.Tensor)
 
     if ret.data_ptr() != output.data_ptr():
-        output[:real_query_num_tokens].view(ret.shape).copy_(ret)
+        # reshape, not view: ret can be a non-contiguous transpose view
+        # (e.g. DCP-gathered attention output under breakable capture), and
+        # output[:real] is itself a slice — view() requires contiguity,
+        # reshape() handles both.
+        if (
+            return_lse
+            and ret.dim() == output.dim()
+            and ret.numel() == output.numel()
+            and ret.shape[0] != output.shape[0]
+        ):
+            # DCP gathered layout: backends with an LSE contract return the
+            # head-folded form (e.g. [T*dcp, H_local, D] for [T, H_local*dcp,
+            # D]). The eager path relies on the model-level
+            # view(-1, H_local*dcp, D) interpreting the folded row order; keep
+            # that memory order intact by reshaping the WHOLE output buffer to
+            # ret's shape — the subsequent view chain is then identical to
+            # eager. Element count must match exactly (no padding interleave).
+            output.reshape(ret.shape).copy_(ret)
+        else:
+            output[:real_query_num_tokens].reshape(ret.shape).copy_(ret)
 
     # During PCG replay the attention backend writes only the narrowed
     # real-token slice (output[:real_query_num_tokens]) and leaves padded positions
@@ -419,6 +442,15 @@ def _unified_attention_with_output_impl(
     # Use context.raw_num_tokens (pre-padding count from PCG runner) instead of
     # forward_batch.extend_num_tokens, which is None for TARGET_VERIFY batches.
     _zero_padded_pcg_tail(output, context)
+    if return_lse:
+        # LSE-returning DCP backends produce the head-folded layout
+        # ([T*dcp, H_local]); the model-level combine (cp_lse_ag_out_rs_mla /
+        # dcp_a2a_lse_reduce in forward_absorb_core) consumes exactly that,
+        # same as the eager path. Do NOT pad to output rows: the BCG
+        # break-point bridge records the capture-time shape, and replay's
+        # eager re-run (static captured args) reproduces it — both sides
+        # agree on the folded shape only if we pass lse through unchanged.
+        return lse
     if lse is not None and lse.shape[0] != output.shape[0]:
         padded_lse = lse.new_zeros((output.shape[0], *lse.shape[1:]))
         padded_lse[:real_query_num_tokens].copy_(lse)
