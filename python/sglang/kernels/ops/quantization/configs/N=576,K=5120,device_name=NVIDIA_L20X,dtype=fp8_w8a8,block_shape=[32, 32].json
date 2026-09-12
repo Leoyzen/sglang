@@ -1,0 +1,1 @@
+N=576,K=5120,device_name=NVIDIA_H200,dtype=fp8_w8a8,block_shape=[32, 32].json
