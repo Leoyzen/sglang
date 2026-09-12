@@ -248,6 +248,41 @@ def _expand_index_page_table(
 _TORCH_INDEXER_SCORE_BUDGET_BYTES = 1 << 30
 
 
+def _sm90_prefill_score_bucket(lc: int, block_size: int) -> int:
+    """Round a prefill block-selection width up to a power of two (>= block_size).
+
+    ``_candidate_scores_kernel`` keys its specialization on WIDTH/STRIDE/BLOCKS,
+    so scoring the raw per-request ``lc = seq_len // ratio`` compiles a fresh
+    kernel for every new prompt length. Rounding to a power of two bounds the
+    specializations to one per binary exponent, which init-time warmup can cover.
+    Positions past each row's lens stay unreachable (-inf / outside ``lens``), so
+    padding is result-neutral; callers slice the mask back to ``lc``.
+    """
+    return max(block_size, 1 << max(lc - 1, 0).bit_length())
+
+
+def _sm90_prefill_score_buckets(max_width: int, block_size: int) -> List[int]:
+    """Every bucket ``_sm90_prefill_score_bucket`` can produce for ``lc <= max_width``.
+
+    ``max_width`` is the largest compressed length the deployment can see
+    (``req_to_token.shape[1] // ratio``), so warming this ladder covers all
+    prefill widths without enumerating per-request lengths.
+    """
+    if max_width <= 0 or block_size <= 0:
+        return []
+    top = _sm90_prefill_score_bucket(max_width, block_size)
+    # ``bucket`` is either ``block_size`` itself or a power of two >= block_size,
+    # so warm both the base value and every power of two up to the top bucket.
+    buckets = {block_size}
+    power = 1
+    while power <= top:
+        if power >= block_size:
+            buckets.add(power)
+        power *= 2
+    buckets.add(top)
+    return sorted(buckets)
+
+
 def _every_request_fits() -> bool:
     """The captured decode variants where every request's positions fit the
     candidate block budget (decode_cuda_graph_runner): the plain top-k is the
@@ -1128,6 +1163,53 @@ class DeepseekV4AttnBackend(
         self.is_draft_runner = model_runner.is_draft_worker
         self._verify_mask = None
         self.cuda_graph_swa_out_cache_loc: Optional[torch.Tensor] = None
+
+        if _is_cuda and _is_sm90():
+            self._warmup_sm90_candidate_scores()
+
+    def _warmup_sm90_candidate_scores(self) -> None:
+        """Pre-compile the SM90 ``_candidate_scores_kernel`` specializations.
+
+        The kernel is keyed on (WIDTH, STRIDE, BLOCKS, ...), so any width the
+        engine has not scored before compiles a fresh kernel and device-loads its
+        cubin mid-serving. Prefill widths are bucketed to powers of two (see
+        ``_sm90_prefill_score_bucket``); this warms every bucket plus the fixed
+        decode width, so serving never compiles. Warming rows=1 tensors costs a
+        few MB and runs before CUDA-graph capture, when headroom is highest.
+        """
+        if envs.SGLANG_DISABLE_SM90_TRITON_WARMUP.get():
+            return
+        block_size = getattr(self.candidate_indexer, "block_size", 0)
+        topk_blocks = getattr(self.candidate_indexer, "topk_blocks", 0)
+        if block_size <= 0 or topk_blocks <= 0 or not self.low_ratios:
+            return
+        from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
+            warmup_candidate_scores,
+        )
+
+        device = self.device
+        ctx = self.req_to_token.shape[1]
+        # Decode/verify score the full compressed width: WIDTH=lmax, and the
+        # logits stride is the fp4 kernel's 4-float-padded out_storage row.
+        for ratio in self.low_ratios:
+            width = ctx // ratio
+            if width <= 0:
+                continue
+            warmup_candidate_scores(
+                width,
+                (width + 3) // 4 * 4,
+                torch.int64,
+                topk_blocks,
+                block_size,
+                device,
+            )
+        # Prefill buckets: WIDTH=STRIDE=bucket, lens int32 (compress_lens).
+        for ratio in self.low_ratios:
+            width = ctx // ratio
+            for bucket in _sm90_prefill_score_buckets(width, block_size):
+                warmup_candidate_scores(
+                    bucket, bucket, torch.int32, topk_blocks, block_size, device
+                )
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
         pin_tensor = torch.tensor(x, dtype=torch.int32, pin_memory=True)
@@ -3143,9 +3225,17 @@ class DeepseekV4AttnBackend(
             # q_len times and grows prohibitively expensive at long context.
             index_k = unpack_fp4_index_keys_to_fp8(slots_j, table, page_size)
             k = min(topk, lc)
+            # _candidate_scores_kernel keys its specialization on WIDTH/STRIDE/
+            # BLOCKS, so scoring the raw per-request lc would compile a new kernel
+            # for every new prompt length. Round the score width up to a power of
+            # two so init-time warmup can cover every specialization. The padded
+            # columns are -inf, so their blocks are never selected and every
+            # downstream width (scores, published mask, consumer mask) stays on
+            # the same bucket, keeping the publish/consume contract aligned.
+            bucket = _sm90_prefill_score_bucket(lc, indexer.candidate_block_size)
             # Bound the materialized fp32 score rows; the fused kernel avoids the
             # much larger [rows, heads, lc] bf16 intermediate of the torch path.
-            rows_per_chunk = max(1, _TORCH_INDEXER_SCORE_BUDGET_BYTES // (lc * 4))
+            rows_per_chunk = max(1, _TORCH_INDEXER_SCORE_BUDGET_BYTES // (bucket * 4))
             masks = [] if publish is not None else None
             for start in range(0, q_len, rows_per_chunk):
                 stop = min(q_len, start + rows_per_chunk)
@@ -3159,7 +3249,18 @@ class DeepseekV4AttnBackend(
                     index_k,
                     lens_c,
                 )
+                if bucket > scores.shape[1]:
+                    # fp8_index_logits_prefill already wrote -inf past every row's
+                    # lens; pad the rest of the bucket with the same sentinel.
+                    scores = F.pad(
+                        scores,
+                        (0, bucket - scores.shape[1]),
+                        value=float("-inf"),
+                    )
                 if masks is not None:
+                    # Keep the bucket width: the consumer of this mask scores the
+                    # same request at the same bucket, so publish/consume widths
+                    # stay aligned (the padded columns are all -inf).
                     masks.append(
                         select_candidate_blocks(
                             scores,

@@ -18,6 +18,7 @@ from types import SimpleNamespace
 from unittest import mock
 
 import torch
+import torch.nn.functional as F
 
 from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.test.test_utils import CustomTestCase
@@ -1114,6 +1115,70 @@ class TestDSV4SwaOutCacheLocResolution(CustomTestCase):
         fb = self._make_fb(torch.tensor([0, 0]), ForwardMode.IDLE)
         out = backend.get_swa_out_cache_loc(fb)
         self.assertEqual(out.tolist(), [0, 0])
+
+
+class TestDSV41PrefillScoreBucket(CustomTestCase):
+    """The SM90 prefill width bucketing bounds kernel specializations.
+
+    ``_candidate_scores_kernel`` keys its Triton cache on the score width, so
+    scoring the raw per-request compressed length ``lc`` compiled a fresh kernel
+    mid-serving for every new prompt length (and device-loaded its cubin, which
+    risks OOM under the running engine). Bucketing to powers of two makes the
+    set of widths finite so init-time warmup can cover it; these tests pin the
+    bucket function and the padding-neutrality of the block selection.
+    """
+
+    def test_bucket_is_power_of_two_at_least_width_and_block_size(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            _sm90_prefill_score_bucket,
+        )
+
+        for block_size in (1, 8, 32, 64):
+            for lc in range(0, 4096):
+                bucket = _sm90_prefill_score_bucket(lc, block_size)
+                self.assertGreaterEqual(bucket, block_size)
+                self.assertEqual(
+                    bucket & (bucket - 1), 0, f"bucket {bucket} is not a power of two"
+                )
+                if lc > 0:
+                    self.assertGreaterEqual(bucket, lc)
+
+    def test_bucket_ladder_covers_every_possible_width(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            _sm90_prefill_score_bucket,
+            _sm90_prefill_score_buckets,
+        )
+
+        max_width = 4096
+        buckets = _sm90_prefill_score_buckets(max_width, 32)
+        self.assertTrue(buckets)
+        self.assertEqual(buckets, sorted(set(buckets)))
+        for lc in range(1, max_width + 1):
+            self.assertIn(_sm90_prefill_score_bucket(lc, 32), buckets)
+
+    def test_padding_with_neg_inf_does_not_change_selection(self):
+        # CPU path exercises the torch reference selection; padding past every
+        # row's length with -inf must leave the first ``lc`` columns unchanged.
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            _sm90_prefill_score_bucket,
+        )
+        from sglang.srt.layers.attention.dsv4.indexer import select_candidate_blocks
+
+        torch.manual_seed(0)
+        block_size, topk_blocks = 32, 4
+        for lc in (5, 32, 33, 100, 257):
+            lens = torch.tensor([lc, max(1, lc - 3), lc], dtype=torch.int32)
+            scores = torch.randn(3, lc)
+            ref = select_candidate_blocks(
+                scores, lens, topk_blocks=topk_blocks, block_size=block_size
+            )
+            bucket = _sm90_prefill_score_bucket(lc, block_size)
+            padded = F.pad(scores, (0, bucket - lc), value=float("-inf"))
+            got = select_candidate_blocks(
+                padded, lens, topk_blocks=topk_blocks, block_size=block_size
+            )[..., :lc]
+            self.assertEqual(ref.shape, got.shape)
+            self.assertTrue(torch.equal(ref, got))
 
 
 if __name__ == "__main__":
