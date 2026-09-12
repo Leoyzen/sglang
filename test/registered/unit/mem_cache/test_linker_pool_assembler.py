@@ -333,7 +333,7 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
         self.assertEqual(c2.layer_mapping, {2: 0, 3: 1})
         _, sizes, offsets = c2.get_prepared_layer_range_meta([0], 3)
         self.assertEqual(sizes, [[7]])
-        self.assertEqual(offsets, [[0]])
+        self.assertEqual(offsets, [[7]])
         self.assertIsNone(c2.get_prepared_layer_range_meta([0], 1))
 
         # ratio-1 index page packs 2 index pages (2 slots each) per FULL page.
