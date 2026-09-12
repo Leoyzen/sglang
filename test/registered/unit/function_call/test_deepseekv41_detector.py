@@ -1,6 +1,7 @@
 """Unit tests for DeepSeekV41Detector (spaced DSML tags) -- no server, no model loading."""
 
 import json
+from unittest.mock import patch
 
 from sglang.srt.entrypoints.openai import encoding_dsv41
 from sglang.srt.entrypoints.openai.protocol import (
@@ -203,6 +204,122 @@ class TestDeepSeekV41ConstrainedDecoding(CustomTestCase):
         kind, tag = parser.get_structure_constraint("required")
         self.assertEqual(kind, "structural_tag")
         self.assertEqual(tag.format.elements[0].value, f"\n\n<{DSML} calls>\n")
+
+
+def _bash_tools():
+    return [
+        Tool(
+            type="function",
+            function=Function(
+                name="bash",
+                description="Run a shell command",
+                parameters={
+                    "type": "object",
+                    "properties": {"command": {"type": "string"}},
+                    "required": ["command"],
+                },
+            ),
+        )
+    ]
+
+
+class TestDeepSeekV41StreamingHardening(CustomTestCase):
+    """V4.1-spaced variants of the DSV4 streaming hardening regressions."""
+
+    def setUp(self):
+        self.tools = _bash_tools()
+        self.detector = DeepSeekV41Detector()
+
+    def _stream(self, text, chunk_size):
+        calls = []
+        for i in range(0, len(text), chunk_size):
+            result = self.detector.parse_streaming_increment(
+                text[i : i + chunk_size], self.tools
+            )
+            calls.extend(result.calls)
+        result = self.detector.parse_streaming_increment("", self.tools)
+        calls.extend(result.calls)
+        return calls
+
+    def test_rstrip_charset_does_not_truncate_value(self):
+        """A string value ending with characters from the end-tag tokens
+        (e.g. 'find /tmp' under '...parameter') must not be truncated while
+        the closer streams in."""
+        completion = (
+            f"<{DSML} calls>\n"
+            f'<{DSML} invoke name="bash">\n'
+            f'<{DSML} parameter name="command" string="true">find /tmp</{DSML} parameter>\n'
+            f"</{DSML} invoke>\n"
+            f"</{DSML} calls>"
+        )
+        # Intermediate state: value fully buffered but the closer is not.
+        probe = DeepSeekV41Detector()
+        probe.parse_streaming_increment(
+            f'<{DSML} invoke name="bash">\n'
+            f'<{DSML} parameter name="command" string="true">find /tmp',
+            self.tools,
+        )
+        self.assertIn("find /tmp", probe.prev_tool_call_arr[0]["arguments"])
+
+        for chunk_size in CHUNK_SIZES:
+            with self.subTest(chunk_size=chunk_size):
+                detector = DeepSeekV41Detector()
+                calls = []
+                for i in range(0, len(completion), chunk_size):
+                    result = detector.parse_streaming_increment(
+                        completion[i : i + chunk_size], self.tools
+                    )
+                    calls.extend(result.calls)
+                result = detector.parse_streaming_increment("", self.tools)
+                calls.extend(result.calls)
+                args = "".join(c.parameters or "" for c in calls)
+                self.assertEqual(json.loads(args), {"command": "find /tmp"})
+
+    def test_subtag_mention_does_not_trap_stream_forever(self):
+        """Prose mentioning a DSML sub-tag must never become a tool call, and
+        the buffered prose must be released at stream end instead of being
+        silently dropped."""
+        result = self.detector.parse_streaming_increment(
+            f'Syntax: <{DSML} parameter name="x"> note.', self.tools
+        )
+        self.assertEqual(result.calls, [])
+        self.detector.parse_streaming_increment(" Still explaining.", self.tools)
+        flushed = self.detector.finish(self.tools)
+        self.assertIn("Syntax:", flushed.normal_text)
+        self.assertNotIn(DSML, flushed.normal_text)
+
+    def test_finish_swallows_trailing_tags_after_parsed_calls(self):
+        """After a successful parse the buffer only holds closing tags and
+        whitespace; finish() must not emit them as normal text."""
+        completion = (
+            f'<{DSML} invoke name="bash">\n'
+            f'<{DSML} parameter name="command" string="true">ls</{DSML} parameter>\n'
+            f"</{DSML} invoke>\n"
+            f"</{DSML} calls>"
+        )
+        self._stream(completion, 7)
+        flushed = self.detector.finish(self.tools)
+        self.assertEqual(flushed.normal_text, "")
+
+    def test_parse_error_keeps_buffer_and_recovers(self):
+        """An unexpected parse error retains the buffer and resets transient
+        state; the next delta reparses the same call successfully."""
+        with patch.object(
+            DeepSeekV41Detector,
+            "_parse_parameters_from_xml",
+            side_effect=RuntimeError("boom"),
+        ):
+            first = self.detector.parse_streaming_increment(
+                '<{0} invoke name="bash">\n'.format(DSML), self.tools
+            )
+            self.assertEqual(first.calls, [])
+        second = self.detector.parse_streaming_increment(
+            '<{0} parameter name="command" string="true">ls</{0} parameter>\n'
+            "</{0} invoke>".format(DSML),
+            self.tools,
+        )
+        names = [c.name for c in second.calls]
+        self.assertIn("bash", names)
 
 
 if __name__ == "__main__":
