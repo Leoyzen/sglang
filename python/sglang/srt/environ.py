@@ -1535,6 +1535,9 @@ class Envs:
     # Run the DeepSeek-V4.1 ratio-1/2 prefill indexer on the torch path instead
     # of the DeepGEMM dense fp4 logits kernel (test oracle / fallback).
     SGLANG_DSV41_TORCH_PREFILL_INDEXER = EnvBool(False)
+    # Skip the SM90 DeepSeek-V4.1 candidate-score warmup that pre-compiles the
+    # indexer kernels during engine init (ops escape hatch / A-B testing).
+    SGLANG_DISABLE_SM90_TRITON_WARMUP = EnvBool(False)
     SGLANG_FP8_PAGED_MQA_LOGITS_TORCH = EnvBool(False)
     SGLANG_OPT_FLASHMLA_SPARSE_PREFILL = EnvBool(True)
 

@@ -375,6 +375,46 @@ def finalize_candidate_topk(
     )
 
 
+def warmup_candidate_scores(
+    width: int,
+    stride: int,
+    lens_dtype: torch.dtype,
+    topk_blocks: int,
+    block_size: int,
+    device: torch.device,
+) -> None:
+    """Compile one ``_candidate_scores_kernel`` specialization at init time.
+
+    The kernel keys its cache on (WIDTH, STRIDE, BLOCKS, GROUP, GROUP_PAD, TILE,
+    WRITE_OUTPUT), so a width the engine has not seen compiles a fresh kernel and
+    device-loads its cubin mid-serving -- which both stalls the engine and risks
+    OOM in cuModuleLoadData (see ``sglang.srt.utils.triton_load_watch``).
+    ``rows=1`` is enough: the grid's row count is not part of the cache key.
+    """
+    if width <= 0 or stride < width or topk_blocks <= 0 or block_size <= 0:
+        return
+    rows = 1
+    blocks = triton.cdiv(width, block_size)
+    group_pad = triton.next_power_of_2(block_size)
+    tile = max(1, 1024 // group_pad)
+    x = torch.zeros(rows, stride, dtype=torch.float32, device=device)
+    lens = torch.ones(rows, dtype=lens_dtype, device=device)
+    scores = torch.empty(rows, blocks, dtype=torch.float32, device=device)
+    _candidate_scores_kernel[(rows, triton.cdiv(blocks, tile))](
+        x,
+        lens,
+        x,
+        scores,
+        width,
+        stride,
+        blocks,
+        block_size,
+        group_pad,
+        tile,
+        False,
+    )
+
+
 @triton.jit
 def _candidate_row_lens_kernel(
     LENS,
