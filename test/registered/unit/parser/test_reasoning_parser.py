@@ -244,10 +244,10 @@ class TestDeepSeekV4Detector(CustomTestCase):
         self.assertTrue(detector.thinks_internally)
 
     def test_dsml_block_is_routed_out_of_reasoning(self):
-        """Without tool_start_token the DSML block stays in reasoning_content and
-        the tool call detector never sees it."""
+        """The calls-block tag routes the payload out of reasoning_content so
+        the tool call detector sees it; V4 uses the unspaced tag name."""
         detector = ReasoningParser(model_type="deepseek-v4").detector
-        self.assertEqual(detector.tool_start_token, "<｜DSML｜")
+        self.assertEqual(detector.tool_start_token, "<｜DSML｜tool_calls")
 
         result = detector.parse_streaming_increment(
             '<think>pick a tool<｜DSML｜tool_calls><｜DSML｜invoke name="s">'
@@ -255,8 +255,44 @@ class TestDeepSeekV4Detector(CustomTestCase):
         self.assertEqual(result.reasoning_text, "pick a tool")
         self.assertTrue(result.normal_text.startswith("<｜DSML｜tool_calls>"))
 
+    def test_dsml_subtag_mention_does_not_cut_reasoning(self):
+        """A parameter sub-tag inside reasoning must NOT exit reasoning; only
+        the calls-block opener does."""
+        detector = ReasoningParser(model_type="deepseek-v4").detector
 
-class TestInklingDetector(CustomTestCase):
+        result = detector.parse_streaming_increment(
+            '<think>The format is <｜DSML｜parameter name="x">style.'
+        )
+        self.assertIn("parameter", result.reasoning_text)
+        self.assertEqual(result.normal_text, "")
+
+    def test_v41_uses_the_spaced_calls_tag(self):
+        detector = ReasoningParser(model_type="deepseek-v41").detector
+        self.assertEqual(detector.tool_start_token, "<｜DSML｜ calls")
+
+        result = detector.parse_streaming_increment(
+            '<think>pick a tool<｜DSML｜ calls><｜DSML｜ invoke name="s">'
+        )
+        self.assertEqual(result.reasoning_text, "pick a tool")
+        self.assertTrue(result.normal_text.startswith("<｜DSML｜ calls>"))
+
+    def test_tool_tag_split_across_think_end_boundary_is_held_back(self):
+        """A partial tool tag right after </think> must not leak into content
+        before its remainder arrives; it is held back and released once the
+        tag completes."""
+        for cut in range(1, len("<｜DSML｜tool_calls")):
+            with self.subTest(cut=cut):
+                detector = ReasoningParser(model_type="deepseek-v4").detector
+                first = detector.parse_streaming_increment(
+                    "<think>reason" + "</think>" + "<｜DSML｜tool_calls"[:cut]
+                )
+                self.assertEqual(first.reasoning_text, "reason")
+                self.assertEqual(first.normal_text, "")
+                second = detector.parse_streaming_increment("<｜DSML｜tool_calls"[cut:])
+                end = detector.finish()
+                joined = first.normal_text + second.normal_text + end.normal_text
+                self.assertEqual(joined, "<｜DSML｜tool_calls")
+
     def test_streaming_routes_blocks_across_all_string_boundaries(self):
         detector = InklingDetector()
         source = (

@@ -220,6 +220,18 @@ class BaseReasoningFormatDetector:
             self._in_reasoning = False
             normal_text = current_text[end_idx + len(self.think_end_token) :]
 
+            # The tool parser downstream holds back its own partial tags, but a
+            # tool tag sliced across the think-end boundary still belongs to this
+            # parser: hold back any trailing partial tool_start_token so it is not
+            # emitted as content before the rest of the tag arrives.
+            if self.tool_start_token:
+                holdback = self._ends_with_partial_token(
+                    normal_text, self.tool_start_token
+                )
+                if holdback:
+                    self._buffer = normal_text[len(normal_text) - holdback :]
+                    normal_text = normal_text[: len(normal_text) - holdback]
+
             return StreamingParseResult(
                 normal_text=normal_text, reasoning_text=reasoning_text
             )
@@ -1293,6 +1305,12 @@ class _DeepSeekV3Detector(Qwen3Detector):
 
 
 class DeepSeekV4Detector(BaseReasoningFormatDetector):
+    # The calls-block opener, without the trailing ">" so partially streamed
+    # tags are detected too. The generic "<｜DSML｜" prefix would also match
+    # the model's sub-tags (e.g. "<｜DSML｜parameter") and cut reasoning short;
+    # V4.1's spaced names need their own literal, hence the kwarg.
+    tool_calls_start_tag = f"<{dsv4_dsml_token}tool_calls"
+
     def __init__(
         self,
         stream_reasoning: bool = True,
@@ -1300,13 +1318,13 @@ class DeepSeekV4Detector(BaseReasoningFormatDetector):
         continue_final_message: bool = False,
         previous_content: str = "",
         force_nonempty_content: bool = False,
+        tool_start_token: Optional[str] = None,
     ):
         super().__init__(
             dsv4_thinking_start_token,
             dsv4_thinking_end_token,
             think_excluded_tokens=[dsv4_eos_token, dsv4_dsml_token],
-            # Leading "<" included: has_tool_call() matches on it.
-            tool_start_token=f"<{dsv4_dsml_token}",
+            tool_start_token=tool_start_token or self.tool_calls_start_tag,
             force_reasoning=force_reasoning,
             stream_reasoning=stream_reasoning,
             continue_final_message=continue_final_message,
@@ -1315,6 +1333,13 @@ class DeepSeekV4Detector(BaseReasoningFormatDetector):
             reasoning_default="explicit_thinking",
             force_nonempty_content=force_nonempty_content,
         )
+
+
+class DeepSeekV41Detector(DeepSeekV4Detector):
+    """V4.1 switches to spaced DSML tag names (" calls" vs V4's "tool_calls"),
+    so its calls-block opener differs; everything else matches V4."""
+
+    tool_calls_start_tag = "<｜DSML｜ calls"
 
 
 class _MimoDetector(Qwen3Detector):
@@ -2025,7 +2050,7 @@ class ReasoningParser:
         "deepseek-r1": DeepSeekR1Detector,
         "deepseek-v3": _DeepSeekV3Detector,
         "deepseek-v4": DeepSeekV4Detector,
-        "deepseek-v41": DeepSeekV4Detector,
+        "deepseek-v41": DeepSeekV41Detector,
         "dots": Qwen3Detector,
         "glm45": Glm45Detector,
         "ling3": Ling3Detector,
