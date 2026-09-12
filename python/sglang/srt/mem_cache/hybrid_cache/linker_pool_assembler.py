@@ -347,28 +347,94 @@ def _build_deepseek_v4_device_pool_group(
                 )
             )
 
-    add(
-        PoolName.DEEPSEEK_V4_C4,
-        PoolName.KV,
-        kvcache.c4_kv_pool,
-        kvcache.c4_kv_pool.kv_buffer,
-        mappings.c4,
-    )
-    for region in _dsv4_indexer_regions(kvcache, page_size):
+    # V4.0 layouts carry C4/C128; V4.1 low-compression layouts carry C1/C2 and
+    # leave these pools unset. Register each only when its layers are present,
+    # and fail with a named error rather than dereferencing a missing pool.
+    if mappings.c4:
+        if kvcache.c4_kv_pool is None:
+            raise ValueError(
+                "DeepSeek V4 layout has C4 layers but no C4 device pool was built."
+            )
         add(
-            region.name,
+            PoolName.DEEPSEEK_V4_C4,
             PoolName.KV,
-            kvcache.c4_indexer_kv_pool,
-            region.device_buffers,
+            kvcache.c4_kv_pool,
+            kvcache.c4_kv_pool.kv_buffer,
             mappings.c4,
         )
-    add(
-        PoolName.DEEPSEEK_V4_C128,
-        PoolName.KV,
-        kvcache.c128_kv_pool,
-        kvcache.c128_kv_pool.kv_buffer,
-        mappings.c128,
-    )
+        for region in _dsv4_indexer_regions(kvcache, page_size):
+            add(
+                region.name,
+                PoolName.KV,
+                kvcache.c4_indexer_kv_pool,
+                region.device_buffers,
+                mappings.c4,
+            )
+    if mappings.c128:
+        if kvcache.c128_kv_pool is None:
+            raise ValueError(
+                "DeepSeek V4 layout has C128 layers but no C128 device pool was built."
+            )
+        add(
+            PoolName.DEEPSEEK_V4_C128,
+            PoolName.KV,
+            kvcache.c128_kv_pool,
+            kvcache.c128_kv_pool.kv_buffer,
+            mappings.c128,
+        )
+    for ratio, names in (
+        (
+            1,
+            (
+                PoolName.DEEPSEEK_V4_C1,
+                PoolName.DEEPSEEK_V4_C1_INDEXER,
+                PoolName.DEEPSEEK_V4_C1_INDEXER_SCALE,
+            ),
+        ),
+        (
+            2,
+            (
+                PoolName.DEEPSEEK_V4_C2,
+                PoolName.DEEPSEEK_V4_C2_INDEXER,
+                PoolName.DEEPSEEK_V4_C2_INDEXER_SCALE,
+            ),
+        ),
+    ):
+        sources = getattr(kvcache, "sources_by_ratio", {}).get(ratio, [])
+        if not sources:
+            continue
+        kv_pool = kvcache.kv_pools[ratio]
+        index_pool = kvcache.index_pools[ratio]
+        assert page_size % ratio == 0
+        slots_per_page = page_size // ratio
+        assert slots_per_page % index_pool.page_size == 0, (
+            f"ratio-{ratio} index pages of {index_pool.page_size} slots do not "
+            f"tile a FULL page of {slots_per_page} slots"
+        )
+        index_pages_per_full_page = slots_per_page // index_pool.page_size
+        # One row per FULL tree page, so the transfer addresses the compressed
+        # pool exactly like the C4 path does.
+        layer_mapping = {
+            source - kvcache.start_layer: index for index, source in enumerate(sources)
+        }
+        add(names[0], PoolName.KV, kv_pool, kv_pool.kv_buffer, layer_mapping)
+        if index_pool.index_k_with_scale_buffer is not None:
+            index_regions = [(names[1], index_pool.index_k_with_scale_buffer)]
+        else:
+            index_regions = [
+                (names[1], index_pool.index_k_payload_buffer),
+                (names[2], index_pool.index_k_scale_buffer),
+            ]
+        for name, buffers in index_regions:
+            rows = []
+            for buffer in buffers:
+                full_pages = buffer.shape[0] // index_pages_per_full_page
+                rows.append(
+                    buffer[: full_pages * index_pages_per_full_page]
+                    .view(torch.uint8)
+                    .reshape(full_pages, -1)
+                )
+            add(name, PoolName.KV, index_pool, rows, layer_mapping)
     add(
         PoolName.DEEPSEEK_V4_C4_STATE,
         PoolName.SWA,
