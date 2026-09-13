@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import logging
+import random
 import threading
+import time
 from concurrent.futures import Future
 from queue import Empty, Queue
 
@@ -111,6 +113,16 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
         self.offload_owner = not rank_replicated or tp_rank == 0
         extra_config, *_ = HybridCacheController.parse_storage_backend_extra_config(
             get_memory().hicache_storage_backend_extra_config
+        )
+        # Transient data-node endpoint timeouts (Mooncake -600) surface only at
+        # the range-get step; the metadata-only revalidate_load cannot see them.
+        # Retry the failed entries on this background thread instead of killing
+        # the engine: a bounded scheduler stall is strictly better than a crash.
+        self.range_get_retry_attempts = int(
+            extra_config.get("range_get_retry_attempts", 5)
+        )
+        self.range_get_retry_budget_s = float(
+            extra_config.get("range_get_retry_budget_s", 30.0)
         )
         storage_config = HiCacheStorageConfig(
             tp_rank=tp_rank,
@@ -336,6 +348,109 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
             finally:
                 self.load_queue.task_done()
 
+    def _range_get_with_retry(
+        self,
+        name: PoolName,
+        layer: int,
+        keys: list[str],
+        meta: tuple[list[int], list, list[int]],
+    ) -> None:
+        """Range-get one pool's layer, retrying only the failed entries.
+
+        A transient data-node endpoint timeout (Mooncake ``-600``) surfaces
+        here, after the prefix has already been committed to the tree and the
+        scheduler is blocked in ``wait_until``. The metadata-only
+        ``revalidate_load`` cannot see it, so this is the last line of defense:
+        re-issue the failed entries on this background thread (a bounded stall
+        is strictly better than a fatal engine restart). Each entry's range is
+        deterministic and independently addressed, so a per-entry re-issue
+        fully overwrites its buffer and partial transfers self-heal.
+
+        Persistent failure still raises: completing the layers as a "miss"
+        would let the running batch read uninitialized device slots and emit
+        silently wrong tokens. Terminal fail-soft belongs to a scheduler-level
+        batch abort, not this layer.
+        """
+        ptrs, sizes, offsets = meta
+        expected = [sum(item) for item in sizes]
+        failed = list(range(len(keys)))
+        deadline = time.monotonic() + self.range_get_retry_budget_s
+        attempt = 0
+        while True:
+            attempt += 1
+            sub_keys = [keys[i] for i in failed]
+            sub_ptrs = [ptrs[i] for i in failed]
+            sub_sizes = [sizes[i] for i in failed]
+            sub_offsets = [offsets[i] for i in failed]
+            result = self.storage.store.batch_get_into_multi_buffer_ranges(
+                sub_keys,
+                sub_ptrs,
+                sub_sizes,
+                sub_offsets,
+            )
+            sub_expected = [expected[i] for i in failed]
+            if (
+                result is not None
+                and not isinstance(result, int)
+                and list(result) == sub_expected
+            ):
+                return
+            codes = (
+                list(result)
+                if result is not None and not isinstance(result, int)
+                else result
+            )
+            still_failed = (
+                [idx for i, idx in enumerate(failed) if codes[i] != expected[idx]]
+                if isinstance(codes, list) and len(codes) == len(failed)
+                else list(failed)
+            )
+            exhausted = (
+                attempt >= self.range_get_retry_attempts or time.monotonic() >= deadline
+            )
+            if exhausted:
+                failed_keys = [keys[i] for i in still_failed]
+                failed_get_cache = getattr(self.storage, "failed_get_cache", None)
+                if failed_get_cache is not None:
+                    failed_get_cache.update_batch([], failed_keys)
+                raise RuntimeError(
+                    f"Mooncake range get failed for pool={name}, layer={layer}: "
+                    f"attempts={attempt}, failed={len(still_failed)}/{len(keys)}, "
+                    f"transferred={codes}, expected={sub_expected}"
+                )
+            # Backoff with jitter so co-recovering TP ranks do not stampede the
+            # data node. On later attempts, end and restart the session for the
+            # failed keys to force fresh master/replica routing: the transfer
+            # engine's endpoint for a wedged session may be unrecoverable.
+            logger.warning(
+                "Mooncake range get partial failure (pool=%s, layer=%d, "
+                "attempt=%d/%d, failed=%d/%d), retrying: transferred=%s",
+                name,
+                layer,
+                attempt,
+                self.range_get_retry_attempts,
+                len(still_failed),
+                len(keys),
+                codes,
+            )
+            if attempt >= 3:
+                try:
+                    self.storage.store.batch_get_session_end(
+                        [keys[i] for i in still_failed]
+                    )
+                    self.storage.store.batch_get_session_start(
+                        [keys[i] for i in still_failed]
+                    )
+                except BaseException:
+                    logger.exception(
+                        "Mooncake range get session restart failed (pool=%s, "
+                        "layer=%d); continuing retries",
+                        name,
+                        layer,
+                    )
+            time.sleep(min(0.5 * (2 ** (attempt - 1)), 5.0) * random.uniform(0.8, 1.2))
+            failed = still_failed
+
     def load_layer_wise(
         self, counter_index: int, request_transfers: list[list[PoolTransfer]]
     ) -> None:
@@ -388,24 +503,7 @@ class MooncakeDirectLinker(UnifiedCacheLinker):
                     )
                     if meta is None:
                         continue
-                    ptrs, sizes, offsets = meta
-                    result = self.storage.store.batch_get_into_multi_buffer_ranges(
-                        keys,
-                        ptrs,
-                        sizes,
-                        offsets,
-                    )
-                    expected = [sum(item) for item in sizes]
-                    if (
-                        result is None
-                        or isinstance(result, int)
-                        or list(result) != expected
-                    ):
-                        raise RuntimeError(
-                            f"Mooncake range get failed for pool={name}, "
-                            f"layer={layer}: transferred={result}, "
-                            f"expected={expected}"
-                        )
+                    self._range_get_with_retry(name, layer, keys, meta)
                 self.layer_done_counter.complete(counter_index, layer)
         except BaseException as error:
             self.layer_done_counter.fail(counter_index, error)
