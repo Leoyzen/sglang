@@ -104,14 +104,12 @@ def _make_deferred_finalize_output(
 ) -> FlashInferTrtllmDeferredFinalizeOutput:
     """Validate and adapt FlashInfer's ``do_finalize=False`` output ABI."""
     gemm2_out, expert_weights, expanded_idx_to_permuted_idx = result[:3]
-    # Some FlashInfer versions size this buffer from routing_logits dtype while
-    # writing BF16 weights into it. Reinterpret only the live BF16 prefix.
-    if expert_weights.dtype == torch.float32:
-        n, k = expert_weights.shape
-        expert_weights = expert_weights.view(torch.bfloat16).view(-1, k)[:n]
-    if expert_weights.dtype != torch.bfloat16:
+    # FlashInfer >= 0.6.18 types this buffer by what it holds: bf16 for packed
+    # routing (flashinfer #3595) and the caller's dtype for unpacked routing,
+    # so fp32 here is genuine fp32 and must not be reinterpreted as bf16 bits.
+    if expert_weights.dtype not in (torch.bfloat16, torch.float32):
         raise RuntimeError(
-            "FlashInfer deferred finalize must return BF16 expert weights, got "
+            "FlashInfer deferred finalize must return BF16 or FP32 expert weights, got "
             f"{expert_weights.dtype}"
         )
     if gemm2_out.dtype != torch.bfloat16:
@@ -910,9 +908,6 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
         assert quant_info.output2_scales_scalar is not None
 
         a_q, _ = scaled_fp8_quant(hidden_states, quant_info.w13_input_scale)
-        routing_bias_cast = (
-            None if correction_bias is None else correction_bias.to(torch.bfloat16)
-        )
 
         # Allocate output inside symmetric memory context
         with use_symmetric_memory(
@@ -933,7 +928,7 @@ def fused_experts_none_to_flashinfer_trtllm_fp8(
 
         output = trtllm_fp8_per_tensor_scale_moe_wrapper(
             routing_logits=router_logits,
-            routing_bias=routing_bias_cast,
+            routing_bias=correction_bias,
             hidden_states=a_q,
             gemm1_weights=quant_info.w13_weight,
             output1_scales_scalar=quant_info.output1_scales_scalar,
