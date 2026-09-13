@@ -106,21 +106,28 @@ def transform_index_page_table_decode_kernel(
     page_table_width,
     page_size: tl.constexpr,
     page_table_row_stride: tl.constexpr,
+    page_table_col_stride: tl.constexpr,
+    topk_indices_row_stride: tl.constexpr,
+    topk_indices_col_stride: tl.constexpr,
+    result_row_stride: tl.constexpr,
+    result_col_stride: tl.constexpr,
 ):
     TOPK: tl.constexpr = 2048
     req_id = tl.program_id(0)
     page_table_ptr = page_table_ptr + req_id * page_table_row_stride
-    topk_indices_ptr = topk_indices_ptr + req_id * TOPK
-    result_ptr = result_ptr + req_id * TOPK
+    topk_indices_ptr = topk_indices_ptr + req_id * topk_indices_row_stride
+    result_ptr = result_ptr + req_id * result_row_stride
 
     offset = tl.arange(0, TOPK)  # topk should be 2048
-    loaded_topk_indices = tl.load(topk_indices_ptr + offset)
+    loaded_topk_indices = tl.load(topk_indices_ptr + offset * topk_indices_col_stride)
     # OOB guard only: the width is THAT table's own column domain, not a
     # folded/derived width -- masking on anything narrower would drop owned rows.
     mask = (loaded_topk_indices >= 0) & (loaded_topk_indices < page_table_width)
-    loaded_kv_indices = tl.load(page_table_ptr + loaded_topk_indices, mask=mask)
-    tl.store(result_ptr + offset, loaded_kv_indices, mask=mask)
-    tl.store(result_ptr + offset, -1, mask=~mask)
+    loaded_kv_indices = tl.load(
+        page_table_ptr + loaded_topk_indices * page_table_col_stride, mask=mask
+    )
+    tl.store(result_ptr + offset * result_col_stride, loaded_kv_indices, mask=mask)
+    tl.store(result_ptr + offset * result_col_stride, -1, mask=~mask)
 
 
 # Expanded EAGLE page tables are contiguous, so their row stride changes with
@@ -222,6 +229,11 @@ def transform_index_page_table_decode_fast(
         page_table.shape[1],
         page_size,
         page_table_row_stride=page_table.stride(0),
+        page_table_col_stride=page_table.stride(1),
+        topk_indices_row_stride=topk_indices.stride(0),
+        topk_indices_col_stride=topk_indices.stride(1),
+        result_row_stride=result.stride(0),
+        result_col_stride=result.stride(1),
     )
     return result
 
