@@ -15,8 +15,14 @@ register_cpu_ci(est_time=8, suite="base-a-test-cpu")
 
 
 class _FakeStore:
-    def __init__(self, range_results, session_start_result=None):
-        self.range_results = list(range_results)
+    """Returns one outcome per call, sized to the keys requested.
+
+    ``outcomes`` is a list of per-call dicts mapping key -> transferred bytes
+    (missing key defaults to OK). The last outcome repeats if more calls come.
+    """
+
+    def __init__(self, outcomes, session_start_result=None):
+        self.outcomes = list(outcomes)
         self.range_calls = []
         self.session_start_calls = []
         self.session_end_calls = []
@@ -24,9 +30,8 @@ class _FakeStore:
 
     def batch_get_into_multi_buffer_ranges(self, keys, ptrs, sizes, offsets):
         self.range_calls.append(list(keys))
-        if len(self.range_results) > 1:
-            return self.range_results.pop(0)
-        return self.range_results[0]
+        outcome = self.outcomes.pop(0) if len(self.outcomes) > 1 else self.outcomes[0]
+        return [outcome.get(key, 74880) for key in keys]
 
     def batch_get_session_start(self, keys):
         self.session_start_calls.append(list(keys))
@@ -57,8 +62,8 @@ def _make_linker(store, *, attempts=5, budget_s=30.0):
 
 class TestRangeGetRetry(CustomTestCase):
     def test_retry_recovers_transient_partial_failure(self):
-        # First attempt: entry 1 fails with -600. Second: all succeed.
-        store = _FakeStore([[74880, -600, 74880], [74880, 74880, 74880]])
+        # First attempt: k1 fails with -600. Second: all succeed.
+        store = _FakeStore([{"k1": -600}, {}])
         linker = _make_linker(store)
         meta = ([100, 200, 300], [[74880], [74880], [74880]], [0, 0, 0])
 
@@ -72,13 +77,7 @@ class TestRangeGetRetry(CustomTestCase):
         self.assertEqual(store.range_calls, [["k0", "k1", "k2"], ["k1"]])
 
     def test_only_failed_entries_are_reissued(self):
-        store = _FakeStore(
-            [
-                [74880, -600, -600, 74880],
-                [-600, 74880],
-                [74880],
-            ]
-        )
+        store = _FakeStore([{"b": -600, "c": -600}, {"b": -600}, {}])
         linker = _make_linker(store)
         meta = ([0, 0, 0, 0], [[74880], [74880], [74880], [74880]], [0, 0, 0, 0])
 
@@ -91,7 +90,7 @@ class TestRangeGetRetry(CustomTestCase):
         self.assertEqual(store.range_calls, [["a", "b", "c", "d"], ["b", "c"], ["b"]])
 
     def test_persistent_failure_raises_and_negative_caches(self):
-        store = _FakeStore([[74880, -600, 74880]])
+        store = _FakeStore([{"k1": -600}])
         failed_cache = _FakeFailedGetCache()
         linker = _make_linker(store, attempts=3)
         linker.storage.failed_get_cache = failed_cache
@@ -110,9 +109,7 @@ class TestRangeGetRetry(CustomTestCase):
         self.assertEqual(failed_cache.batches, [([], ["k1"])])
 
     def test_session_restart_on_later_attempts(self):
-        store = _FakeStore(
-            [[74880, -600], [74880, -600], [74880, -600], [74880, 74880]]
-        )
+        store = _FakeStore([{"k1": -600}, {"k1": -600}, {"k1": -600}, {}])
         linker = _make_linker(store)
         meta = ([0, 0], [[74880], [74880]], [0, 0])
 
