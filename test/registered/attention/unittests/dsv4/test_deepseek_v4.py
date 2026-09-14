@@ -1167,7 +1167,10 @@ class TestDSV41PrefillScoreBucket(CustomTestCase):
         torch.manual_seed(0)
         block_size, topk_blocks = 32, 4
         for lc in (5, 32, 33, 100, 257):
-            lens = torch.tensor([lc, max(1, lc - 3), lc], dtype=torch.int32)
+            # Match the production call site, which passes ``lens[:, None]``;
+            # the torch fallback in select_candidate_block_indices broadcasts the
+            # per-row lengths against the block axis, so a 1-D tensor mismatches.
+            lens = torch.tensor([lc, max(1, lc - 3), lc], dtype=torch.int32)[:, None]
             scores = torch.randn(3, lc)
             ref = select_candidate_blocks(
                 scores, lens, topk_blocks=topk_blocks, block_size=block_size
@@ -1179,6 +1182,45 @@ class TestDSV41PrefillScoreBucket(CustomTestCase):
             )[..., :lc]
             self.assertEqual(ref.shape, got.shape)
             self.assertTrue(torch.equal(ref, got))
+
+    @unittest.skipIf(not torch.cuda.is_available(), "CUDA is required")
+    def test_misaligned_lens_does_not_add_a_specialization(self):
+        # The prefill path passes ``compress_lens[token_rows]``, a view whose
+        # data_ptr offset depends on the preceding requests' q_lens, so LENS is
+        # 16B-aligned only ~1/4 of the time. Triton otherwise keys its cache on
+        # that pointer alignment, compiling a fresh kernel per alignment class
+        # mid-serving (init warmup can only pre-cover the aligned one). The
+        # kernel must not specialize on LENS alignment.
+        from sglang.kernels.ops.attention.dsv4.candidate_blocks import (
+            _candidate_scores_kernel,
+        )
+        from sglang.srt.layers.attention.dsv4.indexer import select_candidate_blocks
+
+        self.assertIn("LENS", _candidate_scores_kernel.do_not_specialize)
+
+        def num_specializations() -> int:
+            return sum(len(v) for v in _candidate_scores_kernel.device_caches.values())
+
+        block_size, topk_blocks, lc = 32, 4, 256
+        buf = torch.ones(lc + 8, dtype=torch.int32, device="cuda")
+        aligned = buf[0:3]  # data_ptr % 16 == 0
+        misaligned = buf[1:4]  # data_ptr % 16 == 4
+        scores = torch.randn(3, lc, device="cuda")
+
+        select_candidate_blocks(
+            scores, aligned[:, None], topk_blocks=topk_blocks, block_size=block_size
+        )
+        torch.cuda.synchronize()
+        after_aligned = num_specializations()
+        select_candidate_blocks(
+            scores, misaligned[:, None], topk_blocks=topk_blocks, block_size=block_size
+        )
+        torch.cuda.synchronize()
+        self.assertEqual(
+            num_specializations(),
+            after_aligned,
+            "misaligned LENS compiled an extra _candidate_scores_kernel specialization",
+        )
 
 
 if __name__ == "__main__":

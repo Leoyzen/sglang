@@ -12,7 +12,13 @@ def _maximum_with_nan(a, b):
     return tl.maximum(a, b, propagate_nan=tl.PropagateNan.ALL)
 
 
-@triton.jit
+# ``LENS`` is exempt from Triton's pointer-alignment specialization: the prefill
+# path passes ``compress_lens[token_rows]``, a view whose data_ptr offset depends
+# on the preceding requests' q_lens, so it is 16B-aligned only ~1/4 of the time.
+# Without this the kernel compiles one extra specialization per alignment class
+# (4 total) and the init-time warmup can only pre-cover the aligned one. ``LENS``
+# is read once per row, so dropping its divisibility hint costs nothing.
+@triton.jit(do_not_specialize=["LENS"])
 def _candidate_scores_kernel(
     X,
     LENS,
