@@ -155,6 +155,10 @@ def _cache_for_wrapper(**kwargs):
         "write_through_threshold": 256,
         "pp_size": 1,
         "pp_group": None,
+        # _probe_agreement_needed reads these to decide whether the rank-local
+        # match() guards can diverge; absent groups mean single-rank (no hang).
+        "attn_cp_group": None,
+        "attn_tp_group": None,
     }
     defaults.update(kwargs)
     return SimpleNamespace(**defaults)

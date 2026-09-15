@@ -3478,7 +3478,12 @@ class DeepseekV4AttnBackend(
                 publish.append(torch.cat(masks) if len(masks) > 1 else masks[0])
             row_base += q_len
 
-        assert row_base == q.shape[0]
+        # MLP-sync token padding (ForwardBatch._pad_inputs_to_size) can append
+        # dummy token rows after the real ones, so this per-request loop covers
+        # only `row_base` of the `q.shape[0]` token rows. The trailing rows
+        # belong to no request; page_indices / raw_indices keep the -1 fill
+        # done at the top of this function.
+        assert row_base <= q.shape[0], (row_base, q.shape[0])
         if publish is not None:
             self.forward_metadata.candidate_metadata = CandidateMasks(
                 request_masks=publish
