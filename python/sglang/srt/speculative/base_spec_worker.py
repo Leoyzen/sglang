@@ -279,6 +279,11 @@ class BaseSpecWorker(ABC):
                 device_pools=draft_pools,
             )
 
+        if get_memory().enable_unified_cache_external_linker:
+            raise NotImplementedError(
+                "The external linker only supports packed draft KV caches."
+            )
+
         return HiCacheDraftPlan(
             mode=HiCacheDraftMode.SIDECAR,
             # Preserve the legacy non-packed HiCache behavior: multi-layer
