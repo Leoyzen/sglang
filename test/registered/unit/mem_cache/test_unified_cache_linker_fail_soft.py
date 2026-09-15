@@ -15,7 +15,7 @@ import torch
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
-from sglang.srt.mem_cache.unified_cache.components.tree_component import (
+from sglang.srt.mem_cache.unified_cache.components.base import (
     ExternalLinkerLoadPhase,
     LinkerTransferPhase,
 )
@@ -131,11 +131,14 @@ def _cache_for_load_back(component, empty_indices):
             enable_external_cache_linker=False,
             empty_match_result=SimpleNamespace(device_indices=empty_indices),
             collect_full_device_indices=lambda *args: torch.zeros(2, dtype=torch.int64),
+            mark_external_cache_stored_path=lambda *args: None,
         ),
         write_through_threshold=256,
         pp_size=1,
         pp_group=None,
         page_size=1,
+        tree_components=(ComponentType.FULL,),
+        components={},
         _components_tuple=(component,),
         insert=lambda params: SimpleNamespace(
             last_device_node=9,
