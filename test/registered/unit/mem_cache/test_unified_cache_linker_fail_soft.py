@@ -14,6 +14,7 @@ import torch
 
 from sglang.srt.mem_cache.hicache_storage import PoolName, PoolTransfer
 from sglang.srt.mem_cache.radix_cache import RadixKey
+from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.mem_cache.unified_cache.components.base import (
     ExternalLinkerLoadPhase,
     LinkerTransferPhase,
@@ -68,6 +69,9 @@ class _RevalidatingFakeLinker(UnifiedCacheLinker):
     def num_completed_offloads(self):
         return len(self.completed_offloads)
 
+    def pop_completed_offload(self):
+        return self.completed_offloads.pop(0)
+
     def take_completed_offloads(self, finish_count):
         return [True] * min(finish_count, len(self.completed_offloads))
 
@@ -90,6 +94,10 @@ class _RevalidatingFakeLinker(UnifiedCacheLinker):
 
 class _LoadBackComponent:
     """Component handing out a fixed KV transfer and recording load phases."""
+
+    # _update_load's COMMIT adoption filter reads both off the component.
+    component_type = ComponentType.FULL
+    linker_indices_are_paged = True
 
     def __init__(self):
         self.phases = []
@@ -121,18 +129,32 @@ class _LoadBackComponent:
 
 def _cache_for_load_back(component, empty_indices):
     lock_params = object()
+    # The COMMIT adoption filter keeps a transfer only when its pages fall in
+    # adopted_ranges; the loaded tail spans [2, 4) (device_hit_len=2 plus the
+    # two tail pages), so the FULL component adopts exactly that range.
+    adopted_ranges = {ComponentType.FULL: [(2, 4)]}
+    # 2 FULL pages: len(tail_hashes) * page_size, as load_back asserts.
+    canonical_tail = torch.arange(2, dtype=torch.int64)
     cache = SimpleNamespace(
         tree_core=SimpleNamespace(
             enable_external_cache_linker=False,
             empty_match_result=SimpleNamespace(device_indices=empty_indices),
+            get_component_device_value=lambda node_id, ct: None,
+            collect_full_device_indices=lambda from_node, until_node: canonical_tail,
+            mark_external_cache_stored_path=lambda from_node, until_node: None,
         ),
         write_through_threshold=256,
         pp_size=1,
         pp_group=None,
         page_size=1,
+        tree_components=(ComponentType.FULL,),
+        components={},
+        token_to_kv_pool_allocator=SimpleNamespace(
+            get_kvcache=lambda: SimpleNamespace(use_dsa=False)
+        ),
         _components_tuple=(component,),
         insert=lambda params: SimpleNamespace(
-            last_device_node=9, mamba_exist=False, adopted_ranges={}
+            last_device_node=9, mamba_exist=False, adopted_ranges=adopted_ranges
         ),
         inc_lock_ref=lambda node_id: SimpleNamespace(to_dec_params=lambda: lock_params),
         dec_lock_ref=lambda node_id, params: None,
@@ -209,8 +231,9 @@ def test_backend_without_revalidation_keeps_legacy_path():
     empty_indices = torch.zeros(0, dtype=torch.int64)
     component = _LoadBackComponent()
     linker = _RevalidatingFakeLinker(revalidate_result=True)
-    # Simulate a backend that has not implemented the hook.
-    del linker.revalidate_load
+    # Simulate a backend that has not implemented the hook. (Shadow the class
+    # method with None; `del` on an instance cannot remove a class attribute.)
+    linker.revalidate_load = None
     cache, lock_params = _cache_for_load_back(component, empty_indices)
     wrapper = UnifiedCacheLinkerWrapper(cache, linker)
     wrapper.hit_markers["rid"] = _hit_marker()

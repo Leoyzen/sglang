@@ -726,7 +726,18 @@ class MambaComponent(TreeComponent):
             hit_policy=PoolHitPolicy.TRAILING_PAGES,
         )
         if phase == LinkerTransferPhase.LOAD:
-            transfer.device_indices = self._alloc_mamba_slot().to(torch.int64)
+            # Inlined alloc/evict: unlike the tree-insert callers, a LOAD that
+            # cannot get a slot must return None so the caller aborts the whole
+            # load (releasing earlier components' temporary allocations) and
+            # degrades the request to a plain cache miss. The tree-insert
+            # callers keep _alloc_mamba_slot's assert.
+            dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
+            if dst is None:
+                self.cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
+                dst = self.cache.req_to_token_pool.mamba_allocator.alloc(1)
+                if dst is None:
+                    return None
+            transfer.device_indices = dst.to(torch.int64)
         return transfer
 
     def update_external_linker_load(

@@ -319,13 +319,14 @@ class TestMambaComponentTransfers(CustomTestCase):
         self.assertIsNone(transfer)
 
     def test_update_load_passes_through(self):
-        component = self._component(_FakeAllocator())
+        allocator = _FakeAllocator()
+        component = self._component(allocator)
         transfer = PoolTransfer(
             name=PoolName.MAMBA,
             keys=["h0"],
             device_indices=torch.tensor([3], dtype=torch.int64),
         )
-        for phase in ExternalLinkerLoadPhase:
+        for phase in (ExternalLinkerLoadPhase.PREPARE, ExternalLinkerLoadPhase.COMMIT):
             result = component.update_external_linker_load(
                 phase,
                 req=SimpleNamespace(),
@@ -335,6 +336,19 @@ class TestMambaComponentTransfers(CustomTestCase):
                 insert_result=InsertResult(prefix_len=0),
             )
             self.assertIs(result, transfer)
+        # ABORT is not a pass-through: LOAD pre-allocated the slot, so the
+        # component returns the slot to the allocator and reports None so the
+        # caller stops the load (instead of leaking it).
+        result = component.update_external_linker_load(
+            ExternalLinkerLoadPhase.ABORT,
+            req=SimpleNamespace(),
+            full_transfer=PoolTransfer(name=PoolName.KV, keys=["h0"]),
+            transfer=transfer,
+            prefix_len=8,
+            insert_result=InsertResult(prefix_len=0),
+        )
+        self.assertIsNone(result)
+        self.assertIn(3, allocator.freed)
 
 
 class TestUpdateLoadCommitKeepsMamba(CustomTestCase):
@@ -359,7 +373,10 @@ class TestUpdateLoadCommitKeepsMamba(CustomTestCase):
         mamba_component.update_external_linker_load = (
             lambda phase, req, full_transfer, transfer, prefix_len, **kwargs: transfer
         )
-        full_component = SimpleNamespace(component_type=ComponentType.FULL)
+        full_component = SimpleNamespace(
+            component_type=ComponentType.FULL,
+            linker_indices_are_paged=True,
+        )
         full_component.update_external_linker_load = (
             lambda phase, req, full_transfer, transfer, prefix_len, **kwargs: transfer
         )
