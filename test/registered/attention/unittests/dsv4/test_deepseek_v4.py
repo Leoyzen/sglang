@@ -783,9 +783,9 @@ class TestDSV41SM90CandidateSlots(CustomTestCase):
             core_attn_metadata=core,
             indexer_metadata=None,
             c2_indexer_metadata=SimpleNamespace(
-                max_c4_seq_len=width,
+                max_compressed_seq_len=width,
                 use_topk_v2=use_topk_v2,
-                c4_seq_lens=torch.full((len(req),), width, dtype=torch.int32),
+                compressed_seq_lens=torch.full((len(req),), width, dtype=torch.int32),
                 topk_metadata=torch.empty(0),
             ),
         )
@@ -860,6 +860,11 @@ class TestDSV41SM90CandidateSlots(CustomTestCase):
             positions = (
                 candidate_blocks[:, :, None] * block_size + torch.arange(block_size)
             ).flatten(1)
+            # Blocks past the row's valid count carry the num_blocks sentinel;
+            # the real kernel masks those lanes instead of dereferencing them,
+            # so clamp the block here and let ``score`` mask the tail via
+            # candidate_lens.
+            positions = positions.clamp_max(width - 1)
             slots = req_to_token[req_rows[:, None], positions * ratio] // ratio
             return score(q, weights, slots, candidate_lens, table, page_size)
 
@@ -928,6 +933,12 @@ class TestDSV41SM90CandidateSlots(CustomTestCase):
                 safe = selected.clamp_max(scores.shape[1] - 1)
                 blocks = candidate_blocks.gather(1, safe // candidate_block_size)
                 logical = blocks * candidate_block_size + safe % candidate_block_size
+                # Invalid lanes carry the num_blocks sentinel, so their logical
+                # position exceeds the source width; the real kernel masks those
+                # loads with ``valid`` instead of dereferencing them. Clamp into
+                # the source domain for the gather -- the masked_fill below
+                # discards these lanes, and valid lanes are already in range.
+                logical = logical.clamp_max(width - 1)
                 slots = req_to_token[req_rows[:, None], logical * ratio] // ratio
             page_out.fill_(-1)
             page_out[:, : selected.shape[1]] = slots.masked_fill(~valid, -1)
@@ -969,6 +980,10 @@ class TestDSV41SM90CandidateSlots(CustomTestCase):
                     side_effect=finalize_topk,
                 ),
             ):
+                # The full-scan call below must not publish; clear whatever the
+                # previous step left so the assertion pins this call rather than
+                # stale state carried on the backend.
+                backend.forward_metadata.candidate_metadata = None
                 indexer.is_candidate_source = False
                 indexer.uses_candidates = False
                 layer.layer_id = 2
@@ -1022,7 +1037,10 @@ class TestDSV41SM90CandidateSlots(CustomTestCase):
                             torch.arange(positions.shape[1]) < counts[:, None],
                         )
                 self.assertEqual(full_logits.call_args.args[-1], width)
-                self.assertEqual(full_topk.call_count, 5 if use_topk_v2 else 4)
+                # Every iteration (the source and the four consumers) takes the
+                # compact path, which always scores through the shared plan; the
+                # non-candidate setup call above is excluded by the reset.
+                self.assertEqual(full_topk.call_count, 5)
                 self.assertEqual(
                     [call.args[4].shape[1] for call in compact_logits.call_args_list],
                     [4, 4, 4, 4, 4],

@@ -427,6 +427,10 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         consumer.sanity_check()
 
     def test_chunked_unfinished_req_offloads_without_inflating_hit_count(self):
+        if self.tree_core_backend != "python":
+            self.skipTest(
+                "chunked offload chain builder is not ported to the Rust tree core"
+            )
         cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
         self.cfg = cfg
         cache, allocator, req_to_token_pool = build_fixture(cfg)
@@ -479,6 +483,10 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         cache.sanity_check()
 
     def test_chunked_unfinished_req_offload_requires_linker(self):
+        if self.tree_core_backend != "python":
+            self.skipTest(
+                "chunked offload chain builder is not ported to the Rust tree core"
+            )
         cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
         self.cfg = cfg
         cache, allocator, req_to_token_pool = build_fixture(cfg)
