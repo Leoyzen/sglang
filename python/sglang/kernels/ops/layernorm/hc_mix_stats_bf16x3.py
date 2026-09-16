@@ -52,6 +52,56 @@ def _hc_mix_stats_bf16x3(X, W_HI, W_MID, W_LO, MIX, SQ, M, BLOCK_M: tl.constexpr
     tl.store(SQ + tl.program_id(1) * M + rows, sq, rows < M)
 
 
+def _bf16x3_block_m(m: int) -> int:
+    """Row tile for the compensated partial kernel. Measured best is 64 for
+    decode-sized batches and 128 for prefill; both preserve the per-row
+    reduction order (a row's bits do not depend on M or on BLOCK_M)."""
+    return 64 if m <= 512 else 128
+
+
+def hc_mix_stats_bf16x3(x: torch.Tensor, weight_parts, rms_eps: float) -> torch.Tensor:
+    """Compensated bf16x3 mix projection: the ``[m, 24]`` fp32 ``mixes`` tensor
+    that ``mhc.hc_mix_stats`` returns, before sinkhorn.
+
+    The 16 fixed K slices keep each row's arithmetic independent of M, so a row
+    is bitwise-identical whether computed alone or inside a batch (verified over
+    decode-sized M). On SM90 this is ~2.8-3.2x faster than the tf32x3 path
+    because bf16 tensor cores are 2x tf32 and a 3-way split still carries ~24
+    mantissa bits (max_abs error vs fp64 ~1.4e-5, vs ~5.7e-6 for tf32x3).
+    """
+    from sglang.kernels.ops.layernorm.mhc import _hc_mix_stats_reduce_kernel
+
+    m = x.shape[0]
+    assert x.dim() == 2 and x.shape[1] == 20480 and x.is_contiguous()
+    assert x.dtype == torch.bfloat16 and 0 < m <= 65536
+    assert len(weight_parts) == 3
+    assert all(
+        w.shape == (24, 20480) and w.dtype == torch.bfloat16 and w.is_contiguous()
+        for w in weight_parts
+    )
+    block_m = _bf16x3_block_m(m)
+    mix = torch.empty((16, m, 24), device=x.device, dtype=torch.float32)
+    sq = torch.empty((16, m), device=x.device, dtype=torch.float32)
+    _hc_mix_stats_bf16x3[(triton.cdiv(m, block_m), 16)](
+        x, *weight_parts, mix, sq, m, block_m, num_warps=4, num_stages=3
+    )
+    mixes = torch.empty((m, 24), device=x.device, dtype=torch.float32)
+    _hc_mix_stats_reduce_kernel[(triton.cdiv(m, block_m),)](
+        mix,
+        sq,
+        mixes,
+        m,
+        1.0 / 20480,
+        rms_eps,
+        MIX=24,
+        MIX_PAD=32,
+        NUM_SLICES=16,
+        BLOCK_M=block_m,
+        num_warps=4,
+    )
+    return mixes
+
+
 def hc_mix_stats_sinkhorn_bf16x3(
     x: torch.Tensor,
     weight_parts,
@@ -65,19 +115,23 @@ def hc_mix_stats_sinkhorn_bf16x3(
 
     m = x.shape[0]
     assert x.shape == (m, 20480) and x.is_contiguous()
-    assert x.dtype == torch.bfloat16 and 4096 <= m <= 65536
+    # The 16 fixed K slices keep each row's reduction order independent of M, so
+    # decode-sized batches are bitwise-identical to prefill rows. Measured best
+    # BLOCK_M is 64 for decode and 128 for prefill (both preserve that property).
+    assert x.dtype == torch.bfloat16 and 0 < m <= 65536
     assert len(weight_parts) == 3
     assert all(
         w.shape == (24, 20480) and w.dtype == torch.bfloat16 and w.is_contiguous()
         for w in weight_parts
     )
+    block_m = 64 if m <= 512 else 128
     mix = torch.empty((16, m, 24), device=x.device, dtype=torch.float32)
     sq = torch.empty((16, m), device=x.device, dtype=torch.float32)
     pre = torch.empty((m, 4), device=x.device, dtype=torch.float32)
     post = torch.empty_like(pre)
     comb = torch.empty((m, 4, 4), device=x.device, dtype=torch.float32)
-    _hc_mix_stats_bf16x3[(triton.cdiv(m, 128), 16)](
-        x, *weight_parts, mix, sq, m, 128, num_warps=4, num_stages=3
+    _hc_mix_stats_bf16x3[(triton.cdiv(m, block_m), 16)](
+        x, *weight_parts, mix, sq, m, block_m, num_warps=4, num_stages=3
     )
     _hc_mix_reduce_sinkhorn_kernel[(m,)](
         mix,
