@@ -454,18 +454,27 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
                         plan.device_pools if nextn_layers else (),
                     )
 
-    def test_unsupported_strategy_fails_with_context(self):
+    def test_mamba_requires_page_size_one(self):
         from sglang.srt.mem_cache.memory_pool import HybridLinearKVPool
 
         kvcache = HybridLinearKVPool.__new__(HybridLinearKVPool)
-        with self.assertRaisesRegex(
-            ValueError,
-            "does not support the direct external linker: _MambaStrategy",
-        ):
+        kvcache.full_attention_layer_id_mapping = {0: 0}
+        params = SimpleNamespace(
+            req_to_token_pool=SimpleNamespace(
+                mamba_pool=SimpleNamespace(
+                    mamba_cache=SimpleNamespace(
+                        temporal=torch.zeros((1, 4, 2), dtype=torch.uint8),
+                        conv=[torch.zeros((1, 4, 3), dtype=torch.uint8)],
+                    )
+                ),
+                mamba_map={0: 0},
+            ),
+        )
+        with self.assertRaisesRegex(ValueError, "requires page_size=1"):
             resolve_hybrid_device_pool_group(
                 kvcache=kvcache,
                 page_size=2,
-                params=SimpleNamespace(),
+                params=params,
                 components={ComponentType.FULL, ComponentType.MAMBA},
             )
 

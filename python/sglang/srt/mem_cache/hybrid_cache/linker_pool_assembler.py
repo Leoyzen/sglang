@@ -419,43 +419,201 @@ def _build_dsa_device_pool_group(
     return DevicePoolGroup(entries, num_layers, page_size, rank_replicated=True)
 
 
+class MambaDevicePoolEntry(DevicePoolEntry):
+    """MAMBA device pool entry carrying the duck-typed host attributes that
+    ``MooncakeStore._get_hybrid_page_component_keys`` / ``_batch_io_v2`` read
+    off a :class:`MambaPoolHost` in direct-linker mode."""
+
+    def __init__(
+        self,
+        *,
+        temporal_state_elem_size: int,
+        conv_buffers: Sequence[torch.Tensor],
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.temporal_state_elem_size = temporal_state_elem_size
+        self.conv_buffer = list(conv_buffers)
+
+
 def _build_mamba_device_pool_group(
     kvcache: Any, params: Any, page_size: int
 ) -> DevicePoolGroup:
-    full_kv_pool = kvcache.full_kv_pool
-    full_layer_mapping = dict(kvcache.full_attention_layer_id_mapping)
+    if page_size != 1:
+        raise ValueError(
+            "The Mamba direct external linker requires page_size=1 (mamba "
+            f"state is token-granular), got page_size={page_size}."
+        )
 
     mamba_pool = params.req_to_token_pool.mamba_pool
     mamba_layer_mapping = dict(params.req_to_token_pool.mamba_map)
-    mamba_cache = mamba_pool.mamba_cache
-    layers = range(mamba_pool.num_mamba_layers)
-    mamba_components = [[conv[layer] for layer in layers] for conv in mamba_cache.conv]
-    mamba_components.append([mamba_cache.temporal[layer] for layer in layers])
+    full_layer_mapping = dict(kvcache.full_attention_layer_id_mapping)
+    union_layers = sorted(set(full_layer_mapping) | set(mamba_layer_mapping))
+
+    state_components, conv_buffers, temporal_state_elem_size = (
+        _build_mamba_state_components(mamba_pool)
+    )
 
     entries = [
         DevicePoolEntry(
             name=PoolName.KV,
             indices_from_pool=PoolName.KV,
-            device_pool=full_kv_pool,
-            components=[full_kv_pool.kv_buffer],
+            device_pool=kvcache,
+            components=_mamba_kv_components(kvcache),
+            layer_mapping=full_layer_mapping,
+            page_size=page_size,
+            rows_are_pages=False,
+        ),
+        MambaDevicePoolEntry(
+            name=PoolName.MAMBA,
+            indices_from_pool=PoolName.MAMBA,
+            device_pool=mamba_pool,
+            components=state_components,
+            layer_mapping=_sorted_union_remapping(mamba_layer_mapping, union_layers),
+            page_size=1,
+            rows_are_pages=True,
+            packed=False,
+            temporal_state_elem_size=temporal_state_elem_size,
+            conv_buffers=conv_buffers,
+        ),
+    ]
+    # Not rank_replicated: the MLA KV is TP-replicated but the KDA state is not.
+    return DevicePoolGroup(
+        entries,
+        len(union_layers),
+        page_size,
+        rank_replicated=False,
+    )
+
+
+def _mamba_kv_components(kvcache: Any) -> list[Sequence[torch.Tensor]]:
+    """Full-attention buffers of a HybridLinearKVPool in component-group form."""
+    pool = kvcache.full_kv_pool
+    k_buffer = getattr(pool, "k_buffer", None)
+    if k_buffer is not None:
+        return [k_buffer, pool.v_buffer]
+    return [pool.kv_buffer]
+
+
+def _sorted_union_remapping(
+    pool_mapping: dict[int, int], union_layers: Sequence[int]
+) -> dict[int, int]:
+    """Map transfer-layer ranks to pool-side layer indices.
+
+    Transfer layers are numbered over the sorted union of component global
+    layer ids; remap each global id to its rank in that union so
+    ``get_prepared_layer_range_meta`` resolves it per transfer layer.
+    """
+    return {
+        local: pool_mapping[gid]
+        for local, gid in enumerate(union_layers)
+        if gid in pool_mapping
+    }
+
+
+def _build_mamba_state_components(
+    mamba_pool: Any,
+) -> tuple[list[list[torch.Tensor]], list[torch.Tensor], int]:
+    """Assemble the MAMBA device entry from the device MambaPool buffers."""
+    state = mamba_pool.mamba_cache
+    # Slot-first component order must match
+    # MooncakeStore._get_hybrid_page_component_keys: temporal first, then
+    # conv_0..conv_n; MambaPoolHost.get_page_buffer_meta drops the temporal
+    # object for conv-only models (0-size state), mirror that here.
+    temporal_state_elem_size = (
+        int(
+            state.temporal.numel()
+            // state.temporal.shape[0]
+            // max(1, state.temporal.shape[1])
+        )
+        if state.temporal.numel()
+        else 0
+    )
+    components: list[list[torch.Tensor]] = []
+    conv_buffers: list[torch.Tensor] = []
+    if temporal_state_elem_size > 0:
+        components.append(
+            [state.temporal[layer] for layer in range(state.temporal.shape[0])]
+        )
+    for conv in state.conv:
+        conv_buffers.append(conv)
+        components.append([conv[layer] for layer in range(conv.shape[0])])
+    if not components:
+        raise ValueError("Mamba pool has neither temporal nor conv state buffers.")
+    return components, conv_buffers, temporal_state_elem_size
+
+
+def _build_mamba_swa_device_pool_group(
+    kvcache: Any, params: Any, page_size: int
+) -> DevicePoolGroup:
+    """Defensive variant for SWA + Mamba hybrid stacks (KV + SWA + MAMBA)."""
+    if page_size != 1:
+        raise ValueError(
+            "The Mamba direct external linker requires page_size=1 (mamba "
+            f"state is token-granular), got page_size={page_size}."
+        )
+
+    from sglang.srt.mem_cache.hybrid_cache.hybrid_pool_assembler import (
+        _swa_layer_mappings,
+    )
+
+    mamba_pool = params.req_to_token_pool.mamba_pool
+    mamba_layer_mapping = dict(params.req_to_token_pool.mamba_map)
+    full_layer_mapping, swa_layer_mapping = _swa_layer_mappings(kvcache)
+    union_layers = sorted(
+        set(full_layer_mapping) | set(swa_layer_mapping) | set(mamba_layer_mapping)
+    )
+
+    state_components, conv_buffers, temporal_state_elem_size = (
+        _build_mamba_state_components(mamba_pool)
+    )
+
+    full_pool = kvcache.full_kv_pool
+    swa_pool = kvcache.swa_kv_pool
+
+    def kv_components(pool: Any) -> list[Sequence[torch.Tensor]]:
+        k_buffer = getattr(pool, "k_buffer", None)
+        if k_buffer is not None:
+            return [k_buffer, pool.v_buffer]
+        return [pool.kv_buffer]
+
+    entries = [
+        DevicePoolEntry(
+            name=PoolName.KV,
+            indices_from_pool=PoolName.KV,
+            device_pool=full_pool,
+            components=kv_components(full_pool),
             layer_mapping=full_layer_mapping,
             page_size=page_size,
             rows_are_pages=False,
         ),
         DevicePoolEntry(
+            name=PoolName.SWA,
+            indices_from_pool=PoolName.SWA,
+            device_pool=swa_pool,
+            components=kv_components(swa_pool),
+            layer_mapping=swa_layer_mapping,
+            page_size=page_size,
+            rows_are_pages=False,
+        ),
+        MambaDevicePoolEntry(
             name=PoolName.MAMBA,
             indices_from_pool=PoolName.MAMBA,
             device_pool=mamba_pool,
-            components=mamba_components,
-            layer_mapping=mamba_layer_mapping,
-            # One row per state slot, addressed by slot id, not token position.
+            components=state_components,
+            layer_mapping=_sorted_union_remapping(mamba_layer_mapping, union_layers),
             page_size=1,
             rows_are_pages=True,
+            packed=False,
+            temporal_state_elem_size=temporal_state_elem_size,
+            conv_buffers=conv_buffers,
         ),
     ]
-    # Not rank_replicated: the MLA KV is TP-replicated but the KDA state is not.
     return DevicePoolGroup(
-        entries, len(full_layer_mapping | mamba_layer_mapping), page_size
+        entries,
+        len(union_layers),
+        page_size,
+        rank_replicated=False,
     )
 
 

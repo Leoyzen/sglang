@@ -653,6 +653,9 @@ class MambaComponent(TreeComponent):
         node: Optional[UnifiedTreeNode],
         keys: Optional[Sequence[str]],
     ) -> Optional[PoolTransfer]:
+        # Mamba keeps ONE state slot per tree node, keyed by the node's last
+        # page hash (same key space as build_hicache_transfers BACKUP_STORAGE),
+        # so every phase reduces the page-granular tail to its trailing hash.
         # int8 checkpoints live in mamba_ckpt_pool, which the linker's device
         # pool group does not map; their slot ids would address the wrong buffer.
         if self.int8_ckpt_pool is not None:
