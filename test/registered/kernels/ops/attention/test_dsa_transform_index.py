@@ -199,6 +199,24 @@ class TestDSATransformIndex(CustomTestCase):
         self.assertFalse(stride_param.is_constexpr)
         self.assertTrue(stride_param.do_not_specialize)
 
+    def test_width_bound_is_not_specialized(self):
+        # Expanded EAGLE tables give every context length its own column
+        # width; a constexpr PAGE_TABLE_WIDTH recompiled the kernel per
+        # width. The bound must be a runtime scalar (do_not_specialize) in
+        # BOTH kernels.
+        for kernel_name in (
+            "transform_index_page_table_prefill_kernel",
+            "transform_index_page_table_decode_kernel",
+        ):
+            with self.subTest(kernel=kernel_name):
+                kernel = getattr(transform_index_module, kernel_name)
+                width_param = next(
+                    param for param in kernel.params if param.name == "page_table_width"
+                )
+
+                self.assertFalse(width_param.is_constexpr)
+                self.assertTrue(width_param.do_not_specialize)
+
     def test_prefill_dynamic_page_table_row_strides(self):
         context_lengths = (4096, 4160, 4224)
         kernel = transform_index_module.transform_index_page_table_prefill_kernel

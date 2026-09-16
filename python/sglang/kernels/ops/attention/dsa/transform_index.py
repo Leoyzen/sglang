@@ -94,11 +94,16 @@ def _allocate_prefill_result(
     return result
 
 
-@triton.jit
+# The OOB width bound must not bake into the cubin: expanded EAGLE page
+# tables (and kpool-tail widening) give every context length its own
+# table width, and a constexpr would recompile the kernel per width.
+# Bind it as a runtime scalar like page_table_stride_0 below.
+@triton.jit(do_not_specialize=["page_table_width"])
 def transform_index_page_table_decode_kernel(
     page_table_ptr: torch.Tensor,
     topk_indices_ptr: torch.Tensor,
     result_ptr: torch.Tensor,
+    page_table_width,
     page_size: tl.constexpr,
     page_table_row_stride: tl.constexpr,
 ):
@@ -110,7 +115,9 @@ def transform_index_page_table_decode_kernel(
 
     offset = tl.arange(0, TOPK)  # topk should be 2048
     loaded_topk_indices = tl.load(topk_indices_ptr + offset)
-    mask = loaded_topk_indices >= 0
+    # OOB guard only: the width is THAT table's own column domain, not a
+    # folded/derived width -- masking on anything narrower would drop owned rows.
+    mask = (loaded_topk_indices >= 0) & (loaded_topk_indices < page_table_width)
     loaded_kv_indices = tl.load(page_table_ptr + loaded_topk_indices, mask=mask)
     tl.store(result_ptr + offset, loaded_kv_indices, mask=mask)
     tl.store(result_ptr + offset, -1, mask=~mask)
@@ -119,13 +126,16 @@ def transform_index_page_table_decode_kernel(
 # Expanded EAGLE page tables are contiguous, so their row stride changes with
 # the exact context length. Treating it as constexpr creates one cubin per
 # observed length and grows the loaded-module set in long-lived processes.
-@triton.jit(do_not_specialize=["page_table_stride_0"])
+# The OOB width bound is runtime-bound for the same reason: the table's
+# column domain tracks the context length too.
+@triton.jit(do_not_specialize=["page_table_stride_0", "page_table_width"])
 def transform_index_page_table_prefill_kernel(
     page_table_ptr: torch.Tensor,
     topk_indices_ptr: torch.Tensor,
     cu_seqlens_q_ptr: torch.Tensor,
     result_ptr: torch.Tensor,
     page_table_stride_0,
+    page_table_width,
     page_table_stride_1: tl.constexpr,
     topk_indices_stride_0: tl.constexpr,
     topk_indices_stride_1: tl.constexpr,
@@ -155,7 +165,9 @@ def transform_index_page_table_prefill_kernel(
         mask=mask,
         other=-1,
     )
-    valid_topk_mask = mask & (loaded_topk_indices >= 0)
+    valid_topk_mask = (
+        mask & (loaded_topk_indices >= 0) & (loaded_topk_indices < page_table_width)
+    )
 
     if PAGE_TABLE_IS_EXPANDED:
         page_table_rows = token_indices
@@ -204,6 +216,10 @@ def transform_index_page_table_decode_fast(
         page_table,
         topk_indices,
         result,
+        # Runtime-bound OOB guard: THIS table's own column domain (an OOB
+        # guard, not a semantic width). Runtime binding avoids a recompile
+        # per table width.
+        page_table.shape[1],
         page_size,
         page_table_row_stride=page_table.stride(0),
     )
@@ -220,7 +236,17 @@ def transform_index_page_table_prefill_fast(
     cu_seqlens_q: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     assert page_size == 1
-    assert topk_indices.shape[1] == 2048
+    # DSA prefill topk width is index_topk (2048) plus, for kpool indexers
+    # (e.g. GLM-5.3-Flash, index_kpool > 1), up to index_kpool - 1 appended
+    # live tail-token columns in the same physical-slot index space (see
+    # append_kpool_tail_to_topk in kpool_fp8_index.py). The triton kernel is
+    # variable-width (TOPK constexpr from shape[1]; grid axis 2 spans the full
+    # width), and downstream prefill impls (tilelang pads to 64-col blocks,
+    # fa3 clamps) already accept the widened table. Keep the >= 2048 floor to
+    # catch layout regressions.
+    assert topk_indices.shape[1] >= 2048, (
+        f"expected prefill topk width >= 2048, got {topk_indices.shape[1]}"
+    )
     real_num_tokens = sum(extend_lens_cpu)
     result = _allocate_prefill_result(topk_indices, real_num_tokens, output_num_tokens)
     if real_num_tokens == 0:
@@ -246,6 +272,10 @@ def transform_index_page_table_prefill_fast(
         cu_seqlens_q,
         result,
         page_table.stride(0),
+        # Runtime-bound OOB guard: THIS table's own column domain (an OOB
+        # guard, not a semantic width). Runtime binding avoids a recompile
+        # per table width.
+        page_table.shape[1],
         page_table.stride(1),
         topk_indices.stride(0),
         topk_indices.stride(1),
@@ -271,13 +301,14 @@ def transform_index_page_table_decode_ref(
     if result is None:
         result = torch.empty_like(topk_indices, dtype=torch.int32)
     assert result.shape == topk_indices.shape
+    valid_topk_mask = (topk_indices >= 0) & (topk_indices < page_table.shape[1])
     torch.gather(
         page_table.to(result.dtype),
         dim=1,
-        index=topk_indices.clamp(min=0),
+        index=topk_indices.clamp(min=0, max=page_table.shape[1] - 1),
         out=result,
     )
-    result[topk_indices < 0] = -1
+    result[~valid_topk_mask] = -1
     return result
 
 
