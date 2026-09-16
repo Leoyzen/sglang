@@ -4,6 +4,7 @@ import unittest
 from unittest.mock import patch
 
 import torch
+import triton
 
 from sglang.kernels.ops.quantization import fp8_kernel
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -107,6 +108,73 @@ class TestHopperBlockFP8SwapAB(CustomTestCase):
                     rtol=0.008 if split_k else 0,
                     atol=0.0001 if split_k else 0,
                 )
+
+
+def _specialization_count(kernel):
+    """Number of compiled variants Triton is holding for `kernel`."""
+    device_caches = getattr(kernel, "device_caches", None) or {}
+    return sum(len(cache[0]) for cache in device_caches.values())
+
+
+@unittest.skipUnless(
+    torch.cuda.is_available() and torch.cuda.get_device_capability() == (9, 0),
+    "Hopper required",
+)
+class TestSplitKReduceSpecialization(CustomTestCase):
+    """The split-K reduce must not mint a variant per token count.
+
+    `elements` (= M*N) and `splits` (= SPLIT_K) are runtime arguments precisely
+    so that a decode step whose M changes -- which under speculative decoding is
+    nearly every step -- reuses one compiled variant instead of paying a fresh
+    ~2s serving-time compile. Making either one a tl.constexpr again would
+    reintroduce the stall without failing any correctness assertion, so pin the
+    count directly.
+    """
+
+    def test_one_variant_per_split_k_regardless_of_M(self):
+        from sglang.kernels.ops.quantization.fp8_kernel import (
+            _reduce_block_fp8_split_k,
+        )
+
+        n, split_k = 512, 8
+        distinct_ms = [1, 2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47]
+
+        # Measure the delta, not the absolute count: other tests in this module
+        # also reach this kernel, so the cache is not necessarily empty here.
+        before = _specialization_count(_reduce_block_fp8_split_k)
+        for m in distinct_ms:
+            parts = torch.randn(split_k, m, n, device="cuda")
+            out = torch.empty(m, n, device="cuda")
+            _reduce_block_fp8_split_k[(triton.cdiv(m * n, 256),)](
+                parts, out, m * n, split_k, 256
+            )
+            torch.testing.assert_close(out, parts.sum(0), atol=1e-3, rtol=1e-4)
+        compiled = _specialization_count(_reduce_block_fp8_split_k) - before
+
+        # At most one new variant: zero if this SPLIT_K was already compiled by
+        # an earlier test, one if not. What must never happen is one per M.
+        self.assertLessEqual(
+            compiled,
+            1,
+            f"{len(distinct_ms)} distinct M values compiled {compiled} new "
+            "variants; elements/splits must stay runtime arguments.",
+        )
+
+    def test_masks_splits_beyond_split_k(self):
+        """Padding rows past `splits` must be masked, not read."""
+        from sglang.kernels.ops.quantization.fp8_kernel import (
+            _MAX_SPLIT_K,
+            _reduce_block_fp8_split_k,
+        )
+
+        m, n, split_k = 8, 64, 4
+        parts = torch.full((_MAX_SPLIT_K, m, n), float("nan"), device="cuda")
+        parts[:split_k] = 1.0
+        out = torch.empty(m, n, device="cuda")
+        _reduce_block_fp8_split_k[(triton.cdiv(m * n, 256),)](
+            parts, out, m * n, split_k, 256
+        )
+        torch.testing.assert_close(out, torch.full_like(out, float(split_k)))
 
 
 if __name__ == "__main__":
