@@ -3398,15 +3398,19 @@ class DeepseekV4AttnBackend(
             # _candidate_scores_kernel keys its specialization on WIDTH/STRIDE/
             # BLOCKS, so scoring the raw per-request lc would compile a new kernel
             # for every new prompt length. Round the score width up to a power of
-            # two so init-time warmup can cover every specialization. The padded
-            # columns are -inf, so their blocks are never selected and every
-            # downstream width (scores, published mask, consumer mask) stays on
-            # the same bucket, keeping the publish/consume contract aligned.
+            # two so init-time warmup can cover every specialization. Only the
+            # published mask drops the padding to the exact lc width; consumers
+            # mask the prefix the publisher covered. Padded columns are -inf, so
+            # they are result-neutral.
             bucket = _sm90_prefill_score_bucket(lc, indexer.candidate_block_size)
             # Bound the materialized fp32 score rows; the fused kernel avoids the
             # much larger [rows, heads, lc] bf16 intermediate of the torch path.
             rows_per_chunk = max(1, _TORCH_INDEXER_SCORE_BUDGET_BYTES // (bucket * 4))
-            masks = [] if publish is not None else None
+            mask_b = (
+                torch.empty((q_len, lc), dtype=torch.bool, device=pos.device)
+                if publish is not None
+                else None
+            )
             for start in range(0, q_len, rows_per_chunk):
                 stop = min(q_len, start + rows_per_chunk)
                 token_rows = slice(row_base + start, row_base + stop)
@@ -3427,20 +3431,25 @@ class DeepseekV4AttnBackend(
                         (0, bucket - scores.shape[1]),
                         value=float("-inf"),
                     )
-                if masks is not None:
-                    # Keep the bucket width: the consumer of this mask scores the
-                    # same request at the same bucket, so publish/consume widths
-                    # stay aligned (the padded columns are all -inf).
-                    masks.append(
-                        select_candidate_blocks(
-                            scores,
-                            lens_c[:, None],
-                            topk_blocks=indexer.candidate_topk_blocks,
-                            block_size=indexer.candidate_block_size,
-                        )
-                    )
+                if mask_b is not None:
+                    # Score at bucket width for kernel-specialization control, but
+                    # publish only the real columns: the retained mask is the
+                    # dominant transient here (1 B per row per compressed token),
+                    # and the padded columns are all -inf anyway.
+                    mask_b[local_rows] = select_candidate_blocks(
+                        scores,
+                        lens_c[:, None],
+                        topk_blocks=indexer.candidate_topk_blocks,
+                        block_size=indexer.candidate_block_size,
+                    )[..., :lc]
                 elif consume is not None:
-                    scores.masked_fill_(~consume[b][local_rows], -torch.inf)
+                    # The publisher now stores exactly `lc` columns, so mask the
+                    # score prefix it covers. Columns past it are already -inf
+                    # from the padding above and are unreachable via lens_c.
+                    consume_mask = consume[b][local_rows]
+                    scores[:, : consume_mask.shape[1]].masked_fill_(
+                        ~consume_mask, -torch.inf
+                    )
                 idx = torch.empty(
                     (scores.shape[0], k), dtype=torch.int32, device=scores.device
                 )
@@ -3450,7 +3459,7 @@ class DeepseekV4AttnBackend(
                     out_offsets=topk_offsets[token_rows],
                     out_indices=idx,
                 )
-                if consume is not None and masks is None:
+                if consume is not None and mask_b is None:
                     idx = mask_topk_scores(scores, idx)
                 unselected = torch.iinfo(torch.int32).max
                 idx = idx.masked_fill(idx < 0, unselected).sort(dim=-1).values
@@ -3462,8 +3471,8 @@ class DeepseekV4AttnBackend(
                     raw_indices[token_rows, :k] = torch.where(reach, idx, -1).to(
                         torch.int32
                     )
-            if masks is not None:
-                publish.append(torch.cat(masks) if len(masks) > 1 else masks[0])
+            if mask_b is not None:
+                publish.append(mask_b)
             row_base += q_len
 
         # MLP-sync token padding (ForwardBatch._pad_inputs_to_size) can append
