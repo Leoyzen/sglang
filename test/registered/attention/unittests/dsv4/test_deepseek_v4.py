@@ -12,6 +12,7 @@ extra-K softmax reference. Compressor math correctness (i.e. verifying the
 gate+norm+rotate compression itself) is a deferred follow-up.
 """
 
+import contextlib
 import importlib.util
 import unittest
 from types import SimpleNamespace
@@ -1220,6 +1221,378 @@ class TestDSV41PrefillScoreBucket(CustomTestCase):
             after_aligned,
             "misaligned LENS compiled an extra _candidate_scores_kernel specialization",
         )
+
+
+class TestDSV41SM90ExtendMaskPublication(CustomTestCase):
+    """The SM90 extend indexer publishes an exact-``lc`` mask, not the bucket.
+
+    Scoring keeps the power-of-two bucket so ``_candidate_scores_kernel`` stays
+    on the init-time warmed specializations, but the published candidate mask
+    used to be bucket-wide and was assembled by ``torch.cat``-ing the per-chunk
+    masks: at the production width (``lc ~ 271k``, ``bucket 524288``) that
+    retained 4 GiB and doubled it transiently against ~2 GiB of free memory.
+    The publisher now preallocates one ``[q_len, lc]`` bool tensor, writes each
+    chunk in place, and consumers mask only the prefix the publisher covered.
+    These CPU tests drive ``_low_ratio_index_topk_sm90_extend`` directly with
+    the GPU-only kernels mocked and pin the width, the chunked in-place writes,
+    and the narrowed consume contract.
+    """
+
+    _RATIO = 2
+    _BLOCK_SIZE = 32
+    _TOPK_BLOCKS = 2
+    _INDEX_TOPK = 3
+    _SPIKE = 5000.0
+
+    @classmethod
+    def _score_rows(cls, global_rows, lc, lens, *, spike_col=False):
+        rows = global_rows.to(torch.int64).unsqueeze(1)
+        cols = torch.arange(lc, dtype=torch.int64).unsqueeze(0)
+        base = ((cols * 5 + rows * 7) % 13).to(torch.float32)
+        # One preferred block per row keeps the selected mask row-dependent, so
+        # a dropped or reordered chunk cannot pass the equality checks below.
+        blocks = max(1, lc // cls._BLOCK_SIZE)
+        base = torch.where(
+            cols // cls._BLOCK_SIZE == rows % blocks,
+            torch.full_like(base, 1000.0),
+            base,
+        )
+        if spike_col:
+            base = torch.where(cols == 0, torch.full_like(base, cls._SPIKE), base)
+        return base.masked_fill(cols >= lens.unsqueeze(1), -torch.inf)
+
+    @classmethod
+    def _select_reference(cls, global_rows, lc, lens, bucket):
+        from sglang.srt.layers.attention.dsv4.indexer import select_candidate_blocks
+
+        scores = cls._score_rows(global_rows, lc, lens)
+        padded = F.pad(scores, (0, bucket - lc), value=float("-inf"))
+        return select_candidate_blocks(
+            padded,
+            lens[:, None],
+            topk_blocks=cls._TOPK_BLOCKS,
+            block_size=cls._BLOCK_SIZE,
+        )[..., :lc]
+
+    @classmethod
+    def _make_case(cls, q_lens, seq_lens, *, is_candidate_source, uses_candidates):
+        from sglang.srt.layers.attention import deepseek_v4_backend as module
+
+        num_reqs = len(q_lens)
+        total_rows = sum(q_lens)
+        max_seq = max(seq_lens)
+        pos = torch.cat(
+            [
+                torch.full((q_len,), seq_len - 1, dtype=torch.int64)
+                for q_len, seq_len in zip(q_lens, seq_lens)
+            ]
+        )
+        q_lora = torch.arange(total_rows, dtype=torch.float32).unsqueeze(1)
+        page_indices = torch.full((total_rows, cls._INDEX_TOPK), -1, dtype=torch.int32)
+        raw_indices = torch.full_like(page_indices, -1)
+        core = SimpleNamespace(
+            sparse_page_indices=lambda _: page_indices,
+            sparse_raw_indices=lambda _: raw_indices,
+        )
+        backend = object.__new__(module.DeepseekV4AttnBackend)
+        backend.forward_metadata = module.DSV4Metadata(
+            core_attn_metadata=core, indexer_metadata=None
+        )
+        backend.req_to_token = torch.arange(max_seq, dtype=torch.int64).repeat(
+            num_reqs, 1
+        )
+        backend.token_to_kv_pool = SimpleNamespace(
+            get_index_k_with_scale_buffer=lambda _: torch.zeros(
+                (1, 64 * 68), dtype=torch.uint8
+            )
+        )
+        indexer = SimpleNamespace(
+            queries=lambda q, _: q,
+            head_weights=lambda t: t,
+            candidate_topk_blocks=cls._TOPK_BLOCKS,
+            candidate_block_size=cls._BLOCK_SIZE,
+            index_topk=cls._INDEX_TOPK,
+            is_candidate_source=is_candidate_source,
+            uses_candidates=uses_candidates,
+        )
+        layer = SimpleNamespace(
+            indexer=indexer,
+            freqs_cis=torch.zeros(max_seq, 1),
+            compress_ratio=cls._RATIO,
+            layer_id=20,
+        )
+        forward_batch = SimpleNamespace(
+            forward_mode=ForwardMode.EXTEND,
+            extend_seq_lens_cpu=torch.tensor(q_lens, dtype=torch.int32),
+            seq_lens_cpu=torch.tensor(seq_lens, dtype=torch.int32),
+            req_pool_indices=torch.arange(num_reqs, dtype=torch.int64),
+        )
+        return (
+            backend,
+            layer,
+            q_lora,
+            q_lora.clone(),
+            pos,
+            forward_batch,
+            page_indices,
+            raw_indices,
+        )
+
+    def _run_extend(
+        self,
+        q_lens,
+        seq_lens,
+        *,
+        is_candidate_source,
+        uses_candidates,
+        consume_masks=None,
+        score_budget=None,
+        spike_col=False,
+        spy_select=False,
+        spy_cat=False,
+    ):
+        from sglang.srt.layers.attention import deepseek_v4_backend as module
+
+        (
+            backend,
+            layer,
+            q_lora,
+            x,
+            pos,
+            forward_batch,
+            page_indices,
+            raw_indices,
+        ) = self._make_case(
+            q_lens,
+            seq_lens,
+            is_candidate_source=is_candidate_source,
+            uses_candidates=uses_candidates,
+        )
+        captured = {"scores": []}
+
+        def score(q_fp8, weights, index_k, lens):
+            lc = int(lens.max().item())
+            return self._score_rows(q_fp8[:, 0], lc, lens, spike_col=spike_col)
+
+        def ragged(scores, lens, *, out_offsets, out_indices, row_starts=None):
+            captured["scores"].append(scores.clone())
+            out_indices.fill_(-1)
+            k = out_indices.shape[1]
+            for i in range(scores.shape[0]):
+                n = int(lens[i].item())
+                values, chosen = scores[i, :n].topk(k)
+                keep = values > -torch.inf
+                out_indices[i, : int(keep.sum())] = chosen[keep].to(torch.int32)
+
+        real_select = module.select_candidate_blocks
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(
+                mock.patch.object(
+                    module,
+                    "unpack_fp4_index_keys_to_fp8",
+                    return_value=torch.zeros(1, 1),
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    module, "quantize_bf16_index_queries_fp8", side_effect=lambda t: t
+                )
+            )
+            stack.enter_context(
+                mock.patch.object(module, "fp8_index_logits_prefill", side_effect=score)
+            )
+            stack.enter_context(
+                mock.patch.object(
+                    module, "topk_transform_ragged_v2", side_effect=ragged
+                )
+            )
+            if consume_masks is not None:
+                stack.enter_context(
+                    mock.patch.object(
+                        module,
+                        "published_masks",
+                        return_value=module.CandidateMasks(request_masks=consume_masks),
+                    )
+                )
+            if score_budget is not None:
+                stack.enter_context(
+                    mock.patch.object(
+                        module, "_TORCH_INDEXER_SCORE_BUDGET_BYTES", score_budget
+                    )
+                )
+            if spy_select:
+                captured["select"] = stack.enter_context(
+                    mock.patch.object(
+                        module, "select_candidate_blocks", side_effect=real_select
+                    )
+                )
+            if spy_cat:
+                captured["cat"] = stack.enter_context(
+                    mock.patch.object(torch, "cat", side_effect=torch.cat)
+                )
+            backend._low_ratio_index_topk_sm90_extend(
+                layer, x, q_lora, pos, forward_batch
+            )
+        return backend, captured, page_indices, raw_indices
+
+    def test_published_mask_is_exact_lc_width_not_the_bucket(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            _sm90_prefill_score_bucket,
+        )
+
+        q_len, lc = 4, 100
+        seq_len = lc * self._RATIO
+        bucket = _sm90_prefill_score_bucket(lc, self._BLOCK_SIZE)
+        # The pin is only meaningful when the bucket actually differs from lc.
+        self.assertEqual(bucket, 128)
+        self.assertNotEqual(bucket, lc)
+
+        backend, _, _, _ = self._run_extend(
+            [q_len], [seq_len], is_candidate_source=True, uses_candidates=False
+        )
+
+        masks = backend.forward_metadata.candidate_metadata.request_masks
+        self.assertEqual(len(masks), 1)
+        self.assertEqual(tuple(masks[0].shape), (q_len, lc))
+        self.assertNotEqual(
+            tuple(masks[0].shape),
+            (q_len, bucket),
+            "published mask kept the score bucket instead of the exact lc width",
+        )
+
+        lens = torch.full((q_len,), lc, dtype=torch.int32)
+        expected = self._select_reference(torch.arange(q_len), lc, lens, bucket)
+        self.assertTrue(torch.equal(masks[0], expected))
+        self.assertGreater(
+            len({tuple(row.tolist()) for row in expected}),
+            1,
+            "rows must be distinguishable for the content pin to mean anything",
+        )
+
+    def test_chunked_writes_preserve_row_order_without_cat(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            _sm90_prefill_score_bucket,
+        )
+
+        q_len, lc = 5, 257
+        seq_len = lc * self._RATIO
+        bucket = _sm90_prefill_score_bucket(lc, self._BLOCK_SIZE)
+        rows_per_chunk = 2
+        budget = rows_per_chunk * bucket * 4
+
+        backend, captured, _, _ = self._run_extend(
+            [q_len],
+            [seq_len],
+            is_candidate_source=True,
+            uses_candidates=False,
+            score_budget=budget,
+            spy_select=True,
+            spy_cat=True,
+        )
+        # The patched budget must actually split the request into chunks.
+        self.assertGreater(captured["select"].call_count, 1)
+
+        masks = backend.forward_metadata.candidate_metadata.request_masks
+        self.assertEqual(len(masks), 1)
+        lens = torch.full((q_len,), lc, dtype=torch.int32)
+        expected = torch.cat(
+            [
+                self._select_reference(
+                    torch.arange(start, min(q_len, start + rows_per_chunk)),
+                    lc,
+                    lens[start : min(q_len, start + rows_per_chunk)],
+                    bucket,
+                )
+                for start in range(0, q_len, rows_per_chunk)
+            ]
+        )
+        self.assertTrue(torch.equal(masks[0], expected))
+        self.assertEqual(
+            len({tuple(row.tolist()) for row in expected}),
+            q_len,
+            "rows must be distinguishable for the order pin to mean anything",
+        )
+
+        mask_cats = [
+            call
+            for call in captured["cat"].call_args_list
+            if len(call.args[0]) > 1
+            and all(t.dtype == torch.bool for t in call.args[0])
+        ]
+        self.assertEqual(mask_cats, [], "published mask was still built with torch.cat")
+
+    def test_consumer_masks_only_the_published_prefix(self):
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            _sm90_prefill_score_bucket,
+        )
+
+        q_len, lc = 4, 100
+        seq_len = lc * self._RATIO
+        bucket = _sm90_prefill_score_bucket(lc, self._BLOCK_SIZE)
+        lens = torch.full((q_len,), lc, dtype=torch.int32)
+
+        consume = torch.ones((q_len, lc), dtype=torch.bool)
+        consume[:, 0] = False  # the row's unique best column is masked out
+        consume[0, 1] = False  # and one interior column, so it is not a prefix
+
+        # Control: with no mask at all the spike column 0 wins the top-k.
+        _, _, _, control_raw = self._run_extend(
+            [q_len],
+            [seq_len],
+            is_candidate_source=False,
+            uses_candidates=False,
+            spike_col=True,
+        )
+        self.assertTrue((control_raw == 0).any())
+
+        _, captured, _, raw = self._run_extend(
+            [q_len],
+            [seq_len],
+            is_candidate_source=False,
+            uses_candidates=True,
+            consume_masks=[consume],
+            spike_col=True,
+        )
+        seen = captured["scores"][0]
+        # Scores keep the bucket width; the published prefix is masked and the
+        # padding past it stays -inf.
+        self.assertEqual(seen.shape[1], bucket)
+        self.assertTrue(torch.isneginf(seen[:, lc:]).all())
+        reference = self._score_rows(
+            torch.arange(q_len), lc, lens, spike_col=True
+        ).masked_fill(~consume, -torch.inf)
+        self.assertTrue(torch.equal(seen[:, :lc], reference))
+        for row in range(q_len):
+            chosen = raw[row][raw[row] >= 0]
+            self.assertTrue(consume[row][chosen].all())
+        self.assertFalse((raw == 0).any(), "a masked-out column was selected")
+
+        # A bucket-wide mask (the pre-fix shape, padded False past lc) selects
+        # exactly the same columns.
+        _, _, _, raw_full = self._run_extend(
+            [q_len],
+            [seq_len],
+            is_candidate_source=False,
+            uses_candidates=True,
+            consume_masks=[F.pad(consume, (0, bucket - lc), value=False)],
+            spike_col=True,
+        )
+        torch.testing.assert_close(raw_full, raw)
+
+    def test_empty_requests_keep_published_list_aligned(self):
+        q_lens = [2, 3, 0, 2]
+        seq_lens = [200, 1, 200, 400]
+
+        backend, _, _, _ = self._run_extend(
+            q_lens, seq_lens, is_candidate_source=True, uses_candidates=False
+        )
+
+        masks = backend.forward_metadata.candidate_metadata.request_masks
+        self.assertEqual(len(masks), len(q_lens))
+        self.assertEqual(tuple(masks[0].shape), (2, 100))
+        self.assertEqual(tuple(masks[1].shape), (0, 0))  # lc == 0
+        self.assertEqual(tuple(masks[2].shape), (0, 0))  # q_len == 0
+        self.assertEqual(tuple(masks[3].shape), (2, 200))
 
 
 if __name__ == "__main__":
