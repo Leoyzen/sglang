@@ -152,6 +152,11 @@ def _cache_for_wrapper(**kwargs):
         "write_through_threshold": 256,
         "pp_size": 1,
         "pp_group": None,
+        # _probe_agreement_needed reads these; the real UnifiedRadixCache
+        # defines all three (unified_radix_cache.py), so this is fake skew.
+        "attn_cp_group": None,
+        "attn_tp_group": None,
+        "tp_world_size": 1,
     }
     defaults.update(kwargs)
     return SimpleNamespace(**defaults)
@@ -185,14 +190,30 @@ def test_cache_linker_attachment_is_backend_independent():
     assert cache.linker.layer_done_counter is linker.layer_done_counter
 
 
-@pytest.mark.parametrize("component_type", [ComponentType.MAMBA, ComponentType.C128])
+@pytest.mark.parametrize("component_type", [ComponentType.C128])
 def test_cache_linker_rejects_unsupported_tree_components(component_type):
+    """Only components outside _EXTERNAL_LINKER_SUPPORTED_COMPONENTS are
+    rejected; MAMBA is supported (see the acceptance test below)."""
     cache = _cache_for_wrapper(tree_components=(ComponentType.FULL, component_type))
 
     with pytest.raises(ValueError, match=component_type.name):
         UnifiedCacheLinkerWrapper(cache, _FakeLinker())
 
     assert not cache.tree_core.enable_external_cache_linker
+
+
+def test_cache_linker_accepts_mamba_tree_component():
+    """MAMBA is supported by the external linker (see
+    _EXTERNAL_LINKER_SUPPORTED_COMPONENTS); only genuinely unsupported
+    components like C128 are rejected."""
+    cache = _cache_for_wrapper(
+        tree_components=(ComponentType.FULL, ComponentType.MAMBA),
+        token_to_kv_pool_allocator=_swa_allocator(None),
+    )
+    wrapper = UnifiedCacheLinkerWrapper(cache, _FakeLinker())
+
+    assert wrapper is not None
+    assert cache.tree_core.enable_external_cache_linker
 
 
 class _InMemoryUnifiedCacheLinker(UnifiedCacheLinker):
@@ -1138,6 +1159,9 @@ def full_linker_component():
 
     return SimpleNamespace(
         component_type=ComponentType.FULL,
+        # Read by _update_load's COMMIT adoption filter; base.py defaults it
+        # to True for non-MAMBA components.
+        linker_indices_are_paged=True,
         build_external_linker_transfer=MagicMock(side_effect=build_transfer),
         update_external_linker_load=lambda phase, req, full_transfer, transfer, prefix_len, **kwargs: (
             transfer
