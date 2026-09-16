@@ -482,6 +482,17 @@ class UnifiedTreeCoreInterface(ABC):
         ...
 
     @abstractmethod
+    def build_backup_action(
+        self, node_id: NodeId, write_back: bool = False
+    ) -> BackupKV:
+        """Build a backup action for a node and any not-yet-persisted ancestors.
+
+        Write-through chains are emitted ancestor-first; the node itself is the
+        only entry when ``write_back`` is set (single eviction victim).
+        """
+        ...
+
+    @abstractmethod
     def build_storage_backup_spec(
         self, node_id: NodeId, pass_prefix_keys: bool
     ) -> Optional[StorageBackupSpec]:

@@ -21,6 +21,7 @@ from test_unified_radix_cache_unittest import (
 from sglang.srt.managers.schedule_batch import ReqKvInfo
 from sglang.srt.mem_cache.allocator.swa import SWATokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import (
+    DecLockRefParams,
     InitLoadBackParams,
     InsertResult,
     MatchPrefixParams,
@@ -424,6 +425,87 @@ class TestUnifiedCacheLinkerPythonBackend(_TreeCoreBackendTestMixin, _InsertWalk
         self.assertEqual(final_match.device_indices.numel(), len(tokens))
         self.assertEqual(consumer_linker.offload_calls, [])
         consumer.sanity_check()
+
+    def test_chunked_unfinished_req_offloads_without_inflating_hit_count(self):
+        cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
+        self.cfg = cfg
+        cache, allocator, req_to_token_pool = build_fixture(cfg)
+        linker = _InMemoryUnifiedCacheLinker()
+        cache.init_cache_linker(linker)
+
+        req = self._make_req(req_to_token_pool)
+        tokens = self._make_seq(1, 3)
+        req.origin_input_ids = array("q", tokens)
+        req.output_ids = array("q")
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.set_extend_range(0, len(tokens))
+        kv_len = len(tokens)
+        kv_indices = self._alloc(allocator, kv_len)
+        req_to_token_pool.write((req.kv.req_pool_idx, slice(0, kv_len)), kv_indices)
+        req.kv.kv_committed_len = kv_len
+        req.last_node = cache.root_node_handle()
+        req.kv.cache_protected_len = 0
+        req.lock_receipt = DecLockRefParams()
+        req.extra_key = None
+
+        # A chunked insert is otherwise ineligible for the hit-count driven
+        # write-through path (#9776 skips the counter for chunked inserts), so
+        # the eager offload in cache_unfinished_req is the only thing that can
+        # push this prefix to L3.
+        cache.cache_unfinished_req(req, chunked=True)
+
+        self.assertEqual(len(linker.offload_calls), 1)
+        (kv_offload,) = linker.offload_calls[0]
+        self.assertEqual(kv_offload.name, PoolName.KV)
+        node = req.last_node
+        self.assertEqual(kv_offload.keys, cache.tree_core.get_hash_values(node))
+        self.assertTrue(
+            torch.equal(
+                kv_offload.device_indices,
+                _device_value(cache, node, ComponentType.FULL),
+            )
+        )
+        # The offload must not reintroduce the #9776 self-inflation: a chunked
+        # request's own in-flight chunks are not hits, so hit_count stays 0 and
+        # eviction order is not skewed toward this request's prefix.
+        self.assertEqual(cache.tree_core.get_node_hit_count(node), 0)
+
+        # Re-inserting the same chunked prefix is incremental: the node is
+        # already pending external storage, so no second offload is queued.
+        cache.cache_unfinished_req(req, chunked=True)
+        self.assertEqual(len(linker.offload_calls), 1)
+
+        cache.dec_lock_ref(req.last_node, req.lock_receipt)
+        cache.sanity_check()
+
+    def test_chunked_unfinished_req_offload_requires_linker(self):
+        cfg = CacheConfig(page_size=2, kv_size=64, max_context_len=64)
+        self.cfg = cfg
+        cache, allocator, req_to_token_pool = build_fixture(cfg)
+        self.assertIsNone(cache.linker)
+
+        req = self._make_req(req_to_token_pool)
+        tokens = self._make_seq(1, 3)
+        req.origin_input_ids = array("q", tokens)
+        req.output_ids = array("q")
+        req.full_untruncated_fill_ids = array("q", tokens)
+        req.set_extend_range(0, len(tokens))
+        kv_len = len(tokens)
+        kv_indices = self._alloc(allocator, kv_len)
+        req_to_token_pool.write((req.kv.req_pool_idx, slice(0, kv_len)), kv_indices)
+        req.kv.kv_committed_len = kv_len
+        req.last_node = cache.root_node_handle()
+        req.kv.cache_protected_len = 0
+        req.lock_receipt = DecLockRefParams()
+        req.extra_key = None
+
+        # Without a linker the eager offload is skipped entirely; the insert
+        # itself must still succeed and keep the prefix cacheable on device.
+        cache.cache_unfinished_req(req, chunked=True)
+        self.assertGreater(len(req.prefix_indices), 0)
+
+        cache.dec_lock_ref(req.last_node, req.lock_receipt)
+        cache.sanity_check()
 
     def test_eagle_lookup_uses_bigram_tail_hashes(self):
         cfg = CacheConfig(
