@@ -74,7 +74,12 @@ def make_candidate_indexer(
 @dataclass
 class CandidateMasks(CandidateMetadata):
     mask: Optional[torch.Tensor] = None  # decode: [rows, width] bool
-    request_masks: Optional[List[torch.Tensor]] = None  # prefill: [rows_b, lc_b] each
+    request_masks: Optional[List[torch.Tensor]] = (
+        None  # prefill: [rows_b, lc_b] each (bool)
+    )
+    request_blocks: Optional[List[tuple[torch.Tensor, torch.Tensor]]] = (
+        None  # prefill compact: each (blocks[rows_b, topk_blocks] int32, valid[rows_b, topk_blocks] bool)
+    )
 
 
 def published_masks(candidate) -> CandidateMasks:
