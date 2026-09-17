@@ -747,15 +747,22 @@ def recompute_w_u_fwd(
     return w, u, kg
 
 
+# Curated autotune space. The full cross-product (BK[32,64] x BV[64,128] x
+# warps[2,4,8] x stages[2,3,4] = 36 configs) is expanded and compiled on the
+# FIRST forward for every (BT, IS_VARLEN) key, which costs ~23s per key and
+# ~90s per rank at GLM-5.3-Flash shapes -- the single largest serving-time
+# compile stall observed. A GPU sweep over that space at those shapes selects
+# only BK=32, BV=128 on both keys (non-varlen: warps=8/stages=3; varlen:
+# warps=4/stages=4), so the space is trimmed to those two winners plus the
+# adjacent stage/width neighbours for robustness on other shapes.
 @triton.autotune(
     configs=[
-        triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
-        for BK in [32, 64]
-        for BV in [64, 128]
-        for num_warps in [2, 4, 8]
-        for num_stages in [2, 3, 4]
+        triton.Config({"BK": 32, "BV": 128}, num_warps=num_warps, num_stages=num_stages)
+        for num_warps in [4, 8]
+        for num_stages in [3, 4]
     ],
     key=["BT", "IS_VARLEN"],
+    **autotune_cache_kwargs,
 )
 @triton.jit(do_not_specialize=["T"])
 def chunk_gla_fwd_kernel_o(

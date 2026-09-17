@@ -143,7 +143,12 @@ def kpool_build_ragged_layout(
     return concat_page_table, q_ks, q_ke
 
 
-@triton.jit
+# MAX_POOL_PAGES is the page-table width, which grows with context length (and
+# is widened further by kpool-tail/EAGLE table expansion). Triton specializes
+# on runtime integer divisibility, so a constexpr-like binding would mint a new
+# specialization per width and recompile mid-serving. Bind it as a runtime
+# scalar that does not participate in the specialization key.
+@triton.jit(do_not_specialize=["MAX_POOL_PAGES"])
 def _kpool_build_ragged_layout_kernel(
     full_page_table_ptr,
     cu_pages_excl_ptr,
