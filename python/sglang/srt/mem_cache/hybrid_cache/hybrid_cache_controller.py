@@ -6,7 +6,7 @@ import os
 import threading
 import time
 from dataclasses import replace
-from queue import Empty, Queue
+from queue import Queue
 from typing import TYPE_CHECKING, Any, Callable, List, Optional
 
 import torch
@@ -726,7 +726,7 @@ class HybridCacheController(BaseHiCacheController):
         operation.storage_hit_count -= trim_tokens
         operation.storage_start += trim_tokens
 
-    def _page_backup(self, operation):
+    def _page_backup(self, operation) -> bool:
         # MLA KV is replicated across TP ranks and should still be written only
         # by TP0. Rank-sharded sidecars still need every TP rank.
         backup_transfers = [
@@ -738,18 +738,15 @@ class HybridCacheController(BaseHiCacheController):
         if backup_transfers:
             self._resolve_sidecar_kv_derived_pool_transfers(operation)
             self._resolve_sidecar_nonkv_derived_pool_transfers(operation)
-            extra_info = HiCacheStorageExtraInfo(prefix_keys=operation.prefix_keys)
-            results = self.storage_backend.batch_set_v2(
-                backup_transfers, extra_info=extra_info
-            )
-            pool_hits = count_pool_hits(results)
-            operation.pool_storage_result.update_extra_pool_hit_pages(pool_hits)
 
-        if not self.backup_skip:
-            super()._page_backup(operation)
-        else:
-            sidecar_ok = bool(backup_transfers)
-            if sidecar_ok:
+            def write_sidecars():
+                # Fork-local (#39050): thread prefix keys into the v2 write.
+                extra_info = HiCacheStorageExtraInfo(prefix_keys=operation.prefix_keys)
+                results = self.storage_backend.batch_set_v2(
+                    backup_transfers, extra_info=extra_info
+                )
+                pool_hits = count_pool_hits(results)
+                operation.pool_storage_result.update_extra_pool_hit_pages(pool_hits)
                 for transfer in backup_transfers:
                     result = results.get(transfer.name)
                     if result is None:
@@ -762,11 +759,20 @@ class HybridCacheController(BaseHiCacheController):
                         or len(result) != expected
                         or not all(bool(ok) for ok in result)
                     ):
-                        sidecar_ok = False
-                        break
-            operation.completed_tokens = (
-                len(operation.hash_value) * self.page_size if sidecar_ok else 0
-            )
+                        return False
+                return True
+
+            if not self._retry_storage_write(write_sidecars):
+                operation.backup_failed = True
+                return False
+
+        if not self.backup_skip:
+            return super()._page_backup(operation)
+        # Only replicated primary KV is skipped. Rank-sharded auxiliary pools
+        # must finish on every rank before the operation is acknowledged.
+        if backup_transfers:
+            operation.completed_tokens = len(operation.hash_value) * self.page_size
+        return True
 
     def should_backup(self, transfer: PoolTransfer) -> bool:
         if not self.backup_skip:
@@ -789,23 +795,6 @@ class HybridCacheController(BaseHiCacheController):
             )
 
         return False
-
-    def backup_thread_func(self):
-        """Back up rank-sharded sidecars on every TP rank.
-
-        The base implementation skips the entire operation on non-zero MLA TP
-        ranks. That optimization is valid for replicated MLA KV, but not for
-        hybrid rank-sharded pools such as Kimi-K3 Mamba state.
-        """
-        while not self.storage_stop_event.is_set():
-            try:
-                operation = self.backup_queue.get(block=True, timeout=1)
-                if operation is None:
-                    continue
-                self._page_backup(operation)
-                self.ack_backup_queue.put(operation)
-            except Empty:
-                continue
 
     def _resolve_sidecar_kv_derived_pool_transfers(self, operation):
         for transfer in operation.pool_transfers:

@@ -50,6 +50,12 @@ logger = logging.getLogger(__name__)
 
 device_module = get_device_module()
 
+# A failed host-to-storage batch is retried a bounded number of times before
+# the operation is explicitly marked as failed. Retrying forever could pin host
+# pages indefinitely when the storage backend is permanently out of space.
+STORAGE_BACKUP_MAX_ATTEMPTS = 3
+STORAGE_BACKUP_RETRY_DELAY = 0.1
+
 
 class LayerLoadingEvent:
     def __init__(self, num_layers: int):
@@ -228,6 +234,9 @@ class StorageOperation:
         self.token_ids = token_ids
         self.last_hash = last_hash
         self.completed_tokens = 0
+        # True only after a terminal host-to-storage write failure. The ack
+        # consumer must not treat a partial backup as a fully persisted span.
+        self.backup_failed = False
         self.hash_value = hash_value if hash_value is not None else []
         self.prefix_keys = prefix_keys
         # Full queried page-hash chain, set by _storage_hit_query before
@@ -1281,10 +1290,40 @@ class HiCacheController:
             self.storage_backend.batch_set_v1(hash_values, host_indices, extra_info)
         )
 
+    def _retry_storage_write(self, write: Callable[[], bool]) -> bool:
+        for attempt in range(1, STORAGE_BACKUP_MAX_ATTEMPTS + 1):
+            if self.storage_stop_event.is_set():
+                return False
+            try:
+                if write():
+                    return True
+            except Exception:
+                logger.warning(
+                    "Storage write raised an exception (attempt %d/%d).",
+                    attempt,
+                    STORAGE_BACKUP_MAX_ATTEMPTS,
+                    exc_info=True,
+                )
+            else:
+                logger.warning(
+                    "Storage write failed (attempt %d/%d).",
+                    attempt,
+                    STORAGE_BACKUP_MAX_ATTEMPTS,
+                )
+            if attempt < STORAGE_BACKUP_MAX_ATTEMPTS:
+                # Allow transient backend pressure to clear without delaying
+                # shutdown or retaining host pages indefinitely.
+                if self.storage_stop_event.wait(STORAGE_BACKUP_RETRY_DELAY * attempt):
+                    return False
+        return False
+
     # Backup batch by batch
-    def _page_backup(self, operation):
-        # Backup batch by batch
-        prefix_keys = operation.prefix_keys
+    def _page_backup(self, operation) -> bool:
+        if self.backup_skip:
+            return True
+        prefix_keys = (
+            operation.prefix_keys.copy() if operation.prefix_keys is not None else None
+        )
         for i in range(0, len(operation.hash_value), STORAGE_BATCH_SIZE):
             batch_hashes = operation.hash_value[i : i + STORAGE_BATCH_SIZE]
             batch_host_indices = operation.host_indices[
@@ -1293,16 +1332,19 @@ class HiCacheController:
             # Set one batch token, and record if success.
             # todo: allow partial success
             extra_info = HiCacheStorageExtraInfo(prefix_keys=prefix_keys)
-            success = self.page_set_func(batch_hashes, batch_host_indices, extra_info)
+            success = self._retry_storage_write(
+                lambda: self.page_set_func(batch_hashes, batch_host_indices, extra_info)
+            )
+
             if not success:
-                logger.warning(
-                    f"Write page to storage: {len(batch_hashes)} pages failed."
-                )
-                break
+                operation.backup_failed = True
+                return False
 
             if prefix_keys is not None:
                 prefix_keys = prefix_keys + batch_hashes
             operation.completed_tokens += self.page_size * len(batch_hashes)
+
+        return True
 
     def backup_thread_func(self):
         """
@@ -1314,8 +1356,24 @@ class HiCacheController:
                 if operation is None:
                     continue
 
-                if not self.backup_skip:
-                    self._page_backup(operation)
+                try:
+                    success = self._page_backup(operation)
+                except Exception:
+                    success = False
+                    logger.exception(
+                        "Storage backup operation %s raised an exception.", operation.id
+                    )
+                operation.backup_failed = not success
+                if operation.backup_failed:
+                    logger.error(
+                        "Storage backup operation %s failed; completed_tokens=%d, "
+                        "requested_tokens=%d. Releasing host resources.",
+                        operation.id,
+                        operation.completed_tokens,
+                        len(operation.hash_value) * self.page_size,
+                    )
+                # This receipt ends the operation's ownership of host memory,
+                # including failure. Consumers account only completed tokens.
                 self.ack_backup_queue.put(operation)
 
             except Empty:
