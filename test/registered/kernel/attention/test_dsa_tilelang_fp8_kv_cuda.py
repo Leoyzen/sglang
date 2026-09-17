@@ -12,12 +12,14 @@ fail when the path is broken:
      comparator discriminates).
 """
 
+import sys
+
 import pytest
 import torch
 
 from sglang.test.ci.ci_register import register_cuda_ci
 
-register_cuda_ci(est_time=90, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=90, stage="base-b-kernel-unit", runner_config="1-gpu-large")
 
 tilelang_kernel = pytest.importorskip(
     "sglang.kernels.ops.attention.dsa.tilelang_kernel"
@@ -93,3 +95,7 @@ def test_fp8_spread_within_budget_and_negative_control_fails():
     assert rel_bad > 0.04, (
         f"scrambled indices still matched the reference — the comparator is not discriminating (rel err {rel_bad:.5f})"
     )
+
+
+if __name__ == "__main__":
+    sys.exit(pytest.main([__file__, "-v"]))
