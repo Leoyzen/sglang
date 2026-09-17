@@ -17,11 +17,11 @@ from sglang.srt.mem_cache.hybrid_cache.linker_pool_assembler import (
     _build_mamba_device_pool_group,
 )
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
-from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
 from sglang.srt.mem_cache.unified_cache.components.base import (
     ExternalLinkerLoadPhase,
     LinkerTransferPhase,
 )
+from sglang.srt.mem_cache.unified_cache.components.mamba import MambaComponent
 from sglang.srt.mem_cache.unified_cache.unified_cache_linker import (
     UnifiedCacheLinkerWrapper,
 )
@@ -497,11 +497,14 @@ class TestSelfKeyedBatchExists(CustomTestCase):
             ),
         ]
         result = type(store).batch_exists_v2(store, kv_keys, transfers)
-        # MAMBA was probed with its own key, not the 5 KV page keys.
-        self.assertIn(
-            ["boundary_hit_r0_tp0_temporal", "boundary_hit_r0_tp0_conv_0"],
-            store._exist_calls,
-        )
+        # MAMBA is probed with its own keys, not the 5 KV page keys. Since
+        # #39696 all pools' component keys ride in a single batched _batch_exist
+        # call, so assert the MAMBA keys appear in that one call (and that the
+        # MAMBA probe did not reuse the KV page keys).
+        self.assertEqual(len(store._exist_calls), 1)
+        batched_keys = store._exist_calls[0]
+        for mamba_key in ("boundary_hit_r0_tp0_temporal", "boundary_hit_r0_tp0_conv_0"):
+            self.assertIn(mamba_key, batched_keys)
         # Terminal-key semantics: the single offloaded slot exists only at the
         # boundary its own key names. batch_exists_v2 maps self-keyed slot i to
         # probe-domain page i+1, so "boundary_hit" (slot 0, the offloaded
