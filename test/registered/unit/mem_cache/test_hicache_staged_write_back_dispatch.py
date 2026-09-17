@@ -1184,6 +1184,7 @@ class TestHiCacheStagedWriteBackDispatch(CustomTestCase):
             device = "cpu"
             size = 64
             logical_size = 64
+            dtype = torch.uint8
             size_per_token = 2
             can_use_write_back_jit = True
 
