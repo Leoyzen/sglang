@@ -87,6 +87,7 @@ from sglang.srt.layers.attention.dsv4.indexer import (
     C4IndexerBackendMixin,
     fp4_paged_mqa_logits,
     fp32_jit_paged_topk,
+    select_candidate_block_indices,
     select_candidate_blocks,
 )
 from sglang.srt.layers.attention.dsv4.metadata import (
@@ -1888,6 +1889,13 @@ class DeepseekV4AttnBackend(
                     for mask, t in zip(full_masks.request_masks, tail_lens_cpu)
                 ]
             )
+        elif isinstance(full_masks, CandidateMasks) and full_masks.request_blocks:
+            tail_metadata.candidate_metadata = CandidateMasks(
+                request_blocks=[
+                    (blk[blk.shape[0] - t :], vld[vld.shape[0] - t :])
+                    for (blk, vld), t in zip(full_masks.request_blocks, tail_lens_cpu)
+                ]
+            )
         # The last index-source layer before the switch published its top-k into
         # the full metadata's buffers; the consumer layers after the switch read
         # the tail metadata's, so carry the tail rows over (padding stays -1).
@@ -3403,19 +3411,35 @@ class DeepseekV4AttnBackend(
         req_pool_indices = forward_batch.req_pool_indices.to(torch.int64)
         topk = indexer.index_topk
         publish = [] if indexer.is_candidate_source else None
-        consume = (
-            published_masks(self.forward_metadata.candidate_metadata).request_masks
+        _consume_cand = (
+            published_masks(self.forward_metadata.candidate_metadata)
             if indexer.uses_candidates
             else None
         )
-        empty_mask = torch.zeros(0, 0, dtype=torch.bool, device=pos.device)
+        consume = (
+            (
+                _consume_cand.request_blocks
+                if _consume_cand.request_blocks is not None
+                else _consume_cand.request_masks
+            )
+            if _consume_cand is not None
+            else None
+        )
+        empty_blocks = (
+            torch.zeros(
+                0, indexer.candidate_topk_blocks, dtype=torch.int32, device=pos.device
+            ),
+            torch.zeros(
+                0, indexer.candidate_topk_blocks, dtype=torch.bool, device=pos.device
+            ),
+        )
 
         row_base = 0
         for b, (q_len, seq_len) in enumerate(zip(q_lens_cpu, seq_lens_cpu)):
             lc = seq_len // ratio
             if lc == 0 or q_len == 0:
                 if publish is not None:
-                    publish.append(empty_mask)
+                    publish.append(empty_blocks)
                 row_base += q_len
                 continue
             j = torch.arange(lc, device=pos.device)
@@ -3439,11 +3463,7 @@ class DeepseekV4AttnBackend(
             # Bound the materialized fp32 score rows; the fused kernel avoids the
             # much larger [rows, heads, lc] bf16 intermediate of the torch path.
             rows_per_chunk = max(1, _TORCH_INDEXER_SCORE_BUDGET_BYTES // (bucket * 4))
-            mask_b = (
-                torch.empty((q_len, lc), dtype=torch.bool, device=pos.device)
-                if publish is not None
-                else None
-            )
+            _req_blocks = [] if publish is not None else None
             for start in range(0, q_len, rows_per_chunk):
                 stop = min(q_len, start + rows_per_chunk)
                 token_rows = slice(row_base + start, row_base + stop)
@@ -3464,22 +3484,41 @@ class DeepseekV4AttnBackend(
                         (0, bucket - scores.shape[1]),
                         value=float("-inf"),
                     )
-                if mask_b is not None:
+                if _req_blocks is not None:
                     # Score at bucket width for kernel-specialization control, but
-                    # publish only the real columns: the retained mask is the
-                    # dominant transient here (1 B per row per compressed token),
-                    # and the padded columns are all -inf anyway.
-                    mask_b[local_rows] = select_candidate_blocks(
+                    # publish only the compressed positions inside the selected
+                    # candidate blocks: a compact int32 block table per request
+                    # (blocks + valid) instead of the O(q_len * lc) full bool mask.
+                    # The padded score columns are all -inf and never selected.
+                    _blk, _vld = select_candidate_block_indices(
                         scores,
                         lens_c[:, None],
                         topk_blocks=indexer.candidate_topk_blocks,
                         block_size=indexer.candidate_block_size,
-                    )[..., :lc]
+                    )
+                    _req_blocks.append((_blk.to(torch.int32), _vld))
                 elif consume is not None:
-                    # The publisher now stores exactly `lc` columns, so mask the
-                    # score prefix it covers. Columns past it are already -inf
-                    # from the padding above and are unreachable via lens_c.
-                    consume_mask = consume[b][local_rows]
+                    # The publisher stores a compact block table; rebuild the
+                    # candidate positions for this chunk and mask everything else.
+                    _lf = consume[b]
+                    if isinstance(_lf, tuple):
+                        _blk, _vld = _lf
+                        _brow = _blk[local_rows].to(torch.int64)
+                        _vrow = _vld[local_rows]
+                        _nblk = (
+                            lc + indexer.candidate_block_size - 1
+                        ) // indexer.candidate_block_size
+                        _keep = torch.zeros(
+                            (_brow.shape[0], _nblk),
+                            dtype=torch.bool,
+                            device=pos.device,
+                        ).scatter_(-1, _brow.clamp_max(_nblk - 1), _vrow)
+                        consume_mask = _keep.repeat_interleave(
+                            indexer.candidate_block_size, dim=-1
+                        )[..., :lc]
+                    else:
+                        # Fallback to a full bool mask (dense / torch publishers).
+                        consume_mask = _lf[local_rows]
                     scores[:, : consume_mask.shape[1]].masked_fill_(
                         ~consume_mask, -torch.inf
                     )
@@ -3492,7 +3531,7 @@ class DeepseekV4AttnBackend(
                     out_offsets=topk_offsets[token_rows],
                     out_indices=idx,
                 )
-                if consume is not None and mask_b is None:
+                if consume is not None and _req_blocks is None:
                     idx = mask_topk_scores(scores, idx)
                 unselected = torch.iinfo(torch.int32).max
                 idx = idx.masked_fill(idx < 0, unselected).sort(dim=-1).values
@@ -3504,8 +3543,13 @@ class DeepseekV4AttnBackend(
                     raw_indices[token_rows, :k] = torch.where(reach, idx, -1).to(
                         torch.int32
                     )
-            if mask_b is not None:
-                publish.append(mask_b)
+            if _req_blocks is not None:
+                publish.append(
+                    (
+                        torch.cat([rb for rb, _ in _req_blocks], dim=0),
+                        torch.cat([rv for _, rv in _req_blocks], dim=0),
+                    )
+                )
             row_base += q_len
 
         # MLP-sync token padding (ForwardBatch._pad_inputs_to_size) can append
@@ -3516,7 +3560,7 @@ class DeepseekV4AttnBackend(
         assert row_base <= q.shape[0], (row_base, q.shape[0])
         if publish is not None:
             self.forward_metadata.candidate_metadata = CandidateMasks(
-                request_masks=publish
+                request_blocks=publish
             )
 
     def _low_ratio_index_topk_extend(

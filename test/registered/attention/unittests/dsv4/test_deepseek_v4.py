@@ -1249,11 +1249,14 @@ class TestDSV41SM90ExtendMaskPublication(CustomTestCase):
     used to be bucket-wide and was assembled by ``torch.cat``-ing the per-chunk
     masks: at the production width (``lc ~ 271k``, ``bucket 524288``) that
     retained 4 GiB and doubled it transiently against ~2 GiB of free memory.
-    The publisher now preallocates one ``[q_len, lc]`` bool tensor, writes each
-    chunk in place, and consumers mask only the prefix the publisher covered.
+    The publisher now emits a compact per-request block table ``(blocks,
+    valid)``, each ``[rows_b, topk_blocks]`` (int32 + bool) instead of an
+    ``O(q_len * lc)`` bool mask, and consumers rebuild the exact-``lc`` mask
+    from those blocks inside their chunk budget.
     These CPU tests drive ``_low_ratio_index_topk_sm90_extend`` directly with
-    the GPU-only kernels mocked and pin the width, the chunked in-place writes,
-    and the narrowed consume contract.
+    the GPU-only kernels mocked and pin the compact shape, the chunked
+    row-ordered accumulation, the round-trip equivalence with
+    ``select_candidate_blocks``, and the narrowed consume contract.
     """
 
     _RATIO = 2
@@ -1291,6 +1294,29 @@ class TestDSV41SM90ExtendMaskPublication(CustomTestCase):
             topk_blocks=cls._TOPK_BLOCKS,
             block_size=cls._BLOCK_SIZE,
         )[..., :lc]
+
+    @classmethod
+    def _reconstruct_mask(cls, blocks_valid, lc):
+        """Expand a published compact block table back into an ``lc``-wide mask."""
+        blocks, valid = blocks_valid
+        nblk = (lc + cls._BLOCK_SIZE - 1) // cls._BLOCK_SIZE
+        keep = torch.zeros((blocks.shape[0], nblk), dtype=torch.bool).scatter_(
+            -1, blocks.to(torch.int64).clamp_max(nblk - 1), valid
+        )
+        return keep.repeat_interleave(cls._BLOCK_SIZE, dim=-1)[..., :lc]
+
+    @classmethod
+    def _mask_to_blocks(cls, mask):
+        """Encode a bool mask as the compact (blocks, valid) contract consumed by
+        the SM90 extend consumer, so the round-trip test can pin equivalence."""
+        rows, lc = mask.shape
+        nblk = (lc + cls._BLOCK_SIZE - 1) // cls._BLOCK_SIZE
+        padded = F.pad(mask, (0, nblk * cls._BLOCK_SIZE - lc), value=False).unflatten(
+            -1, (-1, cls._BLOCK_SIZE)
+        )
+        valid = padded.any(dim=-1)
+        idx = torch.arange(nblk, dtype=torch.int32).repeat(rows, 1)
+        return idx, valid
 
     @classmethod
     def _make_case(cls, q_lens, seq_lens, *, is_candidate_source, uses_candidates):
@@ -1364,6 +1390,7 @@ class TestDSV41SM90ExtendMaskPublication(CustomTestCase):
         is_candidate_source,
         uses_candidates,
         consume_masks=None,
+        consume_blocks=None,
         score_budget=None,
         spike_col=False,
         spy_select=False,
@@ -1432,6 +1459,16 @@ class TestDSV41SM90ExtendMaskPublication(CustomTestCase):
                         return_value=module.CandidateMasks(request_masks=consume_masks),
                     )
                 )
+            if consume_blocks is not None:
+                stack.enter_context(
+                    mock.patch.object(
+                        module,
+                        "published_masks",
+                        return_value=module.CandidateMasks(
+                            request_blocks=consume_blocks
+                        ),
+                    )
+                )
             if score_budget is not None:
                 stack.enter_context(
                     mock.patch.object(
@@ -1442,6 +1479,13 @@ class TestDSV41SM90ExtendMaskPublication(CustomTestCase):
                 captured["select"] = stack.enter_context(
                     mock.patch.object(
                         module, "select_candidate_blocks", side_effect=real_select
+                    )
+                )
+                captured["select_idx"] = stack.enter_context(
+                    mock.patch.object(
+                        module,
+                        "select_candidate_block_indices",
+                        side_effect=module.select_candidate_block_indices,
                     )
                 )
             if spy_cat:
@@ -1469,18 +1513,26 @@ class TestDSV41SM90ExtendMaskPublication(CustomTestCase):
             [q_len], [seq_len], is_candidate_source=True, uses_candidates=False
         )
 
-        masks = backend.forward_metadata.candidate_metadata.request_masks
-        self.assertEqual(len(masks), 1)
-        self.assertEqual(tuple(masks[0].shape), (q_len, lc))
-        self.assertNotEqual(
-            tuple(masks[0].shape),
-            (q_len, bucket),
-            "published mask kept the score bucket instead of the exact lc width",
-        )
+        blks = backend.forward_metadata.candidate_metadata.request_blocks
+        self.assertEqual(len(blks), 1)
+        self.assertIsNone(backend.forward_metadata.candidate_metadata.request_masks)
+        blocks, valid = blks[0]
+        # Compact block table: [q_len, topk_blocks] int32 + [q_len, topk_blocks] bool,
+        # never the O(q_len * lc) full bool mask.
+        self.assertEqual(tuple(blocks.shape), (q_len, self._TOPK_BLOCKS))
+        self.assertEqual(tuple(valid.shape), (q_len, self._TOPK_BLOCKS))
+        self.assertTrue(blocks.dtype == torch.int32)
 
         lens = torch.full((q_len,), lc, dtype=torch.int32)
         expected = self._select_reference(torch.arange(q_len), lc, lens, bucket)
-        self.assertTrue(torch.equal(masks[0], expected))
+        # Round-trip: expanding the compact table must reproduce the reference mask.
+        self.assertTrue(torch.equal(self._reconstruct_mask(blks[0], lc), expected))
+        self.assertEqual(
+            blocks.shape[1],
+            self._TOPK_BLOCKS,
+            "published block table must carry a bounded topk_blocks width, "
+            "not one column per compressed token",
+        )
         self.assertGreater(
             len({tuple(row.tolist()) for row in expected}),
             1,
@@ -1508,10 +1560,10 @@ class TestDSV41SM90ExtendMaskPublication(CustomTestCase):
             spy_cat=True,
         )
         # The patched budget must actually split the request into chunks.
-        self.assertGreater(captured["select"].call_count, 1)
+        self.assertGreater(captured["select_idx"].call_count, 1)
 
-        masks = backend.forward_metadata.candidate_metadata.request_masks
-        self.assertEqual(len(masks), 1)
+        blks = backend.forward_metadata.candidate_metadata.request_blocks
+        self.assertEqual(len(blks), 1)
         lens = torch.full((q_len,), lc, dtype=torch.int32)
         expected = torch.cat(
             [
@@ -1524,20 +1576,32 @@ class TestDSV41SM90ExtendMaskPublication(CustomTestCase):
                 for start in range(0, q_len, rows_per_chunk)
             ]
         )
-        self.assertTrue(torch.equal(masks[0], expected))
+        # Expanding the chunked-but-row-ordered compact table reproduces the full
+        # reference mask exactly.
+        self.assertTrue(torch.equal(self._reconstruct_mask(blks[0], lc), expected))
         self.assertEqual(
             len({tuple(row.tolist()) for row in expected}),
             q_len,
             "rows must be distinguishable for the order pin to mean anything",
         )
 
+        # Publishers never build a full-width bool mask anymore: no torch.cat over
+        # a *full-lc-wide* bool tensor (only compact int32-block/valid tables, a
+        # few columns wide, are concatenated per chunk).
         mask_cats = [
             call
             for call in captured["cat"].call_args_list
             if len(call.args[0]) > 1
-            and all(t.dtype == torch.bool for t in call.args[0])
+            and all(
+                t.ndim == 2
+                and t.dtype == torch.bool
+                and t.shape[1] >= bucket  # full candidate-mask width
+                for t in call.args[0]
+            )
         ]
-        self.assertEqual(mask_cats, [], "published mask was still built with torch.cat")
+        self.assertEqual(
+            mask_cats, [], "full bool candidate mask was still torch.cat-ting"
+        )
 
     def test_consumer_masks_only_the_published_prefix(self):
         from sglang.srt.layers.attention.deepseek_v4_backend import (
@@ -1597,6 +1661,77 @@ class TestDSV41SM90ExtendMaskPublication(CustomTestCase):
         )
         torch.testing.assert_close(raw_full, raw)
 
+        # Compact-block consumer: publish a *block-aligned* restriction as a
+        # (blocks, valid) table and assert it consumes identically to the bool
+        # consumer over the same block-aligned mask. (The column-level `consume`
+        # above is not expressible at block granularity, so the compact path is
+        # pinned against its block-invariant truth.)
+        consume_ba = (
+            F.pad(consume, (0, -lc % self._BLOCK_SIZE), value=False)
+            .unflatten(-1, (-1, self._BLOCK_SIZE))
+            .amax(dim=-1)
+            .repeat_interleave(self._BLOCK_SIZE, dim=-1)[..., :lc]
+        )
+        _, _, _, raw_ba = self._run_extend(
+            [q_len],
+            [seq_len],
+            is_candidate_source=False,
+            uses_candidates=True,
+            consume_masks=[consume_ba],
+            spike_col=True,
+        )
+        _, captured_ba, _, _ = self._run_extend(
+            [q_len],
+            [seq_len],
+            is_candidate_source=False,
+            uses_candidates=True,
+            consume_masks=[consume_ba],
+            spike_col=True,
+        )
+        _, captured_cb, _, raw_cb = self._run_extend(
+            [q_len],
+            [seq_len],
+            is_candidate_source=False,
+            uses_candidates=True,
+            consume_blocks=[self._mask_to_blocks(consume_ba)],
+            spike_col=True,
+        )
+        # The compact consumer masks the identical score rows and selects the same
+        # final columns as the bool consumer over the block-aligned mask.
+        torch.testing.assert_close(
+            captured_cb["scores"][0][:, :lc], captured_ba["scores"][0][:, :lc]
+        )
+        torch.testing.assert_close(raw_cb, raw_ba)
+
+    def test_published_blocks_round_trip_to_bool_mask(self):
+        """Expanding a published compact block table reproduces select_candidate_blocks."""
+        from sglang.srt.layers.attention.deepseek_v4_backend import (
+            _sm90_prefill_score_bucket,
+        )
+
+        # Mix of lc values, several requests, one with lc smaller than a block and
+        # one where the newest-block-always-kept rule actually kicks in.
+        for lc in (7, 32, 100, 257):
+            q_len = 4
+            seq_len = lc * self._RATIO
+            bucket = _sm90_prefill_score_bucket(lc, self._BLOCK_SIZE)
+            lens = torch.full((q_len,), lc, dtype=torch.int32)
+            expected = self._select_reference(torch.arange(q_len), lc, lens, bucket)
+
+            backend, _, _, _ = self._run_extend(
+                [q_len], [seq_len], is_candidate_source=True, uses_candidates=False
+            )
+            blocks, valid = backend.forward_metadata.candidate_metadata.request_blocks[
+                0
+            ]
+            got = self._reconstruct_mask((blocks, valid), lc)
+            nblk = (lc + self._BLOCK_SIZE - 1) // self._BLOCK_SIZE
+            # The block table holds min(topk_blocks, num_blocks) columns (inspect
+            # reachable blocks, capped by the requested top-k), never one per token.
+            self.assertEqual(tuple(blocks.shape), (q_len, min(self._TOPK_BLOCKS, nblk)))
+            self.assertEqual(tuple(valid.shape), (q_len, min(self._TOPK_BLOCKS, nblk)))
+            self.assertTrue(torch.equal(got, expected))
+
     def test_empty_requests_keep_published_list_aligned(self):
         q_lens = [2, 3, 0, 2]
         seq_lens = [200, 1, 200, 400]
@@ -1605,12 +1740,24 @@ class TestDSV41SM90ExtendMaskPublication(CustomTestCase):
             q_lens, seq_lens, is_candidate_source=True, uses_candidates=False
         )
 
-        masks = backend.forward_metadata.candidate_metadata.request_masks
-        self.assertEqual(len(masks), len(q_lens))
-        self.assertEqual(tuple(masks[0].shape), (2, 100))
-        self.assertEqual(tuple(masks[1].shape), (0, 0))  # lc == 0
-        self.assertEqual(tuple(masks[2].shape), (0, 0))  # q_len == 0
-        self.assertEqual(tuple(masks[3].shape), (2, 200))
+        blks = backend.forward_metadata.candidate_metadata.request_blocks
+        self.assertIsNone(backend.forward_metadata.candidate_metadata.request_masks)
+        self.assertEqual(len(blks), len(q_lens))
+        for blk_blk, blk_vld, expected_rows in zip(
+            (b[0] for b in blks),
+            (b[1] for b in blks),
+            (2, 0, 0, 2),  # (2,100) / lc==0 / q_len==0 / (2,200)
+        ):
+            self.assertEqual(blk_blk.shape[0], expected_rows)
+            self.assertEqual(blk_vld.shape[0], expected_rows)
+            if expected_rows:
+                self.assertEqual(blk_blk.shape[1], self._TOPK_BLOCKS)
+                self.assertEqual(blk_vld.shape[1], self._TOPK_BLOCKS)
+        # Non-empty requests keep their per-request row count; empty keep 0 rows.
+        self.assertEqual(tuple(blks[0][0].shape), (2, self._TOPK_BLOCKS))
+        self.assertEqual(tuple(blks[1][0].shape), (0, self._TOPK_BLOCKS))  # lc == 0
+        self.assertEqual(tuple(blks[2][0].shape), (0, self._TOPK_BLOCKS))  # q_len == 0
+        self.assertEqual(tuple(blks[3][0].shape), (2, self._TOPK_BLOCKS))
 
 
 if __name__ == "__main__":
