@@ -42,6 +42,7 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
 )
 from sglang.srt.compilation.compilation_config import register_split_op
 from sglang.srt.configs.deepseek_v4 import DeepSeekV4Config
+from sglang.srt.configs.deepseek_v41 import dsv41_vision_enabled
 from sglang.srt.distributed import (
     get_pp_group,
     get_tp_group,
@@ -2609,8 +2610,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             routed_quant_stream=moe_routed_quant_stream,
             is_nextn=is_nextn,
             is_deepseek_v4=True,
-            vl_correction_bias=config.model_type == "deepseek_v41"
-            and config.vision_n_layers > 0,
+            vl_correction_bias=dsv41_vision_enabled(config),
         )
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
@@ -4110,10 +4110,7 @@ class DeepseekV4Model(nn.Module):
                 config,
                 self.engram_layout,
                 image_token_id=(
-                    config.image_token_id
-                    if config.model_type == "deepseek_v41"
-                    and config.vision_n_layers > 0
-                    else None
+                    config.image_token_id if dsv41_vision_enabled(config) else None
                 ),
             )
 
@@ -4271,10 +4268,7 @@ class DeepseekV4Model(nn.Module):
                     forward_batch,
                     cp_all_tokens=cp_extend,
                 )
-                if (
-                    self.config.model_type == "deepseek_v41"
-                    and self.config.vision_n_layers > 0
-                ):
+                if dsv41_vision_enabled(self.config):
                     hidden_states = torch.where(
                         (input_ids == self.config.image_token_id)[:, None, None],
                         before_engram,
@@ -4646,7 +4640,7 @@ class DeepseekV4ForCausalLM(nn.Module):
         self.wo_a_fp8 = wo_a_fp8_gemm_enabled(quant_config)
         self.determine_num_fused_shared_experts()
         self.vision = None
-        if config.model_type == "deepseek_v41" and config.vision_n_layers > 0:
+        if dsv41_vision_enabled(config):
             if (
                 get_parallel().attn_cp_size != 1
                 or get_pp_group().world_size != 1
