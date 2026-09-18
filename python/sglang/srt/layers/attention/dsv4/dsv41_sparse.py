@@ -69,9 +69,19 @@ def token_req_indices(forward_batch, *, num_tokens=None) -> torch.Tensor:
     assert forward_batch.forward_mode.is_extend(), (
         "the V4.1 torch attention path serves extend, target-verify and decode"
     )
-    return torch.repeat_interleave(
-        req, forward_batch.extend_seq_lens.to(torch.int64), output_size=num_tokens
-    )
+    repeats = forward_batch.extend_seq_lens.to(torch.int64)
+    total = int(repeats.sum().item())
+    if num_tokens is not None and int(num_tokens) != total:
+        # An A2A backend (e.g. DeepEP) can widen an extend batch's token dim to a
+        # multiple of 8, appending pad rows (position 0, out_cache_loc 0) without
+        # extending extend_seq_lens. Keep one req row per token row so the rows
+        # stay aligned with positions / x / out_cache_loc; the 0 out_cache_loc is
+        # the writers' pad sentinel, so charging the extra rows to the last
+        # request is a no-op for them.
+        repeats = repeats.clone()
+        repeats[-1] += int(num_tokens) - total
+        total = int(num_tokens)
+    return torch.repeat_interleave(req, repeats, output_size=total)
 
 
 def rope_tail(
