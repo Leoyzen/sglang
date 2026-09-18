@@ -477,17 +477,18 @@ def _apply_wo_a_bf16_matmul(
                 and get_platform().is_blackwell
             )
         )
-        and o.shape[1:] == (2, 4096)
-        and wo_a.shape == (2, 1024, 4096)
+        and o.shape[2] == 4096
+        and (o.shape[1] == 2 or (o.shape[1] == 1 and get_platform().is_sm90))
+        and wo_a.shape == (o.shape[1], 1024, 4096)
         and o.dtype == wo_a.dtype == torch.bfloat16
         and o.stride(2) == 1
         and o.stride(1) == 4096
-        and o.stride(0) >= 8192
+        and o.stride(0) >= 4096 * o.shape[1]
         and wo_a.is_contiguous()
     ):
         if is_decode and o.shape[0] == 1:
             return wo_a_bf16_gemv(o, wo_a)
-        if 2 <= o.shape[0] <= 8:
+        if 2 <= o.shape[0] <= 8 and o.shape[1] == 2:
             if fuse_mxfp8_quant:
                 return Mxfp8SwizzledInput(*wo_a_bf16_small_batch_mxfp8(o, wo_a))
             return wo_a_bf16_small_batch(o, wo_a)
