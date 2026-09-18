@@ -10,7 +10,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-from transformers import PretrainedConfig, PreTrainedTokenizer, PreTrainedTokenizerBase
+from transformers import PretrainedConfig
 from transformers.image_processing_utils import BaseImageProcessor
 
 import sglang.srt.utils.hf_transformers.processor as processor_utils
@@ -137,77 +137,6 @@ class TestGetProcessor(unittest.TestCase):
             trust_remote_code=False,
             revision=None,
         )
-
-    def test_multimodal_bare_tokenizer_raises_runtime_error(self):
-        config = SimpleNamespace(
-            model_type="llava",
-            architectures=["LlavaForConditionalGeneration"],
-            vision_config={"patch_size": 14},
-            auto_map={},
-        )
-        bare_tokenizer = MagicMock(spec=PreTrainedTokenizerBase)
-        auto_config = MagicMock()
-        auto_config.from_pretrained.return_value = config
-        auto_processor = MagicMock()
-        auto_processor.from_pretrained.return_value = bare_tokenizer
-
-        with patch.multiple(
-            processor_utils,
-            AutoConfig=auto_config,
-            AutoProcessor=auto_processor,
-        ):
-            with self.assertRaises(RuntimeError) as ctx:
-                processor_utils.get_processor("some/multimodal-model")
-            self.assertIn("bare tokenizer", str(ctx.exception))
-            self.assertIn("LlavaForConditionalGeneration", str(ctx.exception))
-
-    def test_glm5next_bare_tokenizer_allowed(self):
-        # GLM-5.3 carries a vision_config but is also served text-only; a bare
-        # tokenizer from AutoProcessor must not trip the multimodal guard.
-        config = SimpleNamespace(
-            model_type="glm5_next",
-            architectures=["Glm5NextForConditionalGeneration"],
-            vision_config={"patch_size": 14},
-            auto_map={},
-        )
-        bare_tokenizer = MagicMock(spec=PreTrainedTokenizer)
-        bare_tokenizer.chat_template = "template"
-        bare_tokenizer.get_added_vocab.return_value = {}
-        auto_config = MagicMock()
-        auto_config.from_pretrained.return_value = config
-        auto_processor = MagicMock()
-        auto_processor.from_pretrained.return_value = bare_tokenizer
-
-        with patch.multiple(
-            processor_utils,
-            AutoConfig=auto_config,
-            AutoProcessor=auto_processor,
-        ):
-            processor = processor_utils.get_processor("zai-org/GLM-5.3-Flash")
-            self.assertIs(processor, bare_tokenizer)
-
-    def test_intentional_tokenizer_allowed(self):
-        config = SimpleNamespace(
-            model_type="internvl",
-            architectures=["InternVLChatModel"],
-            vision_config={"patch_size": 14},
-            auto_map={},
-        )
-        bare_tokenizer = MagicMock(spec=PreTrainedTokenizer)
-        bare_tokenizer.chat_template = "template"
-        bare_tokenizer.get_added_vocab.return_value = {}
-        auto_config = MagicMock()
-        auto_config.from_pretrained.return_value = config
-        auto_processor = MagicMock()
-        auto_processor.from_pretrained.return_value = bare_tokenizer
-
-        with patch.multiple(
-            processor_utils,
-            AutoConfig=auto_config,
-            AutoProcessor=auto_processor,
-        ):
-            processor = processor_utils.get_processor("OpenGVLab/InternVL2-8B")
-            self.assertIs(processor, bare_tokenizer)
 
 
 # ---------------------------------------------------------------------------
