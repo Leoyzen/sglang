@@ -1580,8 +1580,11 @@ def fused_moe_dispatch_index_triton_kernel(
     BLOCK_SIZE: tl.constexpr,
     ZERO_INIT: tl.constexpr,
 ):
-    # Each token picks top_k distinct experts, so per-expert count <= num_tokens < m_max;
-    # dst = expert*m_max + offset never spills into the next expert's region.
+    # Each valid token contributes top_k entries, so a single expert can receive up to
+    # num_toks*top_k rows; the region is only safe while that stays <= m_max. Callers
+    # must guarantee it (the topk ids are expected to be drop-masked to -1, not aliased
+    # into a real expert). dst = expert*m_max + offset can otherwise spill into the
+    # next expert's region (see HANDOFF §0.7).
     pid = tl.program_id(0)
     if ZERO_INIT:
         # Zero the cursor in-kernel and barrier before any atomic_add (single-block path).
@@ -1654,6 +1657,7 @@ def fill_gateup_input_triton_kernel(
     hidden_size,
     scale_size,
     m_max,
+    dst_bound,
     scale_row_stride,
     scale_col_stride,
     BLOCK_SIZE: tl.constexpr,
@@ -1672,7 +1676,10 @@ def fill_gateup_input_triton_kernel(
     vec = tl.arange(0, BLOCK_SIZE)
     for idx in range(topk):
         dst_idx_int32 = tl.load(src2dst_ptr + idx)
-        if dst_idx_int32 >= 0:
+        # Upper bound guards the masked-grouped-GEMM write region
+        # (num_local_experts * m_max). Without it a corrupt/padded topk id
+        # silently writes out of bounds (see HANDOFF §0.7).
+        if (dst_idx_int32 >= 0) & (dst_idx_int32 < dst_bound):
             dst_idx = dst_idx_int32.to(tl.int64)
             dst_ptr = gateup_input_ptr + dst_idx * hidden_size
             for start_offset in tl.range(0, hidden_size, BLOCK_SIZE):
@@ -1744,6 +1751,18 @@ def moe_ep_deepgemm_preprocess(
     masked_m, src2dst = fused_moe_dispatch_index(
         topk_ids, num_local_experts, m_max, expert_start=expert_start
     )
+    # Guard the masked-GEMM write region: a topk id that aliased a drop sentinel
+    # into a real expert (or any corrupt id) makes an expert receive more than
+    # m_max rows, and fill_gateup_input_triton_kernel would then write past the
+    # [num_local_experts, m_max, *] buffer (see HANDOFF §0.7). Async so the
+    # per-layer check costs no host sync and stays capture-safe; gated on
+    # SGLANG_ENABLE_ASYNC_ASSERT like the other async probes.
+    if envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
+        torch._assert_async(
+            masked_m.max() <= m_max,
+            "EP MoE dispatch overflow: an expert received more rows than m_max "
+            "(topk_ids contain an aliased/corrupt expert id)",
+        )
 
     gateup_input = torch.empty(
         (num_local_experts, m_max, hidden_states.size(1)),
@@ -1800,6 +1819,7 @@ def moe_ep_deepgemm_preprocess(
             hidden_states.size(1),
             scale.size(1),
             m_max,
+            num_local_experts * m_max,
             scale.stride(0),
             scale.stride(1),
             BLOCK_SIZE=1024,
@@ -1820,6 +1840,7 @@ def moe_ep_deepgemm_preprocess(
             hidden_states.size(1),
             0,
             m_max,
+            num_local_experts * m_max,
             0,
             0,
             BLOCK_SIZE=1024,

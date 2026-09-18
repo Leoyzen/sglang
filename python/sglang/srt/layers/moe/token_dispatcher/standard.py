@@ -226,7 +226,20 @@ class StandardDispatcher(BaseDispatcher):
                 )
             elif not self.use_aiter_moe_runner:
                 if TopKOutputChecker.format_is_standard(topk_output):
-                    topk_ids_local = self.local_expert_mapping[topk_output.topk_ids]
+                    # A -1 here is the padded-region drop sentinel (see
+                    # _mask_topk_ids_padded_region). Gather through
+                    # local_expert_mapping would wrap -1 to its LAST entry, which
+                    # is a valid local expert on the last EP rank — aliasing the
+                    # drop sentinel into a real expert and dispatching padded
+                    # rows into it. Translate only valid ids and preserve -1.
+                    topk_ids_local = self.local_expert_mapping[
+                        topk_output.topk_ids.clamp(min=0)
+                    ]
+                    topk_ids_local = torch.where(
+                        topk_output.topk_ids >= 0,
+                        topk_ids_local,
+                        topk_output.topk_ids,
+                    )
                     # Drop dp-attention MAX_LEN pad rows from the dispatch:
                     # pad rows carry stale hidden through the router and
                     # their expert outputs are discarded downstream — pure

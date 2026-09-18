@@ -989,6 +989,20 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
             )
 
         num_tokens = len(batch.input_ids) if batch.input_ids is not None else 0
+        if (
+            num_tokens == 0
+            and batch.spec_info is not None
+            and not batch.forward_mode.is_idle()
+        ):
+            # Spec-draft (EAGLE) decode: the scheduler rebuilds input_ids after
+            # init_new, so at this point they are still None even though the
+            # batch carries real tokens. Deriving 0 here armed the padded-region
+            # mask with a live count of 0 and masked every row of the draft
+            # topk_ids to -1 (see HANDOFF §0.7). Use the real forward width.
+            # Idle batches stay 0 so their dummy rows remain masked.
+            num_tokens = len(batch.seq_lens) * max(
+                getattr(batch.spec_info, "num_tokens_per_req", 0), 1
+            )
         if enable_num_token_non_padded():
             ret.global_num_token_non_padded = torch.tensor(
                 num_tokens,

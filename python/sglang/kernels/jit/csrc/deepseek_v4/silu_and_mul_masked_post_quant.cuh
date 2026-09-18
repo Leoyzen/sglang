@@ -103,7 +103,14 @@ SGL_DEVICE CTAWork get_work(const SiluMulQuantVarlenParams& params) {
   const auto prefix_exclusive = warp::reduce_sum(tmp_val) + warp_exclusive;
   const auto bx = blockIdx.x;
   if (prefix_exclusive <= bx && bx < prefix_exclusive + val) {
-    result = {tx, bx - prefix_exclusive, true};
+    const uint32_t token_id = bx - prefix_exclusive;
+    // Guard the [E, T, *] input/output buffers: a corrupt masked_m can exceed
+    // num_tokens (the padded token dim T), which would push
+    // offset = expert_id*num_tokens + token_id past the allocation and read/write
+    // out of bounds. Drop such rows (see HANDOFF §0.7).
+    if (token_id < params.num_tokens) {
+      result = {tx, token_id, true};
+    }
   }
   __syncthreads();
   return result;
