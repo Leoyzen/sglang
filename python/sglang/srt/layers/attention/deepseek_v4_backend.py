@@ -1994,6 +1994,12 @@ class DeepseekV4AttnBackend(
             ),
             c4_compress_metadata=create(compress_ratio=4) if self.has_c4 else None,
             c128_compress_metadata=c128_compress_metadata,
+            # Ragged verify expands per-request runs of unequal length, so the
+            # row mapping cannot be rebuilt from a uniform draft-token stride;
+            # hoist what this build already computed. Consumers fall back to
+            # token_req_indices when this is absent.
+            low_ratio_req_indices=req_pool_indices_repeated.to(torch.int64),
+            low_ratio_pos_i64=core_attn_metadata.positions_casual.to(torch.int64),
         )
 
     def make_forward_metadata_from_raw_decode(
