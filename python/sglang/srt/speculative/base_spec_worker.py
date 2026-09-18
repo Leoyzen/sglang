@@ -34,6 +34,8 @@ class HiCacheDraftMode(str, Enum):
 
 @dataclass(frozen=True, slots=True)
 class HiCacheDraftPlan:
+    """Draft-cache layout shared by HiCache and the direct external linker."""
+
     mode: HiCacheDraftMode = HiCacheDraftMode.NONE
     device_pools: tuple[object, ...] = ()
 
