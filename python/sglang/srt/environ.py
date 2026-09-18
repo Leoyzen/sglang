@@ -1513,6 +1513,11 @@ class Envs:
     SGLANG_OPT_USE_TILELANG_MHC_POST = EnvBool(True)
     SGLANG_OPT_USE_FLASHINFER_MHC = EnvBool(False)
     SGLANG_OPT_FUSE_MHC_POST_PRE = EnvBool(True)
+    # Use the compensated bf16x3 partial for the mHC mix projection on the
+    # decode path (SM90 included). Same batch-invariant 16-slice reduction as
+    # tf32x3, but on bf16 tensor cores: ~2.8-3.2x faster at decode M. Defaults
+    # off in this port; flip on to enable.
+    SGLANG_OPT_DSV4_MHC_BF16X3_DECODE = EnvBool(False)
     SGLANG_OPT_USE_TILELANG_INDEXER = EnvBool(False)
     SGLANG_OPT_DSV4_NONPAGED_INDEXER = EnvBool(True)
     # Per-rank local query rows (after DP-attention sharding when enabled),

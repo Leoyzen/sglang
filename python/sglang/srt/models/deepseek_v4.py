@@ -2683,13 +2683,29 @@ class DeepseekV4DecoderLayer(nn.Module):
         # The original FP32 parameters stay intact for small rows and invariant mode.
         self._hc_attn_tf32_parts = self._hc_ffn_tf32_parts = None
         self._hc_attn_bf16_parts = self._hc_ffn_bf16_parts = None
-        if (
+        # The compensated bf16x3 split is arch-independent (SM90 included) and
+        # carries ~24 mantissa bits with 16 fixed K slices, so it stays
+        # per-row bitwise-invariant across batch sizes. It is the fastest
+        # decode-M mix projection on SM90 (~2.8-3.2x over tf32x3).
+        hc_bf16_parts_ok = (
             self.hc_pre_from_prev_sublayer
-            and get_platform().is_sm100
+            and (get_platform().is_sm90 or get_platform().is_sm100)
             and self.hc_attn_fn.shape == (24, 20480)
-            and envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get()
             and getattr(self.config, "model_type", None) == "deepseek_v41"
             and not is_batch_invariant_mode_enabled()
+        )
+        if hc_bf16_parts_ok:
+            from sglang.kernels.ops.layernorm.mhc import (
+                split_bf16_hc_weight,
+            )
+
+            self._hc_attn_bf16_parts = split_bf16_hc_weight(self.hc_attn_fn.data)
+            self._hc_ffn_bf16_parts = split_bf16_hc_weight(self.hc_ffn_fn.data)
+
+        if (
+            hc_bf16_parts_ok
+            and get_platform().is_sm100
+            and envs.SGLANG_OPT_DEEPGEMM_HC_PRENORM.get()
         ):
             from sglang.kernels.ops.layernorm.mhc import (
                 split_tf32_hc_weight,
@@ -2705,18 +2721,6 @@ class DeepseekV4DecoderLayer(nn.Module):
                     return
                 self._hc_attn_tf32_parts = split_tf32_hc_weight(self.hc_attn_fn.data)
                 self._hc_ffn_tf32_parts = split_tf32_hc_weight(self.hc_ffn_fn.data)
-                if (
-                    getattr(getattr(self, "config", None), "model_type", None)
-                    == "deepseek_v41"
-                ):
-                    from sglang.kernels.ops.layernorm.mhc import (
-                        split_bf16_hc_weight,
-                    )
-
-                    self._hc_attn_bf16_parts = split_bf16_hc_weight(
-                        self.hc_attn_fn.data
-                    )
-                    self._hc_ffn_bf16_parts = split_bf16_hc_weight(self.hc_ffn_fn.data)
 
     def hc_pre(
         self,
@@ -3312,9 +3316,33 @@ class DeepseekV4DecoderLayer(nn.Module):
                     coefficient.record_stream(main_stream)
             return pre, post, comb
         if x.is_cuda and torch.version.cuda is not None:
-            # cuBLAS/torch reductions can change order with num_tokens; this kernel
-            # keeps the mixing and RMS reductions batch-invariant.
-            mixes = hc_mix_stats(x_flat, hc_fn, self.rms_norm_eps).unsqueeze(1)
+            # Keep mixing and RMS reductions batch-invariant; cuBLAS/torch
+            # reductions can change order with num_tokens. Kernel upcasts let
+            # x_flat remain a bf16 view.
+            #
+            # The compensated bf16x3 partial is the same batch-invariant form
+            # (16 fixed K slices) but runs on bf16 tensor cores: measured
+            # ~2.8-3.2x faster than tf32x3 at decode M on SM90, with max_abs
+            # error vs fp64 ~1.4e-5 (vs ~5.7e-6 for tf32x3). This is the SM90
+            # decode path (the fused branch above only takes bs==1 there).
+            bf16_parts = None
+            if (
+                x_flat.shape[0] > 0
+                and x_flat.is_contiguous()
+                and envs.SGLANG_OPT_DSV4_MHC_BF16X3_DECODE.get()
+            ):
+                if hc_fn is self.hc_attn_fn:
+                    bf16_parts = getattr(self, "_hc_attn_bf16_parts", None)
+                elif hc_fn is self.hc_ffn_fn:
+                    bf16_parts = getattr(self, "_hc_ffn_bf16_parts", None)
+            if bf16_parts is not None:
+                from sglang.kernels.ops.layernorm.mhc import hc_mix_stats_bf16x3
+
+                mixes = hc_mix_stats_bf16x3(
+                    x_flat, bf16_parts, self.rms_norm_eps
+                ).unsqueeze(1)
+            else:
+                mixes = hc_mix_stats(x_flat, hc_fn, self.rms_norm_eps).unsqueeze(1)
         else:
             x_flat = x_flat.float()
             rsqrt = torch.rsqrt(
