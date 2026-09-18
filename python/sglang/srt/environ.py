@@ -1506,6 +1506,11 @@ class Envs:
     # anonymous mapping per rank holding only its rows, gathered with the
     # all-reduce, and the only layout that gets huge pages without shmem THP.
     SGLANG_DSV41_ENGRAM_HOST_TABLE_LAYOUT = EnvStr("shared")
+    # Set to 0 to keep the checkpoint page cache across restarts (iteration /
+    # debugging): the host-table code drops it before pre-faulting a per-rank
+    # shard and again in finish_load when huge pages fall short, which slows
+    # every reload of the 475 GB checkpoint.
+    SGLANG_ENABLE_DSV41_ENGRAM_DROP_PAGE_CACHE = EnvBool(True)
 
     # Kernels and indexer
     SGLANG_OPT_DEEPGEMM_HC_PRENORM = EnvBool(True)

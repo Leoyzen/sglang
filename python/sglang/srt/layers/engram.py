@@ -573,6 +573,8 @@ _page_cache_dropped = False
 
 def drop_checkpoint_page_cache() -> tuple[int, int]:
     """posix_fadvise(DONTNEED) on the checkpoint files; returns (files, bytes)."""
+    if not envs.SGLANG_ENABLE_DSV41_ENGRAM_DROP_PAGE_CACHE.get():
+        return 0, 0
     try:
         model_path = get_model().model_path
     except (ValueError, AttributeError):
