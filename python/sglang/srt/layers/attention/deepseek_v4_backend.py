@@ -3352,16 +3352,22 @@ class DeepseekV4AttnBackend(
             scores.masked_fill_(j[None, :lc] >= lens, -torch.inf)
             # the block selection pads and pools a copy of its rows; bound that copy
             step = max(1, _TORCH_INDEXER_SCORE_BUDGET_BYTES // (lc * 4))
-            masks = [
-                select_candidate_blocks(
+            # Write the chunk masks into one preallocated buffer instead of
+            # collecting them and torch.cat-ing: cat holds every chunk and the
+            # concatenated result live at once, i.e. 2x the mask, which is
+            # OOM-class at long-context lc. The buffer is exactly what cat
+            # would return, so consumers see identical values. STOPGAP: delete
+            # this in favour of the upstream compact candidate-blocks
+            # representation when that stack lands (see commit message).
+            mask = torch.empty((t_len, lc), dtype=torch.bool, device=logits.device)
+            for start in range(0, t_len, step):
+                mask[start : start + step] = select_candidate_blocks(
                     scores[start : start + step],
                     lens[start : start + step],
                     topk_blocks=indexer.candidate_topk_blocks,
                     block_size=indexer.candidate_block_size,
                 )
-                for start in range(0, t_len, step)
-            ]
-            publish.append(masks[0] if len(masks) == 1 else torch.cat(masks))
+            publish.append(mask)
         if publish is not None:
             self.forward_metadata.candidate_metadata = CandidateMasks(
                 request_masks=publish
