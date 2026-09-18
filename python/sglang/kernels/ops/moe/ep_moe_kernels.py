@@ -908,6 +908,7 @@ def post_reorder_deepgemm_triton_kernel(
     topk,
     num_tokens,
     hidden_size,
+    dst_bound,
     routed_scaling_factor: float,
     BLOCK_SIZE: tl.constexpr,
     NUM_STAGES: tl.constexpr,
@@ -935,7 +936,9 @@ def post_reorder_deepgemm_triton_kernel(
         sum_vec = tl.zeros([BLOCK_SIZE], dtype=tl.float32)
         for idx in range(topk):
             dst_idx = tl.load(token_src2dst_ptr + idx).to(tl.int64)
-            if dst_idx >= 0:
+            # Upper bound guards the gather from down_output ([E, T, *]): a
+            # corrupt src2dst could point past the allocation and read OOB.
+            if (dst_idx >= 0) & (dst_idx < dst_bound):
                 weight_scale = tl.load(token_topk_weights_ptr + idx).to(tl.float32)
                 load_ptr_offs = down_output_ptr_offs + dst_idx * hidden_size
                 in_data = tl.load(load_ptr_offs, mask=mask).to(tl.float32)
@@ -966,6 +969,7 @@ def post_reorder_deepgemm(
         topk,
         num_tokens,
         hidden_size,
+        down_output.size(0) * down_output.size(1),
         float(routed_scaling_factor),
         BLOCK_SIZE=block_dim,
         NUM_STAGES=3,

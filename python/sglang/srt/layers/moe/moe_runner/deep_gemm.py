@@ -706,6 +706,20 @@ class DeepGemmRunnerCore(MoeRunnerCore):
         use_mxfp8 = quant_info.use_mxfp8
         scale_block_size = quant_info.block_shape[1] if quant_info.block_shape else 128
 
+        # Consumer-side guard for the masked path: every downstream kernel
+        # (silu_mul_quant_varlen, grouped GEMM, post_reorder) indexes rows as
+        # expert_id*T + token_id with token_id < masked_m[e], so a masked_m[e]
+        # greater than T (= hidden_states.size(1)) reads/writes past [E, T, *].
+        # This also covers the DeepEP-LL masked path, which has no producer-side
+        # assert. Async + gated, so it is a loud detector without a host sync.
+        # See HANDOFF §0.7/§0.10.
+        if envs.SGLANG_ENABLE_ASYNC_ASSERT.get():
+            torch._assert_async(
+                masked_m.max() <= hidden_states.size(1),
+                "Masked MoE masked_m exceeds the padded token dim T "
+                "(corrupt dispatch geometry; would read/write past [E, T, *])",
+            )
+
         if use_mxfp8:
             recipe_b = tuple(quant_info.block_shape)
             # gran_k is set by the dispatch path (standard=block_shape[1], DeepEP-LL=128),
