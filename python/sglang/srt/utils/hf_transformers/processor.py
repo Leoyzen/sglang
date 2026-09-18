@@ -370,6 +370,10 @@ def get_processor(
     is_intentional_tokenizer = (
         is_lm_only
         or any("InternVL" in arch for arch in architectures)
+        # GLM-5.3 (Glm5NextForConditionalGeneration) carries a vision_config in
+        # its checkpoint but is also served text-only; AutoProcessor legitimately
+        # degrades to the bare tokenizer there, so treat it as intentional.
+        or any("Glm5Next" in arch for arch in architectures)
         or "InternVL3_5" in tokenizer_name
     )
 

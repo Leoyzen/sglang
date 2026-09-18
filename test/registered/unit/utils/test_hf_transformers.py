@@ -140,8 +140,8 @@ class TestGetProcessor(unittest.TestCase):
 
     def test_multimodal_bare_tokenizer_raises_runtime_error(self):
         config = SimpleNamespace(
-            model_type="glm5_next",
-            architectures=["Glm5NextForConditionalGeneration"],
+            model_type="llava",
+            architectures=["LlavaForConditionalGeneration"],
             vision_config={"patch_size": 14},
             auto_map={},
         )
@@ -157,9 +157,34 @@ class TestGetProcessor(unittest.TestCase):
             AutoProcessor=auto_processor,
         ):
             with self.assertRaises(RuntimeError) as ctx:
-                processor_utils.get_processor("zai-org/GLM-5.3-Flash")
+                processor_utils.get_processor("some/multimodal-model")
             self.assertIn("bare tokenizer", str(ctx.exception))
-            self.assertIn("Glm5NextForConditionalGeneration", str(ctx.exception))
+            self.assertIn("LlavaForConditionalGeneration", str(ctx.exception))
+
+    def test_glm5next_bare_tokenizer_allowed(self):
+        # GLM-5.3 carries a vision_config but is also served text-only; a bare
+        # tokenizer from AutoProcessor must not trip the multimodal guard.
+        config = SimpleNamespace(
+            model_type="glm5_next",
+            architectures=["Glm5NextForConditionalGeneration"],
+            vision_config={"patch_size": 14},
+            auto_map={},
+        )
+        bare_tokenizer = MagicMock(spec=PreTrainedTokenizer)
+        bare_tokenizer.chat_template = "template"
+        bare_tokenizer.get_added_vocab.return_value = {}
+        auto_config = MagicMock()
+        auto_config.from_pretrained.return_value = config
+        auto_processor = MagicMock()
+        auto_processor.from_pretrained.return_value = bare_tokenizer
+
+        with patch.multiple(
+            processor_utils,
+            AutoConfig=auto_config,
+            AutoProcessor=auto_processor,
+        ):
+            processor = processor_utils.get_processor("zai-org/GLM-5.3-Flash")
+            self.assertIs(processor, bare_tokenizer)
 
     def test_intentional_tokenizer_allowed(self):
         config = SimpleNamespace(
