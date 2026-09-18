@@ -43,6 +43,31 @@ def round_up_grid(total: int, grid: Sequence[int]) -> int:
     return grid[index]
 
 
+def row_map_from_qo_indptr(
+    qo_indptr: torch.Tensor, num_tokens: int, bs: int
+) -> torch.Tensor:
+    """Per-token request row from the ragged verify layout's qo_indptr.
+
+    Bisect-right over the full indptr puts token t in the last row starting at
+    or before it, so zero-length rows are skipped naturally; tokens past the
+    capped layout's final cumsum (its tail pad) clamp into the last row. The
+    pad tokens hash to garbage rows but have no consumer: their logits are
+    scattered away and verify never commits them to history.
+
+    Built with searchsorted over a fixed shape -- never repeat_interleave,
+    whose output shape depends on data, which cuda graph replay cannot
+    tolerate.
+    """
+    return (
+        torch.searchsorted(
+            qo_indptr,
+            torch.arange(num_tokens, device=qo_indptr.device),
+            right=True,
+        )
+        - 1
+    ).clamp_max(bs - 1)
+
+
 class RaggedVerifyLayout(msgspec.Struct, frozen=True):
     verify_lens: torch.Tensor
     graph_num_tokens: int
