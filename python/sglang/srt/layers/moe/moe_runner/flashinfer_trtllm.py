@@ -181,6 +181,14 @@ def _get_routing_for_flashinfer_routed(topk_output) -> FlashInferRouting:
         return topk_output.packed_topk_ids
 
     assert TopKOutputChecker.format_is_standard(topk_output)
+    # StandardTopKOutputPacked carries the ids the router already packed in
+    # its own launch; prefer them over re-deriving a tuple. The deferred
+    # finalize adapter reinterprets the FP32 (ids, weights) pair as BF16, so
+    # handing it the packed buffer is what keeps CUDA-graph decoding from
+    # emitting repeated BOS tokens.
+    packed_topk_ids = getattr(topk_output, "packed_topk_ids", None)
+    if packed_topk_ids is not None:
+        return packed_topk_ids
     return (
         topk_output.topk_ids.contiguous(),
         topk_output.topk_weights.contiguous(),
