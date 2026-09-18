@@ -9,6 +9,16 @@ from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(1.0, "base-a-test-cpu")
 
+import json
+from unittest.mock import patch
+
+from sglang.srt.entrypoints.openai.protocol import Function, Tool
+from sglang.srt.function_call.deepseekv4_detector import DeepSeekV4Detector
+from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
+
+register_cpu_ci(1.0, "base-a-test-cpu")
+
 DSML = "｜DSML｜"
 
 
@@ -103,8 +113,9 @@ class TestDeepSeekV4Streaming(CustomTestCase):
         self.assertEqual(len(result.calls), 2)
 
     def test_parse_error_neither_swallows_nor_duplicates(self):
-        """An unexpected parse error must not empty the turn, and the dropped
-        buffer must not come back on the next delta."""
+        """An unexpected parse error keeps the buffer for a retry with more
+        data, resets only the transient tool state, and emits neither the
+        buffered call text nor duplicated text in the meantime."""
         detector = DeepSeekV4Detector()
 
         with patch.object(
@@ -113,14 +124,40 @@ class TestDeepSeekV4Streaming(CustomTestCase):
             side_effect=RuntimeError("boom"),
         ):
             first = detector.parse_streaming_increment(_weather_call(), self.tools)
-            self.assertEqual(detector._buffer, "")
+            # Buffer retained for retry; transient state reset so a partial
+            # parse cannot corrupt the next attempt.
+            self.assertIn(_weather_call(), detector._buffer)
+            self.assertEqual(detector.current_tool_id, -1)
+            self.assertEqual(detector.prev_tool_call_arr, [])
             second = detector.parse_streaming_increment(" tail", self.tools)
 
-        self.assertIn("get_weather", first.normal_text)
-        self.assertNotIn("get_weather", second.normal_text)
-        # No half-formed call: the failure can land between a tool's name and its
-        # arguments, so an argument-less named call must not reach the client.
+        # No turn content is lost or duplicated while the buffer waits: the
+        # failure can land between a tool's name and its arguments, and a
+        # half-formed call is worse than holding the text for one more delta.
+        self.assertEqual(first.normal_text, "")
+        self.assertEqual(second.normal_text, "")
+        # No half-formed call reaches the client.
         self.assertEqual(first.calls, [])
+        self.assertEqual(second.calls, [])
+
+    def test_parse_error_recovers_on_next_delta(self):
+        """A transient parse error must not permanently lose the tool call:
+        once parsing works again, the retained buffer parses normally."""
+        detector = DeepSeekV4Detector()
+
+        with patch.object(
+            DeepSeekV4Detector,
+            "_parse_parameters_from_xml",
+            side_effect=RuntimeError("boom"),
+        ):
+            first = detector.parse_streaming_increment(_weather_call(), self.tools)
+        second = detector.parse_streaming_increment("", self.tools)
+
+        self.assertEqual(first.calls, [])
+        names = [c.name for c in second.calls]
+        args = "".join(c.parameters or "" for c in second.calls)
+        self.assertIn("get_weather", names)
+        self.assertEqual(json.loads(args), {"city": "SF"})
 
 
 if __name__ == "__main__":
