@@ -2332,6 +2332,19 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
             return None, None
         return node.key.extra_key, node.key.cache_salt
 
+    def build_backup_action(
+        self, node_id: NodeId, write_back: bool = False
+    ) -> BackupKV:
+        """Build a backup action for a node and any not-yet-persisted ancestors.
+
+        Public wrapper over :meth:`_build_backup_kv_action` for callers that
+        hold a NodeId rather than a node (e.g. the cache's chunked-prefill
+        external-linker offload).
+        """
+        return self._build_backup_kv_action(
+            self.node_by_id(node_id), write_back=write_back
+        )
+
     def _build_backup_kv_action(
         self, node: UnifiedTreeNode, write_back: bool = False
     ) -> BackupKV:

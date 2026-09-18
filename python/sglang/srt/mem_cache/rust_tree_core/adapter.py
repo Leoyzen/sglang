@@ -756,6 +756,17 @@ class RustUnifiedTreeCore(UnifiedTreeCoreInterface):
         device_value, comp_xfers = self._binding.build_backup_spec(node_id)
         return device_value, _comp_xfers_from_binding(comp_xfers)
 
+    def build_backup_action(
+        self, node_id: NodeId, write_back: bool = False
+    ) -> BackupKV:
+        # The Rust binding does not expose the chain builder yet. Its only
+        # caller is the external-linker chunked-prefill offload, which already
+        # needs node_by_id -- itself unported on this backend -- so linker mode
+        # cannot reach here until the Rust core ports the whole path.
+        raise NotImplementedError(
+            "build_backup_action: not yet ported to the Rust tree core"
+        )
+
     def build_storage_backup_spec(
         self, node_id: NodeId, pass_prefix_keys: bool
     ) -> Optional[StorageBackupSpec]:

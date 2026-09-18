@@ -1175,6 +1175,28 @@ class UnifiedRadixCache(BasePrefixCache):
         insert_params.value = values
         result = self.insert(insert_params)
 
+        # Eager external-linker offload for chunked prefills. Hit-count based
+        # write-through never fires for a chunked request: the hit counter is
+        # skipped for chunked inserts by design (#9776, so a request's own
+        # in-flight chunks are not counted as hits), and `_should_backup_after_insert`
+        # only reaches the external-linker branch for a new leaf. A prompt longer
+        # than `chunked_prefill_size` is therefore permanently ineligible, and on
+        # eviction its pages are destroyed instead of reaching L3 -- exactly the
+        # cold long prompts that would benefit most. Offload each newly inserted
+        # chain as it lands; the chain builder only walks not-yet-backed
+        # ancestors, so this is incremental and idempotent, and it does not touch
+        # `hit_count`, so the #9776 self-inflation concern is not reintroduced.
+        if (
+            chunked
+            and self.linker is not None
+            and not self.tree_core.is_write_back
+            and not result.rotation_tail_declined
+            and result.last_device_node is not None
+        ):
+            self._apply_cache_action(
+                self.tree_core.build_backup_action(result.last_device_node)
+            )
+
         if result.rotation_tail_declined:
             # Rotation-base discontinuity with the matched chain (pipelined
             # batches raced this request's insert against another chain over
