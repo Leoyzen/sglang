@@ -14,11 +14,14 @@ from sglang.srt.layers.attention.dsa.dsa_indexer import (
     rotate_activation,
 )
 from sglang.srt.layers.attention.dsa.dsa_topk_backend import TopkTransformMethod
-from sglang.srt.layers.attention.dsa.mqa_logits_budget import (
-    mqa_logits_max_rows,
-    should_chunk_mqa_logits,
-)
 from sglang.srt.layers.attention.dsa.utils import dsa_use_prefill_cp
+from sglang.srt.layers.attention.mqa_logits_utils import (
+    mqa_logits_budget_bytes,
+    mqa_logits_row_bytes,
+    mqa_logits_rows_per_chunk,
+    mqa_logits_should_chunk,
+    mqa_logits_static_budget_bytes,
+)
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.utils import add_prefix, ceil_align, is_cuda, is_hip, is_npu
@@ -58,6 +61,25 @@ if TYPE_CHECKING:
 
 
 class IndexerKPool(MultiPlatformOp):
+    # One measured budget per device for the process lifetime (mirrors Indexer).
+    _mqa_logits_budget_bytes: Dict[int, int] = {}
+
+    def _get_mqa_logits_budget_bytes(self, device_index: int) -> int:
+        cached_budget = self._mqa_logits_budget_bytes.get(device_index)
+        if cached_budget is not None:
+            return cached_budget
+
+        # Graph capture cannot sync the host; use the static guard and do not
+        # cache it, so the first eager prefill still measures the real budget.
+        if get_is_capture_mode():
+            return mqa_logits_static_budget_bytes(device_index=device_index)
+
+        budget_bytes = mqa_logits_budget_bytes(
+            device_index=device_index, allow_sync=True
+        )
+        self._mqa_logits_budget_bytes[device_index] = budget_bytes
+        return budget_bytes
+
     def __init__(
         self,
         hidden_size: int,
@@ -1076,8 +1098,11 @@ class IndexerKPool(MultiPlatformOp):
         # with the whole batch's context, while each q row only reads its own
         # request's column window. Splitting per request (and then per q-row
         # chunk) keeps the peak inside the budget. See sgl-project/sglang#37712.
-        need_chunk, logits_budget_bytes = should_chunk_mqa_logits(
-            n_real, total_k_rows, device.index
+        need_chunk, logits_budget_bytes = mqa_logits_should_chunk(
+            num_rows=n_real,
+            num_cols=total_k_rows,
+            get_budget_bytes=lambda: self._get_mqa_logits_budget_bytes(device.index),
+            rocm=is_hip(),
         )
         if not need_chunk:
             logits = deep_gemm.fp8_mqa_logits(
@@ -1143,9 +1168,14 @@ class IndexerKPool(MultiPlatformOp):
             k_lo = group.k_start
             k_hi = k_lo + group.k_rows
             q_end = group.q_start + group.q_len
-            max_rows = mqa_logits_max_rows(
-                logits_budget_bytes, group.k_rows, group.q_len
+            # DeepGEMM pads the logits row stride to 256 fp32 columns, so the
+            # per-row cost is the aligned column count, not k_rows * 4.
+            rows_per_chunk = mqa_logits_rows_per_chunk(
+                num_rows=group.q_len,
+                row_bytes=mqa_logits_row_bytes(group.k_rows),
+                budget_bytes=logits_budget_bytes,
             )
+            max_rows = rows_per_chunk if rows_per_chunk is not None else group.q_len
 
             for start in range(group.q_start, q_end, max_rows):
                 end = min(start + max_rows, q_end)
