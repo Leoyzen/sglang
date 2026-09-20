@@ -995,15 +995,17 @@ class TestHybridDevicePoolAssembler(CustomTestCase):
             )
             # (b) the host stack received the UNWRAPPED full_kv_pool (1 draft
             # layer) and transfer layers grew by the draft count. The KV entry
-            # transfers transfer_layer_num(=|full|+|mamba| keys = 5) + 1 draft
-            # = 6 layers; the controller reflects the full union (5).
+            # transfers transfer_layer_id_max(=max(full|mamba keys)+1 = 5) + 1
+            # draft = 6 layers; the controller reflects the full union (5).
             host_kv = host_group.entry_map[PoolName.KV]
             self.assertEqual(len(host_kv.host_pool.mtp_draft_device_pools), 1)
             self.assertIs(
                 host_kv.host_pool.packed_device_kv_buffers[3], draft_inner_kv_buffer
             )
             self.assertEqual(host_kv.host_pool.layer_num, 4)  # 3 target + 1 draft
-            self.assertEqual(controller.layer_num, 5)  # full union (no draft)
+            self.assertEqual(
+                controller.transfer_layer_id_max, 5
+            )  # full union (no draft)
             # The layer mapper resolves the draft depth at transfer id
             # transfer_layer_start(5) + 0 to the first packed DRAFT layer of
             # the host pool (3 target layers + depth 0 -> pool layer 3).
