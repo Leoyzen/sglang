@@ -1,0 +1,6616 @@
+{
+  "meta": {
+    "device": "NVIDIA L20X",
+    "hidden": 5120,
+    "intermediate": 2304,
+    "experts": 96,
+    "top_k": 6,
+    "ep": 4,
+    "warmup": 20,
+    "iters": 50,
+    "rounds": 5,
+    "seed": 1234
+  },
+  "points": [
+    {
+      "gemm": "grouped",
+      "label": "decode_bs16",
+      "M": 16,
+      "rows_valid": 24,
+      "parent_v": 96,
+      "fixed_v": 24,
+      "parent_ms": 0.5374067115783692,
+      "fixed_ms": 0.5374067115783692,
+      "parent_w13": {
+        "block_shape": [
+          8,
+          256,
+          128
+        ],
+        "warp_shape": [
+          8,
+          32,
+          64
+        ],
+        "use_stream_k": true,
+        "use_f16_accum": false,
+        "num_stages": 4,
+        "use_warp_spec": true,
+        "use_tma": true,
+        "use_mbarrier": true
+      },
+      "parent_w2": {
+        "block_shape": [
+          8,
+          256,
+          128
+        ],
+        "warp_shape": [
+          8,
+          32,
+          64
+        ],
+        "use_stream_k": true,
+        "use_f16_accum": false,
+        "num_stages": 4,
+        "use_warp_spec": true,
+        "use_tma": true,
+        "use_mbarrier": true
+      },
+      "best_v": 281,
+      "best_ms": 0.49944192886352534,
+      "best_w13": {
+        "block_shape": [
+          16,
+          256,
+          128
+        ],
+        "warp_shape": [
+          16,
+          32,
+          64
+        ],
+        "use_stream_k": true,
+        "use_f16_accum": false,
+        "num_stages": 4,
+        "use_warp_spec": true,
+        "use_tma": true,
+        "use_mbarrier": true
+      },
+      "best_w2": {
+        "block_shape": [
+          16,
+          256,
+          128
+        ],
+        "warp_shape": [
+          16,
+          32,
+          64
+        ],
+        "use_stream_k": true,
+        "use_f16_accum": false,
+        "num_stages": 4,
+        "use_warp_spec": true,
+        "use_tma": true,
+        "use_mbarrier": true
+      },
+      "parent_is_best": false,
+      "parent_vs_best_pct": 7.601440832417139,
+      "candidates": [
+        {
+          "v": 1,
+          "is_parent": true,
+          "is_fixed": true,
+          "w13": {
+            "block_shape": [
+              8,
+              256,
+              128
+            ],
+            "warp_shape": [
+              8,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              8,
+              256,
+              128
+            ],
+            "warp_shape": [
+              8,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 0.36707134246826173,
+          "w2_ms": 0.1703353691101074,
+          "sum_ms": 0.5374067115783692,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 281,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              16,
+              256,
+              128
+            ],
+            "warp_shape": [
+              16,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              16,
+              256,
+              128
+            ],
+            "warp_shape": [
+              16,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 0.30616960525512693,
+          "w2_ms": 0.19327232360839844,
+          "sum_ms": 0.49944192886352534,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 769,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              24,
+              256,
+              128
+            ],
+            "warp_shape": [
+              24,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              24,
+              256,
+              128
+            ],
+            "warp_shape": [
+              24,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 0.30783424377441404,
+          "w2_ms": 0.19161088943481444,
+          "sum_ms": 0.49944513320922845,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 1281,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              32,
+              256,
+              128
+            ],
+            "warp_shape": [
+              32,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              32,
+              256,
+              128
+            ],
+            "warp_shape": [
+              32,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 0.31236799240112306,
+          "w2_ms": 0.1940915107727051,
+          "sum_ms": 0.5064595031738282,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 1601,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              40,
+              256,
+              64
+            ],
+            "warp_shape": [
+              40,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              40,
+              256,
+              64
+            ],
+            "warp_shape": [
+              40,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 0.37282302856445315,
+          "w2_ms": 0.1958412742614746,
+          "sum_ms": 0.5686643028259277,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 2113,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              48,
+              256,
+              64
+            ],
+            "warp_shape": [
+              48,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              48,
+              256,
+              64
+            ],
+            "warp_shape": [
+              48,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 0.38340862274169923,
+          "w2_ms": 0.187128963470459,
+          "sum_ms": 0.5705375862121582,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 2401,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              56,
+              256,
+              64
+            ],
+            "warp_shape": [
+              56,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              56,
+              256,
+              64
+            ],
+            "warp_shape": [
+              56,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 0.3873740768432617,
+          "w2_ms": 0.20242624282836913,
+          "sum_ms": 0.5898003196716308,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 2945,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              64,
+              256,
+              64
+            ],
+            "warp_shape": [
+              64,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              64,
+              256,
+              64
+            ],
+            "warp_shape": [
+              64,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 0.39732479095458983,
+          "w2_ms": 0.20669055938720704,
+          "sum_ms": 0.6040153503417969,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 3713,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              72,
+              256,
+              64
+            ],
+            "warp_shape": [
+              72,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              72,
+              256,
+              64
+            ],
+            "warp_shape": [
+              72,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 0.39469696044921876,
+          "w2_ms": 0.19954687118530273,
+          "sum_ms": 0.5942438316345215,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 4097,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              80,
+              256,
+              64
+            ],
+            "warp_shape": [
+              80,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              80,
+              256,
+              64
+            ],
+            "warp_shape": [
+              80,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 0.40014400482177737,
+          "w2_ms": 0.20454080581665038,
+          "sum_ms": 0.6046848106384277,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 4609,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              88,
+              256,
+              64
+            ],
+            "warp_shape": [
+              88,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              88,
+              256,
+              64
+            ],
+            "warp_shape": [
+              88,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 0.41757568359375,
+          "w2_ms": 0.1914041519165039,
+          "sum_ms": 0.6089798355102539,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 5377,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              96,
+              256,
+              64
+            ],
+            "warp_shape": [
+              96,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              96,
+              256,
+              64
+            ],
+            "warp_shape": [
+              96,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 0.4638297653198242,
+          "w2_ms": 0.21974336624145507,
+          "sum_ms": 0.6835731315612793,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 5825,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              104,
+              256,
+              64
+            ],
+            "warp_shape": [
+              104,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              104,
+              256,
+              64
+            ],
+            "warp_shape": [
+              104,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 0.4654764938354492,
+          "w2_ms": 0.22060672760009767,
+          "sum_ms": 0.6860832214355469,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 6273,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              112,
+              256,
+              64
+            ],
+            "warp_shape": [
+              112,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              112,
+              256,
+              64
+            ],
+            "warp_shape": [
+              112,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 0.4492652893066406,
+          "w2_ms": 0.2740863990783691,
+          "sum_ms": 0.7233516883850097,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 6785,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              120,
+              256,
+              64
+            ],
+            "warp_shape": [
+              120,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              120,
+              256,
+              64
+            ],
+            "warp_shape": [
+              120,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 0.4492153549194336,
+          "w2_ms": 0.2777248001098633,
+          "sum_ms": 0.7269401550292969,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 8065,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              128,
+              256,
+              64
+            ],
+            "warp_shape": [
+              128,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              128,
+              256,
+              64
+            ],
+            "warp_shape": [
+              128,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 0.4720159912109375,
+          "w2_ms": 0.2691155242919922,
+          "sum_ms": 0.7411315155029297,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 8897,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              136,
+              256,
+              64
+            ],
+            "warp_shape": [
+              136,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              136,
+              256,
+              64
+            ],
+            "warp_shape": [
+              136,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 0.47089855194091795,
+          "w2_ms": 0.2741414451599121,
+          "sum_ms": 0.7450399971008301,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 9409,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              144,
+              256,
+              64
+            ],
+            "warp_shape": [
+              144,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              144,
+              256,
+              64
+            ],
+            "warp_shape": [
+              144,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 0.47918975830078125,
+          "w2_ms": 0.22737663269042968,
+          "sum_ms": 0.706566390991211,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 9985,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              152,
+              256,
+              64
+            ],
+            "warp_shape": [
+              152,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              152,
+              256,
+              64
+            ],
+            "warp_shape": [
+              152,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 0.5176947021484375,
+          "w2_ms": 0.2576492881774902,
+          "sum_ms": 0.7753439903259277,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 11201,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              160,
+              256,
+              64
+            ],
+            "warp_shape": [
+              160,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              160,
+              256,
+              64
+            ],
+            "warp_shape": [
+              160,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 0.507083511352539,
+          "w2_ms": 0.30010879516601563,
+          "sum_ms": 0.8071923065185547,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 11841,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              168,
+              256,
+              64
+            ],
+            "warp_shape": [
+              168,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              168,
+              256,
+              64
+            ],
+            "warp_shape": [
+              168,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 0.5745516967773437,
+          "w2_ms": 0.3083212852478027,
+          "sum_ms": 0.8828729820251464,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 12289,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              176,
+              256,
+              64
+            ],
+            "warp_shape": [
+              176,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              176,
+              256,
+              64
+            ],
+            "warp_shape": [
+              176,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 0.6051948928833008,
+          "w2_ms": 0.369760627746582,
+          "sum_ms": 0.9749555206298828,
+          "num_tokens_padded": null,
+          "error": null
+        }
+      ]
+    },
+    {
+      "gemm": "grouped",
+      "label": "decode_bs32",
+      "M": 32,
+      "rows_valid": 48,
+      "parent_v": 192,
+      "fixed_v": 48,
+      "parent_ms": 1.041599998474121,
+      "fixed_ms": 1.041599998474121,
+      "parent_w13": {
+        "block_shape": [
+          8,
+          256,
+          128
+        ],
+        "warp_shape": [
+          8,
+          32,
+          64
+        ],
+        "use_stream_k": true,
+        "use_f16_accum": false,
+        "num_stages": 4,
+        "use_warp_spec": true,
+        "use_tma": true,
+        "use_mbarrier": true
+      },
+      "parent_w2": {
+        "block_shape": [
+          8,
+          256,
+          128
+        ],
+        "warp_shape": [
+          8,
+          32,
+          64
+        ],
+        "use_stream_k": true,
+        "use_f16_accum": false,
+        "num_stages": 4,
+        "use_warp_spec": true,
+        "use_tma": true,
+        "use_mbarrier": true
+      },
+      "best_v": 1281,
+      "best_ms": 0.9937753295898437,
+      "best_w13": {
+        "block_shape": [
+          32,
+          256,
+          128
+        ],
+        "warp_shape": [
+          32,
+          32,
+          64
+        ],
+        "use_stream_k": true,
+        "use_f16_accum": false,
+        "num_stages": 4,
+        "use_warp_spec": true,
+        "use_tma": true,
+        "use_mbarrier": true
+      },
+      "best_w2": {
+        "block_shape": [
+          32,
+          256,
+          128
+        ],
+        "warp_shape": [
+          32,
+          32,
+          64
+        ],
+        "use_stream_k": true,
+        "use_f16_accum": false,
+        "num_stages": 4,
+        "use_warp_spec": true,
+        "use_tma": true,
+        "use_mbarrier": true
+      },
+      "parent_is_best": false,
+      "parent_vs_best_pct": 4.812422633193747,
+      "candidates": [
+        {
+          "v": 1,
+          "is_parent": true,
+          "is_fixed": true,
+          "w13": {
+            "block_shape": [
+              8,
+              256,
+              128
+            ],
+            "warp_shape": [
+              8,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              8,
+              256,
+              128
+            ],
+            "warp_shape": [
+              8,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 0.6675135803222656,
+          "w2_ms": 0.37408641815185545,
+          "sum_ms": 1.041599998474121,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 281,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              16,
+              256,
+              128
+            ],
+            "warp_shape": [
+              16,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              16,
+              256,
+              128
+            ],
+            "warp_shape": [
+              16,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 0.6477983856201172,
+          "w2_ms": 0.3665625762939453,
+          "sum_ms": 1.0143609619140626,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 769,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              24,
+              256,
+              128
+            ],
+            "warp_shape": [
+              24,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              24,
+              256,
+              128
+            ],
+            "warp_shape": [
+              24,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 0.6497913360595703,
+          "w2_ms": 0.3691904067993164,
+          "sum_ms": 1.0189817428588868,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 1281,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              32,
+              256,
+              128
+            ],
+            "warp_shape": [
+              32,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              32,
+              256,
+              128
+            ],
+            "warp_shape": [
+              32,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 0.6571942138671875,
+          "w2_ms": 0.33658111572265625,
+          "sum_ms": 0.9937753295898437,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 1601,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              40,
+              256,
+              64
+            ],
+            "warp_shape": [
+              40,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              40,
+              256,
+              64
+            ],
+            "warp_shape": [
+              40,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 0.7123212432861328,
+          "w2_ms": 0.3810348892211914,
+          "sum_ms": 1.0933561325073242,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 2113,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              48,
+              256,
+              64
+            ],
+            "warp_shape": [
+              48,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              48,
+              256,
+              64
+            ],
+            "warp_shape": [
+              48,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 0.7462445068359375,
+          "w2_ms": 0.38926593780517577,
+          "sum_ms": 1.1355104446411133,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 2401,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              56,
+              256,
+              64
+            ],
+            "warp_shape": [
+              56,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              56,
+              256,
+              64
+            ],
+            "warp_shape": [
+              56,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 0.730348129272461,
+          "w2_ms": 0.3926105499267578,
+          "sum_ms": 1.1229586791992188,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 2945,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              64,
+              256,
+              64
+            ],
+            "warp_shape": [
+              64,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              64,
+              256,
+              64
+            ],
+            "warp_shape": [
+              64,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 0.7650208282470703,
+          "w2_ms": 0.40290111541748047,
+          "sum_ms": 1.1679219436645507,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 3713,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              72,
+              256,
+              64
+            ],
+            "warp_shape": [
+              72,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              72,
+              256,
+              64
+            ],
+            "warp_shape": [
+              72,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 0.7867814636230469,
+          "w2_ms": 0.4027711868286133,
+          "sum_ms": 1.1895526504516603,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 4097,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              80,
+              256,
+              64
+            ],
+            "warp_shape": [
+              80,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              80,
+              256,
+              64
+            ],
+            "warp_shape": [
+              80,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 0.8002912139892578,
+          "w2_ms": 0.4414656066894531,
+          "sum_ms": 1.2417568206787108,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 4609,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              88,
+              256,
+              64
+            ],
+            "warp_shape": [
+              88,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              88,
+              256,
+              64
+            ],
+            "warp_shape": [
+              88,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 0.8368153381347656,
+          "w2_ms": 0.43869312286376955,
+          "sum_ms": 1.2755084609985352,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 5377,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              96,
+              256,
+              64
+            ],
+            "warp_shape": [
+              96,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              96,
+              256,
+              64
+            ],
+            "warp_shape": [
+              96,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 0.8595884704589843,
+          "w2_ms": 0.4707833480834961,
+          "sum_ms": 1.3303718185424804,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 5825,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              104,
+              256,
+              64
+            ],
+            "warp_shape": [
+              104,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              104,
+              256,
+              64
+            ],
+            "warp_shape": [
+              104,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 0.9124486541748047,
+          "w2_ms": 0.47463489532470704,
+          "sum_ms": 1.3870835494995117,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 6273,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              112,
+              256,
+              64
+            ],
+            "warp_shape": [
+              112,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              112,
+              256,
+              64
+            ],
+            "warp_shape": [
+              112,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 0.915712661743164,
+          "w2_ms": 0.47697601318359373,
+          "sum_ms": 1.3926886749267577,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 6785,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              120,
+              256,
+              64
+            ],
+            "warp_shape": [
+              120,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              120,
+              256,
+              64
+            ],
+            "warp_shape": [
+              120,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 0.9001618957519532,
+          "w2_ms": 0.48825855255126954,
+          "sum_ms": 1.3884204483032228,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 8065,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              128,
+              256,
+              64
+            ],
+            "warp_shape": [
+              128,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              128,
+              256,
+              64
+            ],
+            "warp_shape": [
+              128,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 0.9462802886962891,
+          "w2_ms": 0.4931372833251953,
+          "sum_ms": 1.4394175720214843,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 8897,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              136,
+              256,
+              64
+            ],
+            "warp_shape": [
+              136,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              136,
+              256,
+              64
+            ],
+            "warp_shape": [
+              136,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.000115203857422,
+          "w2_ms": 0.549447021484375,
+          "sum_ms": 1.5495622253417969,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 9409,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              144,
+              256,
+              64
+            ],
+            "warp_shape": [
+              144,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              144,
+              256,
+              64
+            ],
+            "warp_shape": [
+              144,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.0091519927978516,
+          "w2_ms": 0.5456204986572266,
+          "sum_ms": 1.5547724914550782,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 9985,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              152,
+              256,
+              64
+            ],
+            "warp_shape": [
+              152,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              152,
+              256,
+              64
+            ],
+            "warp_shape": [
+              152,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.0014163208007814,
+          "w2_ms": 0.5623129653930664,
+          "sum_ms": 1.5637292861938477,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 11201,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              160,
+              256,
+              64
+            ],
+            "warp_shape": [
+              160,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              160,
+              256,
+              64
+            ],
+            "warp_shape": [
+              160,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.091788787841797,
+          "w2_ms": 0.5723334503173828,
+          "sum_ms": 1.6641222381591798,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 11841,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              168,
+              256,
+              64
+            ],
+            "warp_shape": [
+              168,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              168,
+              256,
+              64
+            ],
+            "warp_shape": [
+              168,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.1042316436767579,
+          "w2_ms": 0.5784467315673828,
+          "sum_ms": 1.6826783752441408,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 12289,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              176,
+              256,
+              64
+            ],
+            "warp_shape": [
+              176,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              176,
+              256,
+              64
+            ],
+            "warp_shape": [
+              176,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.1583634948730468,
+          "w2_ms": 0.6530419158935546,
+          "sum_ms": 1.8114054107666013,
+          "num_tokens_padded": null,
+          "error": null
+        }
+      ]
+    },
+    {
+      "gemm": "grouped",
+      "label": "decode_bs48",
+      "M": 48,
+      "rows_valid": 72,
+      "parent_v": 288,
+      "fixed_v": 72,
+      "parent_ms": 1.4341888427734375,
+      "fixed_ms": 1.5442099380493164,
+      "parent_w13": {
+        "block_shape": [
+          16,
+          256,
+          128
+        ],
+        "warp_shape": [
+          16,
+          32,
+          64
+        ],
+        "use_stream_k": true,
+        "use_f16_accum": false,
+        "num_stages": 4,
+        "use_warp_spec": true,
+        "use_tma": true,
+        "use_mbarrier": true
+      },
+      "parent_w2": {
+        "block_shape": [
+          16,
+          256,
+          128
+        ],
+        "warp_shape": [
+          16,
+          32,
+          64
+        ],
+        "use_stream_k": true,
+        "use_f16_accum": false,
+        "num_stages": 4,
+        "use_warp_spec": true,
+        "use_tma": true,
+        "use_mbarrier": true
+      },
+      "best_v": 769,
+      "best_ms": 1.393791961669922,
+      "best_w13": {
+        "block_shape": [
+          24,
+          256,
+          128
+        ],
+        "warp_shape": [
+          24,
+          32,
+          64
+        ],
+        "use_stream_k": true,
+        "use_f16_accum": false,
+        "num_stages": 4,
+        "use_warp_spec": true,
+        "use_tma": true,
+        "use_mbarrier": true
+      },
+      "best_w2": {
+        "block_shape": [
+          24,
+          256,
+          128
+        ],
+        "warp_shape": [
+          24,
+          32,
+          64
+        ],
+        "use_stream_k": true,
+        "use_f16_accum": false,
+        "num_stages": 4,
+        "use_warp_spec": true,
+        "use_tma": true,
+        "use_mbarrier": true
+      },
+      "parent_is_best": false,
+      "parent_vs_best_pct": 2.8983436706806254,
+      "candidates": [
+        {
+          "v": 1,
+          "is_parent": false,
+          "is_fixed": true,
+          "w13": {
+            "block_shape": [
+              8,
+              256,
+              128
+            ],
+            "warp_shape": [
+              8,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              8,
+              256,
+              128
+            ],
+            "warp_shape": [
+              8,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.015913619995117,
+          "w2_ms": 0.5282963180541992,
+          "sum_ms": 1.5442099380493164,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 281,
+          "is_parent": true,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              16,
+              256,
+              128
+            ],
+            "warp_shape": [
+              16,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              16,
+              256,
+              128
+            ],
+            "warp_shape": [
+              16,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 0.9404768371582031,
+          "w2_ms": 0.4937120056152344,
+          "sum_ms": 1.4341888427734375,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 769,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              24,
+              256,
+              128
+            ],
+            "warp_shape": [
+              24,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              24,
+              256,
+              128
+            ],
+            "warp_shape": [
+              24,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 0.9266687774658203,
+          "w2_ms": 0.46712318420410154,
+          "sum_ms": 1.393791961669922,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 1281,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              32,
+              256,
+              128
+            ],
+            "warp_shape": [
+              32,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              32,
+              256,
+              128
+            ],
+            "warp_shape": [
+              32,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 0.9450790405273437,
+          "w2_ms": 0.5502483367919921,
+          "sum_ms": 1.4953273773193358,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 1601,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              40,
+              256,
+              64
+            ],
+            "warp_shape": [
+              40,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              40,
+              256,
+              64
+            ],
+            "warp_shape": [
+              40,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.069205093383789,
+          "w2_ms": 0.5654099273681641,
+          "sum_ms": 1.6346150207519532,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 2113,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              48,
+              256,
+              64
+            ],
+            "warp_shape": [
+              48,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              48,
+              256,
+              64
+            ],
+            "warp_shape": [
+              48,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.0933023834228515,
+          "w2_ms": 0.5771718215942383,
+          "sum_ms": 1.6704742050170898,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 2401,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              56,
+              256,
+              64
+            ],
+            "warp_shape": [
+              56,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              56,
+              256,
+              64
+            ],
+            "warp_shape": [
+              56,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.1124639892578125,
+          "w2_ms": 0.5799033737182617,
+          "sum_ms": 1.6923673629760743,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 2945,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              64,
+              256,
+              64
+            ],
+            "warp_shape": [
+              64,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              64,
+              256,
+              64
+            ],
+            "warp_shape": [
+              64,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.2006073760986329,
+          "w2_ms": 0.639991683959961,
+          "sum_ms": 1.8405990600585938,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 3713,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              72,
+              256,
+              64
+            ],
+            "warp_shape": [
+              72,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              72,
+              256,
+              64
+            ],
+            "warp_shape": [
+              72,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.1451481628417968,
+          "w2_ms": 0.6460582733154296,
+          "sum_ms": 1.7912064361572264,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 4097,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              80,
+              256,
+              64
+            ],
+            "warp_shape": [
+              80,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              80,
+              256,
+              64
+            ],
+            "warp_shape": [
+              80,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.2128607940673828,
+          "w2_ms": 0.6278470230102539,
+          "sum_ms": 1.8407078170776368,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 4609,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              88,
+              256,
+              64
+            ],
+            "warp_shape": [
+              88,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              88,
+              256,
+              64
+            ],
+            "warp_shape": [
+              88,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.2584819030761718,
+          "w2_ms": 0.6310303878784179,
+          "sum_ms": 1.8895122909545896,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 5377,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              96,
+              256,
+              64
+            ],
+            "warp_shape": [
+              96,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              96,
+              256,
+              64
+            ],
+            "warp_shape": [
+              96,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.275203857421875,
+          "w2_ms": 0.6768172454833984,
+          "sum_ms": 1.9520211029052734,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 5825,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              104,
+              256,
+              64
+            ],
+            "warp_shape": [
+              104,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              104,
+              256,
+              64
+            ],
+            "warp_shape": [
+              104,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.2552633666992188,
+          "w2_ms": 0.7307596588134766,
+          "sum_ms": 1.9860230255126954,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 6273,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              112,
+              256,
+              64
+            ],
+            "warp_shape": [
+              112,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              112,
+              256,
+              64
+            ],
+            "warp_shape": [
+              112,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.3383270263671876,
+          "w2_ms": 0.6992127990722656,
+          "sum_ms": 2.0375398254394534,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 6785,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              120,
+              256,
+              64
+            ],
+            "warp_shape": [
+              120,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              120,
+              256,
+              64
+            ],
+            "warp_shape": [
+              120,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.319351043701172,
+          "w2_ms": 0.7436454772949219,
+          "sum_ms": 2.062996520996094,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 8065,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              128,
+              256,
+              64
+            ],
+            "warp_shape": [
+              128,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              128,
+              256,
+              64
+            ],
+            "warp_shape": [
+              128,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.3274957275390624,
+          "w2_ms": 0.7157676696777344,
+          "sum_ms": 2.043263397216797,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 8897,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              136,
+              256,
+              64
+            ],
+            "warp_shape": [
+              136,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              136,
+              256,
+              64
+            ],
+            "warp_shape": [
+              136,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.438647003173828,
+          "w2_ms": 0.7432064056396485,
+          "sum_ms": 2.1818534088134767,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 9409,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              144,
+              256,
+              64
+            ],
+            "warp_shape": [
+              144,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              144,
+              256,
+              64
+            ],
+            "warp_shape": [
+              144,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.4876063537597657,
+          "w2_ms": 0.8219910430908203,
+          "sum_ms": 2.309597396850586,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 9985,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              152,
+              256,
+              64
+            ],
+            "warp_shape": [
+              152,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              152,
+              256,
+              64
+            ],
+            "warp_shape": [
+              152,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.5461549377441406,
+          "w2_ms": 0.8143116760253907,
+          "sum_ms": 2.3604666137695314,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 11201,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              160,
+              256,
+              64
+            ],
+            "warp_shape": [
+              160,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              160,
+              256,
+              64
+            ],
+            "warp_shape": [
+              160,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.5880256652832032,
+          "w2_ms": 0.8220396423339844,
+          "sum_ms": 2.4100653076171876,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 11841,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              168,
+              256,
+              64
+            ],
+            "warp_shape": [
+              168,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              168,
+              256,
+              64
+            ],
+            "warp_shape": [
+              168,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.6401849365234376,
+          "w2_ms": 0.8850758361816407,
+          "sum_ms": 2.525260772705078,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 12289,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              176,
+              256,
+              64
+            ],
+            "warp_shape": [
+              176,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              176,
+              256,
+              64
+            ],
+            "warp_shape": [
+              176,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.7167546081542968,
+          "w2_ms": 0.9451046752929687,
+          "sum_ms": 2.6618592834472654,
+          "num_tokens_padded": null,
+          "error": null
+        }
+      ]
+    },
+    {
+      "gemm": "grouped",
+      "label": "verify_bs32_x6",
+      "M": 192,
+      "rows_valid": 288,
+      "parent_v": 1152,
+      "fixed_v": 288,
+      "parent_ms": 2.281502075195313,
+      "fixed_ms": 2.526768569946289,
+      "parent_w13": {
+        "block_shape": [
+          24,
+          256,
+          128
+        ],
+        "warp_shape": [
+          24,
+          32,
+          64
+        ],
+        "use_stream_k": true,
+        "use_f16_accum": false,
+        "num_stages": 4,
+        "use_warp_spec": true,
+        "use_tma": true,
+        "use_mbarrier": true
+      },
+      "parent_w2": {
+        "block_shape": [
+          24,
+          256,
+          128
+        ],
+        "warp_shape": [
+          24,
+          32,
+          64
+        ],
+        "use_stream_k": true,
+        "use_f16_accum": false,
+        "num_stages": 4,
+        "use_warp_spec": true,
+        "use_tma": true,
+        "use_mbarrier": true
+      },
+      "best_v": 1601,
+      "best_ms": 2.251432876586914,
+      "best_w13": {
+        "block_shape": [
+          40,
+          256,
+          64
+        ],
+        "warp_shape": [
+          40,
+          32,
+          64
+        ],
+        "use_stream_k": true,
+        "use_f16_accum": false,
+        "num_stages": 4,
+        "use_warp_spec": true,
+        "use_tma": true,
+        "use_mbarrier": true
+      },
+      "best_w2": {
+        "block_shape": [
+          40,
+          256,
+          64
+        ],
+        "warp_shape": [
+          40,
+          32,
+          64
+        ],
+        "use_stream_k": true,
+        "use_f16_accum": false,
+        "num_stages": 4,
+        "use_warp_spec": true,
+        "use_tma": true,
+        "use_mbarrier": true
+      },
+      "parent_is_best": false,
+      "parent_vs_best_pct": 1.3355582980551617,
+      "candidates": [
+        {
+          "v": 1,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              8,
+              256,
+              128
+            ],
+            "warp_shape": [
+              8,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              8,
+              256,
+              128
+            ],
+            "warp_shape": [
+              8,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 2.1043545532226564,
+          "w2_ms": 1.0933280181884766,
+          "sum_ms": 3.197682571411133,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 281,
+          "is_parent": false,
+          "is_fixed": true,
+          "w13": {
+            "block_shape": [
+              16,
+              256,
+              128
+            ],
+            "warp_shape": [
+              16,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              16,
+              256,
+              128
+            ],
+            "warp_shape": [
+              16,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.6387199401855468,
+          "w2_ms": 0.8880486297607422,
+          "sum_ms": 2.526768569946289,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 769,
+          "is_parent": true,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              24,
+              256,
+              128
+            ],
+            "warp_shape": [
+              24,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              24,
+              256,
+              128
+            ],
+            "warp_shape": [
+              24,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.5167193603515625,
+          "w2_ms": 0.76478271484375,
+          "sum_ms": 2.281502075195313,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 1281,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              32,
+              256,
+              128
+            ],
+            "warp_shape": [
+              32,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              32,
+              256,
+              128
+            ],
+            "warp_shape": [
+              32,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.4827488708496093,
+          "w2_ms": 0.7781100463867188,
+          "sum_ms": 2.260858917236328,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 1601,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              40,
+              256,
+              64
+            ],
+            "warp_shape": [
+              40,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              40,
+              256,
+              64
+            ],
+            "warp_shape": [
+              40,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.4644613647460938,
+          "w2_ms": 0.7869715118408203,
+          "sum_ms": 2.251432876586914,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 2113,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              48,
+              256,
+              64
+            ],
+            "warp_shape": [
+              48,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              48,
+              256,
+              64
+            ],
+            "warp_shape": [
+              48,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.5558277893066406,
+          "w2_ms": 0.8566124725341797,
+          "sum_ms": 2.4124402618408203,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 2401,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              56,
+              256,
+              64
+            ],
+            "warp_shape": [
+              56,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              56,
+              256,
+              64
+            ],
+            "warp_shape": [
+              56,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.6128480529785156,
+          "w2_ms": 0.7935424041748047,
+          "sum_ms": 2.4063904571533206,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 2945,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              64,
+              256,
+              64
+            ],
+            "warp_shape": [
+              64,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              64,
+              256,
+              64
+            ],
+            "warp_shape": [
+              64,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.696549072265625,
+          "w2_ms": 0.833477783203125,
+          "sum_ms": 2.53002685546875,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 3713,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              72,
+              256,
+              64
+            ],
+            "warp_shape": [
+              72,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              72,
+              256,
+              64
+            ],
+            "warp_shape": [
+              72,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.6342655944824218,
+          "w2_ms": 0.9212525177001953,
+          "sum_ms": 2.555518112182617,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 4097,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              80,
+              256,
+              64
+            ],
+            "warp_shape": [
+              80,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              80,
+              256,
+              64
+            ],
+            "warp_shape": [
+              80,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.6444557189941407,
+          "w2_ms": 0.9243289947509765,
+          "sum_ms": 2.568784713745117,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 4609,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              88,
+              256,
+              64
+            ],
+            "warp_shape": [
+              88,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              88,
+              256,
+              64
+            ],
+            "warp_shape": [
+              88,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.82728515625,
+          "w2_ms": 0.937501449584961,
+          "sum_ms": 2.764786605834961,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 5377,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              96,
+              256,
+              64
+            ],
+            "warp_shape": [
+              96,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              96,
+              256,
+              64
+            ],
+            "warp_shape": [
+              96,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.8512115478515625,
+          "w2_ms": 1.0031148529052734,
+          "sum_ms": 2.854326400756836,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 5825,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              104,
+              256,
+              64
+            ],
+            "warp_shape": [
+              104,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              104,
+              256,
+              64
+            ],
+            "warp_shape": [
+              104,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.901604461669922,
+          "w2_ms": 0.982261734008789,
+          "sum_ms": 2.883866195678711,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 6273,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              112,
+              256,
+              64
+            ],
+            "warp_shape": [
+              112,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              112,
+              256,
+              64
+            ],
+            "warp_shape": [
+              112,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.9918124389648437,
+          "w2_ms": 1.0225363159179688,
+          "sum_ms": 3.0143487548828123,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 6785,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              120,
+              256,
+              64
+            ],
+            "warp_shape": [
+              120,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              120,
+              256,
+              64
+            ],
+            "warp_shape": [
+              120,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 2.046017303466797,
+          "w2_ms": 1.0123744201660156,
+          "sum_ms": 3.0583917236328126,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 8065,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              128,
+              256,
+              64
+            ],
+            "warp_shape": [
+              128,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              128,
+              256,
+              64
+            ],
+            "warp_shape": [
+              128,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 2.0421292114257814,
+          "w2_ms": 1.0977753448486327,
+          "sum_ms": 3.139904556274414,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 8897,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              136,
+              256,
+              64
+            ],
+            "warp_shape": [
+              136,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              136,
+              256,
+              64
+            ],
+            "warp_shape": [
+              136,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.989617919921875,
+          "w2_ms": 1.0718265533447267,
+          "sum_ms": 3.0614444732666017,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 9409,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              144,
+              256,
+              64
+            ],
+            "warp_shape": [
+              144,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              144,
+              256,
+              64
+            ],
+            "warp_shape": [
+              144,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 2.163990325927734,
+          "w2_ms": 1.1280057525634766,
+          "sum_ms": 3.291996078491211,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 9985,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              152,
+              256,
+              64
+            ],
+            "warp_shape": [
+              152,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              152,
+              256,
+              64
+            ],
+            "warp_shape": [
+              152,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 2.177687072753906,
+          "w2_ms": 1.1739871978759766,
+          "sum_ms": 3.351674270629883,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 11201,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              160,
+              256,
+              64
+            ],
+            "warp_shape": [
+              160,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              160,
+              256,
+              64
+            ],
+            "warp_shape": [
+              160,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 2.1761216735839843,
+          "w2_ms": 1.214449920654297,
+          "sum_ms": 3.3905715942382812,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 11841,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              168,
+              256,
+              64
+            ],
+            "warp_shape": [
+              168,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              168,
+              256,
+              64
+            ],
+            "warp_shape": [
+              168,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 2.3691757202148436,
+          "w2_ms": 1.2534815979003906,
+          "sum_ms": 3.622657318115234,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 12289,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              176,
+              256,
+              64
+            ],
+            "warp_shape": [
+              176,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              176,
+              256,
+              64
+            ],
+            "warp_shape": [
+              176,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 2.444965057373047,
+          "w2_ms": 1.3695449829101562,
+          "sum_ms": 3.8145100402832033,
+          "num_tokens_padded": null,
+          "error": null
+        }
+      ]
+    },
+    {
+      "gemm": "grouped",
+      "label": "verify_bs48_x6",
+      "M": 288,
+      "rows_valid": 432,
+      "parent_v": 1728,
+      "fixed_v": 432,
+      "parent_ms": 2.642142791748047,
+      "fixed_ms": 2.9535711669921874,
+      "parent_w13": {
+        "block_shape": [
+          40,
+          256,
+          64
+        ],
+        "warp_shape": [
+          40,
+          32,
+          64
+        ],
+        "use_stream_k": true,
+        "use_f16_accum": false,
+        "num_stages": 4,
+        "use_warp_spec": true,
+        "use_tma": true,
+        "use_mbarrier": true
+      },
+      "parent_w2": {
+        "block_shape": [
+          40,
+          256,
+          64
+        ],
+        "warp_shape": [
+          40,
+          32,
+          64
+        ],
+        "use_stream_k": true,
+        "use_f16_accum": false,
+        "num_stages": 4,
+        "use_warp_spec": true,
+        "use_tma": true,
+        "use_mbarrier": true
+      },
+      "best_v": 1281,
+      "best_ms": 2.427193603515625,
+      "best_w13": {
+        "block_shape": [
+          32,
+          256,
+          128
+        ],
+        "warp_shape": [
+          32,
+          32,
+          64
+        ],
+        "use_stream_k": true,
+        "use_f16_accum": false,
+        "num_stages": 4,
+        "use_warp_spec": true,
+        "use_tma": true,
+        "use_mbarrier": true
+      },
+      "best_w2": {
+        "block_shape": [
+          32,
+          256,
+          128
+        ],
+        "warp_shape": [
+          32,
+          32,
+          64
+        ],
+        "use_stream_k": true,
+        "use_f16_accum": false,
+        "num_stages": 4,
+        "use_warp_spec": true,
+        "use_tma": true,
+        "use_mbarrier": true
+      },
+      "parent_is_best": false,
+      "parent_vs_best_pct": 8.855873215926513,
+      "candidates": [
+        {
+          "v": 1,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              8,
+              256,
+              128
+            ],
+            "warp_shape": [
+              8,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              8,
+              256,
+              128
+            ],
+            "warp_shape": [
+              8,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 2.631619873046875,
+          "w2_ms": 1.397729949951172,
+          "sum_ms": 4.0293498229980464,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 281,
+          "is_parent": false,
+          "is_fixed": true,
+          "w13": {
+            "block_shape": [
+              16,
+              256,
+              128
+            ],
+            "warp_shape": [
+              16,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              16,
+              256,
+              128
+            ],
+            "warp_shape": [
+              16,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.9181004333496094,
+          "w2_ms": 1.0354707336425781,
+          "sum_ms": 2.9535711669921874,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 769,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              24,
+              256,
+              128
+            ],
+            "warp_shape": [
+              24,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              24,
+              256,
+              128
+            ],
+            "warp_shape": [
+              24,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.7190669250488282,
+          "w2_ms": 0.9419353485107422,
+          "sum_ms": 2.6610022735595704,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 1281,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              32,
+              256,
+              128
+            ],
+            "warp_shape": [
+              32,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              32,
+              256,
+              128
+            ],
+            "warp_shape": [
+              32,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.5071218872070313,
+          "w2_ms": 0.9200717163085937,
+          "sum_ms": 2.427193603515625,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 1601,
+          "is_parent": true,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              40,
+              256,
+              64
+            ],
+            "warp_shape": [
+              40,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              40,
+              256,
+              64
+            ],
+            "warp_shape": [
+              40,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.715081024169922,
+          "w2_ms": 0.927061767578125,
+          "sum_ms": 2.642142791748047,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 2113,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              48,
+              256,
+              64
+            ],
+            "warp_shape": [
+              48,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              48,
+              256,
+              64
+            ],
+            "warp_shape": [
+              48,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.7351858520507812,
+          "w2_ms": 0.9375199890136718,
+          "sum_ms": 2.6727058410644533,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 2401,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              56,
+              256,
+              64
+            ],
+            "warp_shape": [
+              56,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              56,
+              256,
+              64
+            ],
+            "warp_shape": [
+              56,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.6421209716796874,
+          "w2_ms": 0.9269203186035156,
+          "sum_ms": 2.569041290283203,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 2945,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              64,
+              256,
+              64
+            ],
+            "warp_shape": [
+              64,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              64,
+              256,
+              64
+            ],
+            "warp_shape": [
+              64,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.7590170288085938,
+          "w2_ms": 0.9453081512451171,
+          "sum_ms": 2.704325180053711,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 3713,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              72,
+              256,
+              64
+            ],
+            "warp_shape": [
+              72,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              72,
+              256,
+              64
+            ],
+            "warp_shape": [
+              72,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.7992127990722657,
+          "w2_ms": 0.9334649658203125,
+          "sum_ms": 2.7326777648925784,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 4097,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              80,
+              256,
+              64
+            ],
+            "warp_shape": [
+              80,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              80,
+              256,
+              64
+            ],
+            "warp_shape": [
+              80,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.8101651000976562,
+          "w2_ms": 0.9451423645019531,
+          "sum_ms": 2.755307464599609,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 4609,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              88,
+              256,
+              64
+            ],
+            "warp_shape": [
+              88,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              88,
+              256,
+              64
+            ],
+            "warp_shape": [
+              88,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.8222496032714843,
+          "w2_ms": 0.9800025939941406,
+          "sum_ms": 2.802252197265625,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 5377,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              96,
+              256,
+              64
+            ],
+            "warp_shape": [
+              96,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              96,
+              256,
+              64
+            ],
+            "warp_shape": [
+              96,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.8547789001464843,
+          "w2_ms": 1.0231999969482422,
+          "sum_ms": 2.877978897094726,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 5825,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              104,
+              256,
+              64
+            ],
+            "warp_shape": [
+              104,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              104,
+              256,
+              64
+            ],
+            "warp_shape": [
+              104,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.9185772705078126,
+          "w2_ms": 1.0327769470214845,
+          "sum_ms": 2.951354217529297,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 6273,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              112,
+              256,
+              64
+            ],
+            "warp_shape": [
+              112,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              112,
+              256,
+              64
+            ],
+            "warp_shape": [
+              112,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 2.0186009216308594,
+          "w2_ms": 1.0396998596191407,
+          "sum_ms": 3.05830078125,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 6785,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              120,
+              256,
+              64
+            ],
+            "warp_shape": [
+              120,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              120,
+              256,
+              64
+            ],
+            "warp_shape": [
+              120,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 2.0835731506347654,
+          "w2_ms": 1.0974892425537108,
+          "sum_ms": 3.1810623931884763,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 8065,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              128,
+              256,
+              64
+            ],
+            "warp_shape": [
+              128,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              128,
+              256,
+              64
+            ],
+            "warp_shape": [
+              128,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 1.9747564697265625,
+          "w2_ms": 1.0711251068115235,
+          "sum_ms": 3.045881576538086,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 8897,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              136,
+              256,
+              64
+            ],
+            "warp_shape": [
+              136,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              136,
+              256,
+              64
+            ],
+            "warp_shape": [
+              136,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 2.1622195434570313,
+          "w2_ms": 1.0329901123046874,
+          "sum_ms": 3.195209655761719,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 9409,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              144,
+              256,
+              64
+            ],
+            "warp_shape": [
+              144,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              144,
+              256,
+              64
+            ],
+            "warp_shape": [
+              144,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 2.197396545410156,
+          "w2_ms": 1.1776338958740233,
+          "sum_ms": 3.3750304412841796,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 9985,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              152,
+              256,
+              64
+            ],
+            "warp_shape": [
+              152,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              152,
+              256,
+              64
+            ],
+            "warp_shape": [
+              152,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 2.257040710449219,
+          "w2_ms": 1.200456314086914,
+          "sum_ms": 3.457497024536133,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 11201,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              160,
+              256,
+              64
+            ],
+            "warp_shape": [
+              160,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              160,
+              256,
+              64
+            ],
+            "warp_shape": [
+              160,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 2.363322296142578,
+          "w2_ms": 1.269767074584961,
+          "sum_ms": 3.6330893707275393,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 11841,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              168,
+              256,
+              64
+            ],
+            "warp_shape": [
+              168,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              168,
+              256,
+              64
+            ],
+            "warp_shape": [
+              168,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 2.4331251525878907,
+          "w2_ms": 1.3121292114257812,
+          "sum_ms": 3.7452543640136717,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 12289,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              176,
+              256,
+              64
+            ],
+            "warp_shape": [
+              176,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              176,
+              256,
+              64
+            ],
+            "warp_shape": [
+              176,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 2.5248959350585936,
+          "w2_ms": 1.3849177551269531,
+          "sum_ms": 3.9098136901855467,
+          "num_tokens_padded": null,
+          "error": null
+        }
+      ]
+    },
+    {
+      "gemm": "grouped",
+      "label": "prefill_chunk4096",
+      "M": 4096,
+      "rows_valid": 6144,
+      "parent_v": 24576,
+      "fixed_v": 6144,
+      "parent_ms": 4.995877075195312,
+      "fixed_ms": 5.0770060729980475,
+      "parent_w13": {
+        "block_shape": [
+          160,
+          256,
+          64
+        ],
+        "warp_shape": [
+          160,
+          32,
+          64
+        ],
+        "use_stream_k": true,
+        "use_f16_accum": false,
+        "num_stages": 4,
+        "use_warp_spec": true,
+        "use_tma": true,
+        "use_mbarrier": true
+      },
+      "parent_w2": {
+        "block_shape": [
+          160,
+          256,
+          64
+        ],
+        "warp_shape": [
+          160,
+          32,
+          64
+        ],
+        "use_stream_k": true,
+        "use_f16_accum": false,
+        "num_stages": 4,
+        "use_warp_spec": true,
+        "use_tma": true,
+        "use_mbarrier": true
+      },
+      "best_v": 9985,
+      "best_ms": 4.866318054199219,
+      "best_w13": {
+        "block_shape": [
+          152,
+          256,
+          64
+        ],
+        "warp_shape": [
+          152,
+          32,
+          64
+        ],
+        "use_stream_k": true,
+        "use_f16_accum": false,
+        "num_stages": 4,
+        "use_warp_spec": true,
+        "use_tma": true,
+        "use_mbarrier": true
+      },
+      "best_w2": {
+        "block_shape": [
+          152,
+          256,
+          64
+        ],
+        "warp_shape": [
+          152,
+          32,
+          64
+        ],
+        "use_stream_k": true,
+        "use_f16_accum": false,
+        "num_stages": 4,
+        "use_warp_spec": true,
+        "use_tma": true,
+        "use_mbarrier": true
+      },
+      "parent_is_best": false,
+      "parent_vs_best_pct": 2.6623623765054782,
+      "candidates": [
+        {
+          "v": 1,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              8,
+              256,
+              128
+            ],
+            "warp_shape": [
+              8,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              8,
+              256,
+              128
+            ],
+            "warp_shape": [
+              8,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 14.176175537109375,
+          "w2_ms": 15.4005517578125,
+          "sum_ms": 29.576727294921874,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 281,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              16,
+              256,
+              128
+            ],
+            "warp_shape": [
+              16,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              16,
+              256,
+              128
+            ],
+            "warp_shape": [
+              16,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 7.43296875,
+          "w2_ms": 8.619697265625,
+          "sum_ms": 16.052666015625,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 769,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              24,
+              256,
+              128
+            ],
+            "warp_shape": [
+              24,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              24,
+              256,
+              128
+            ],
+            "warp_shape": [
+              24,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 5.430925903320312,
+          "w2_ms": 6.217189331054687,
+          "sum_ms": 11.648115234374998,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 1281,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              32,
+              256,
+              128
+            ],
+            "warp_shape": [
+              32,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              32,
+              256,
+              128
+            ],
+            "warp_shape": [
+              32,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 4.154768676757812,
+          "w2_ms": 4.752396850585938,
+          "sum_ms": 8.90716552734375,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 1601,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              40,
+              256,
+              64
+            ],
+            "warp_shape": [
+              40,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              40,
+              256,
+              64
+            ],
+            "warp_shape": [
+              40,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 4.067408752441406,
+          "w2_ms": 4.547373352050781,
+          "sum_ms": 8.614782104492187,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 2113,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              48,
+              256,
+              64
+            ],
+            "warp_shape": [
+              48,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              48,
+              256,
+              64
+            ],
+            "warp_shape": [
+              48,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 3.89685302734375,
+          "w2_ms": 4.285763854980469,
+          "sum_ms": 8.182616882324218,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 2401,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              56,
+              256,
+              64
+            ],
+            "warp_shape": [
+              56,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              56,
+              256,
+              64
+            ],
+            "warp_shape": [
+              56,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 3.6639218139648437,
+          "w2_ms": 3.9963616943359375,
+          "sum_ms": 7.660283508300781,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 2945,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              64,
+              256,
+              64
+            ],
+            "warp_shape": [
+              64,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              64,
+              256,
+              64
+            ],
+            "warp_shape": [
+              64,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 2.8585235595703127,
+          "w2_ms": 3.1141311645507814,
+          "sum_ms": 5.972654724121094,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 3713,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              72,
+              256,
+              64
+            ],
+            "warp_shape": [
+              72,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              72,
+              256,
+              64
+            ],
+            "warp_shape": [
+              72,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 2.6695742797851563,
+          "w2_ms": 2.921286926269531,
+          "sum_ms": 5.590861206054687,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 4097,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              80,
+              256,
+              64
+            ],
+            "warp_shape": [
+              80,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              80,
+              256,
+              64
+            ],
+            "warp_shape": [
+              80,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 2.6100250244140626,
+          "w2_ms": 2.517134094238281,
+          "sum_ms": 5.127159118652344,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 4609,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              88,
+              256,
+              64
+            ],
+            "warp_shape": [
+              88,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              88,
+              256,
+              64
+            ],
+            "warp_shape": [
+              88,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 2.5574969482421874,
+          "w2_ms": 2.6511294555664064,
+          "sum_ms": 5.208626403808594,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 5377,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              96,
+              256,
+              64
+            ],
+            "warp_shape": [
+              96,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              96,
+              256,
+              64
+            ],
+            "warp_shape": [
+              96,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 2.559547576904297,
+          "w2_ms": 2.4103826904296874,
+          "sum_ms": 4.969930267333984,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 5825,
+          "is_parent": false,
+          "is_fixed": true,
+          "w13": {
+            "block_shape": [
+              104,
+              256,
+              64
+            ],
+            "warp_shape": [
+              104,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              104,
+              256,
+              64
+            ],
+            "warp_shape": [
+              104,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 2.5081715393066406,
+          "w2_ms": 2.5688345336914065,
+          "sum_ms": 5.0770060729980475,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 6273,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              112,
+              256,
+              64
+            ],
+            "warp_shape": [
+              112,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              112,
+              256,
+              64
+            ],
+            "warp_shape": [
+              112,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 2.5010304260253906,
+          "w2_ms": 2.5572511291503908,
+          "sum_ms": 5.058281555175782,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 6785,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              120,
+              256,
+              64
+            ],
+            "warp_shape": [
+              120,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              120,
+              256,
+              64
+            ],
+            "warp_shape": [
+              120,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 2.457635803222656,
+          "w2_ms": 2.5223039245605468,
+          "sum_ms": 4.9799397277832025,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 8065,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              128,
+              256,
+              64
+            ],
+            "warp_shape": [
+              128,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              128,
+              256,
+              64
+            ],
+            "warp_shape": [
+              128,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 2.4144026184082032,
+          "w2_ms": 2.4533702087402345,
+          "sum_ms": 4.867772827148437,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 8897,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              136,
+              256,
+              64
+            ],
+            "warp_shape": [
+              136,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              136,
+              256,
+              64
+            ],
+            "warp_shape": [
+              136,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 2.415460510253906,
+          "w2_ms": 2.4568019104003906,
+          "sum_ms": 4.872262420654296,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 9409,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              144,
+              256,
+              64
+            ],
+            "warp_shape": [
+              144,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              144,
+              256,
+              64
+            ],
+            "warp_shape": [
+              144,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 2.42927490234375,
+          "w2_ms": 2.4411546325683595,
+          "sum_ms": 4.870429534912109,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 9985,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              152,
+              256,
+              64
+            ],
+            "warp_shape": [
+              152,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              152,
+              256,
+              64
+            ],
+            "warp_shape": [
+              152,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 2.434835205078125,
+          "w2_ms": 2.431482849121094,
+          "sum_ms": 4.866318054199219,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 11201,
+          "is_parent": true,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              160,
+              256,
+              64
+            ],
+            "warp_shape": [
+              160,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              160,
+              256,
+              64
+            ],
+            "warp_shape": [
+              160,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 2.481546173095703,
+          "w2_ms": 2.5143309020996094,
+          "sum_ms": 4.995877075195312,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 11841,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              168,
+              256,
+              64
+            ],
+            "warp_shape": [
+              168,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              168,
+              256,
+              64
+            ],
+            "warp_shape": [
+              168,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 2.5536370849609376,
+          "w2_ms": 2.6090655517578125,
+          "sum_ms": 5.16270263671875,
+          "num_tokens_padded": null,
+          "error": null
+        },
+        {
+          "v": 12289,
+          "is_parent": false,
+          "is_fixed": false,
+          "w13": {
+            "block_shape": [
+              176,
+              256,
+              64
+            ],
+            "warp_shape": [
+              176,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w2": {
+            "block_shape": [
+              176,
+              256,
+              64
+            ],
+            "warp_shape": [
+              176,
+              32,
+              64
+            ],
+            "use_stream_k": true,
+            "use_f16_accum": false,
+            "num_stages": 4,
+            "use_warp_spec": true,
+            "use_tma": true,
+            "use_mbarrier": true
+          },
+          "w13_ms": 2.6177093505859377,
+          "w2_ms": 2.637922668457031,
+          "sum_ms": 5.255632019042968,
+          "num_tokens_padded": null,
+          "error": null
+        }
+      ]
+    }
+  ]
+}
