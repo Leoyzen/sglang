@@ -193,7 +193,15 @@ class TestDecodeProjections(CustomTestCase):
             block_size=block_size,
         )
 
-        padded = F.pad(logits, (0, -width % block_size), value=-torch.inf)
+        # The kernel reduces visibility-masked values, so the reference has to
+        # mask the unread tail before the block max; otherwise the zero-length
+        # row's all-(-inf) scores would be read as all-valid.
+        visible = torch.arange(width, device="cuda") < lens[:, None]
+        padded = F.pad(
+            logits.masked_fill(~visible, -torch.inf),
+            (0, -width % block_size),
+            value=-torch.inf,
+        )
         scores = padded.unflatten(-1, (-1, block_size)).amax(dim=-1)
         last = (lens - 1) // block_size
         scores = scores.masked_fill(
@@ -202,14 +210,25 @@ class TestDecodeProjections(CustomTestCase):
         )
         expected = scores.topk(topk_blocks, dim=-1)
 
-        torch.testing.assert_close(
-            actual_indices.sort(dim=-1).values,
-            expected.indices.sort(dim=-1).values,
-        )
-        torch.testing.assert_close(actual_valid, expected.values > -torch.inf)
+        expected_valid = expected.values > -torch.inf
+        torch.testing.assert_close(actual_valid, expected_valid)
+        # Invalid lanes carry arbitrary indices (every candidate is -inf), so
+        # only the valid lanes have a defined value to compare.
+        for row in range(rows):
+            torch.testing.assert_close(
+                actual_indices[row][actual_valid[row]].sort().values,
+                expected.indices[row][expected_valid[row]].sort().values,
+            )
 
+        # TopK v2 loads score rows through 16-byte vectors, so the row stride
+        # must be a multiple of 4; the block count (33 here) is not.
+        score_storage = torch.empty(
+            (rows, (scores.shape[1] + 3) // 4 * 4), device="cuda"
+        )
+        block_scores = score_storage[:, : scores.shape[1]]
+        block_scores.copy_(scores)
         sorted_blocks, counts, _ = candidate_block_state(
-            scores,
+            block_scores,
             ((lens + block_size - 1) // block_size).to(torch.int32),
             lens,
             topk_blocks=topk_blocks,
