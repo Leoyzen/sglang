@@ -630,6 +630,10 @@ class DSparkV4Stage(DeepseekV4DecoderLayer):
             hc_stats_stream=hc_stats_stream,
             moe_routed_quant_stream=moe_routed_quant_stream,
         )
+        # DSpark draft expert weights follow the target model's global expert
+        # placement, so logical expert ids must be mapped to physical slots at
+        # runtime as well. Other nextn/MTP users retain the legacy behavior.
+        self.mlp.enable_nextn_expert_location_dispatch()
         self.stage_id = stage_id
         self.dim = config.hidden_size
 
