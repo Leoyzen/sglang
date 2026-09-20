@@ -340,7 +340,7 @@ struct TopKConfig {
       counts[i] = hist[tx * kRefineItems + i];
       local_sum += counts[i];
     }
-    const auto warp_inc = warp_inclusive_sum(lane_id, local_sum);
+    const auto warp_inc = warp::inclusive_sum(local_sum, lane_id);
     if (lane_id == kWarpSize - 1) smem->warp_sum[warp_id] = warp_inc;
     __syncthreads();
 
