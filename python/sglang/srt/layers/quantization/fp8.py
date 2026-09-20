@@ -771,10 +771,14 @@ class Fp8LinearMethod(LinearMethodBase):
                 )
                 layer.weight = Parameter(qweight, requires_grad=False)
                 layer.weight_scale_inv = Parameter(new_scale, requires_grad=False)
-                self.weight_block_size = [128, 128]
+                # Per-layer state only. Never mutate method-level
+                # weight_block_size here: one Fp8LinearMethod instance serves
+                # many layers, and layers skipped by the guards above (or with
+                # keep_plain_weight_layout) still carry [32,32]-grid scales.
+                layer.requant_to_128_done = True
             else:
                 # Keep the [32,32] Triton path for this layer.
-                self.requant_dense_128_layer_skipped = True
+                layer.requant_to_128_done = False
         if self.convert_mxfp8_to_block:
             from sglang.srt.layers.quantization.mxfp8_block_convert import (
                 convert_mxfp8_weight_to_block_fp8,
@@ -1264,11 +1268,20 @@ class Fp8LinearMethod(LinearMethodBase):
                     True,  # is_vnni
                 )
 
+            # block_size is a per-layer property: layers opted into the
+            # load-time [32,32]->[128,128] requant carry 128-grid scales while
+            # skipped/keep_plain_weight_layout layers keep [32,32] grids, and
+            # they can share one Fp8LinearMethod instance.
+            if getattr(layer, "requant_to_128_done", False):
+                runtime_block_size = [128, 128]
+            else:
+                runtime_block_size = self.quant_config.weight_block_size
+
             if isinstance(x, tuple):
                 return self.w8a8_block_fp8_linear(
                     input=x[0],
                     weight=layer.weight,
-                    block_size=self.weight_block_size,
+                    block_size=runtime_block_size,
                     weight_scale=layer.weight_scale_inv,
                     input_scale=x[1],
                     bias=bias,
@@ -1277,7 +1290,7 @@ class Fp8LinearMethod(LinearMethodBase):
             return self.w8a8_block_fp8_linear(
                 input=x,
                 weight=layer.weight,
-                block_size=self.weight_block_size,
+                block_size=runtime_block_size,
                 weight_scale=layer.weight_scale_inv,
                 input_scale=None,
                 bias=bias,

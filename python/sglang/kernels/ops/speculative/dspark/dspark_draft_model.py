@@ -445,10 +445,21 @@ def commit_kv_proj_fused(
         )
     elif stacked.fp8_scale is not None:
         quant_method = wkv_linears[0].quant_method
+        # block_size must match the scale grid actually stacked below. Layers
+        # opted into the load-time [32,32]->[128,128] requant carry 128-grid
+        # scales; use the largest grid present so cdiv checks hold (mixed
+        # grids cannot happen: requant is all-or-nothing per stacked group --
+        # the wkv linears of one layer share shapes).
+        if all(
+            getattr(linear, "requant_to_128_done", False) for linear in wkv_linears
+        ):
+            stacked_block_size = [128, 128]
+        else:
+            stacked_block_size = quant_method.quant_config.weight_block_size
         kv_all = quant_method.w8a8_block_fp8_linear(
             input=main_x,
             weight=stacked.weight,
-            block_size=quant_method.quant_config.weight_block_size,
+            block_size=stacked_block_size,
             weight_scale=stacked.fp8_scale,
             input_scale=None,
             bias=None,
