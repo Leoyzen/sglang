@@ -137,6 +137,16 @@ _mxfp8_to_block_fp8_required = mxfp8_block_convert_required() or get_bool_env_va
     "SGLANG_FORCE_MXFP8_BLOCK_CONVERT"
 )
 _use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT") and _is_hip
+# H200-class SM90 has no 32-wide-K block-scaled FP8 fast path (DeepGEMM
+# gran_k=32 is SM100-only; FlashInfer MXFP8 is Blackwell-only), so [32,32]
+# ue8m0 checkpoints (DeepSeek-V4.1) fall back to the Triton w8a8 kernel.
+# SGLANG_REQUANT_DENSE_128=1 opts eligible dense layers into a load-time
+# requantize [32,32] -> [128,128] (exact dequant + one e4m3 re-round,
+# numerically equivalent to a native 128-block checkpoint), which unlocks the
+# DeepGEMM 128-block dense GEMM.
+_requant_dense_128_env = (
+    _is_cuda and get_bool_env_var("SGLANG_REQUANT_DENSE_128")
+)
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
 _is_gfx1250_supported = is_gfx1250_supported()
@@ -513,6 +523,17 @@ class Fp8LinearMethod(LinearMethodBase):
         )
         self.convert_mxfp8_to_block = self.use_mxfp8 and _mxfp8_to_block_fp8_required
         self.weight_block_size = self.quant_config.weight_block_size
+        # Load-time [32,32] -> [128,128] requant (see _requant_dense_128_env).
+        # Only when the checkpoint itself is a 32-block ue8m0 fp8 checkpoint;
+        # per-layer guards (shape divisibility, keep_plain_weight_layout) are
+        # applied in process_weights_after_loading_block_quant.
+        self.requant_dense_128 = (
+            _requant_dense_128_env
+            and not self.use_mxfp8
+            and isinstance(self.quant_config, Fp8Config)
+            and self.quant_config.weight_block_size == [32, 32]
+            and not self.convert_mxfp8_to_block
+        )
         self.w8a8_block_fp8_linear = None
         self.w8a8_mxfp8_linear = None
         self.mxfp8_dense_backend = None
@@ -523,10 +544,15 @@ class Fp8LinearMethod(LinearMethodBase):
             self.w8a8_mxfp8_linear = dispatch_w8a8_mxfp8_linear()
         else:
             # Dispatch on the block size the weight will have after loading: an
-            # MXFP8 checkpoint converted to block-fp8 ends up as [128, 128].
-            effective_block_size = (
-                [128, 128] if self.convert_mxfp8_to_block else self.weight_block_size
-            )
+            # MXFP8 checkpoint converted to block-fp8 ends up as [128, 128], and
+            # a [32,32] checkpoint opted into SGLANG_REQUANT_DENSE_128 likewise
+            # ends up as [128, 128].
+            if self.requant_dense_128:
+                effective_block_size = [128, 128]
+            elif self.convert_mxfp8_to_block:
+                effective_block_size = [128, 128]
+            else:
+                effective_block_size = self.weight_block_size
             self.w8a8_block_fp8_linear = dispatch_w8a8_block_fp8_linear(
                 weight_block_size=effective_block_size,
                 act_scale_ue8m0=isinstance(self.quant_config, Fp8Config)
@@ -720,6 +746,35 @@ class Fp8LinearMethod(LinearMethodBase):
         )
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        if self.requant_dense_128 and not getattr(
+            layer, "keep_plain_weight_layout", False
+        ):
+            # Load-time [32,32] -> [128,128] requant to unlock the DeepGEMM
+            # 128-block dense GEMM on SM90 (no native 32-wide-K fast path).
+            # Guards: shapes must be exactly divisible by 128 (no padding --
+            # a padded weight could not fall back to Triton cleanly), and the
+            # scale grid must match the 32-block contract.
+            from sglang.srt.layers.quantization.mxfp8_block_convert import (
+                requant_block_fp8_32_to_128,
+            )
+
+            n, k = layer.weight.shape
+            block_size = self.quant_config.weight_block_size
+            scale = layer.weight_scale_inv.data
+            if (
+                n % 128 == 0
+                and k % 128 == 0
+                and scale.shape == (n // 32, k // 32)
+            ):
+                qweight, new_scale = requant_block_fp8_32_to_128(
+                    layer.weight.data, scale.to(torch.float32)
+                )
+                layer.weight = Parameter(qweight, requires_grad=False)
+                layer.weight_scale_inv = Parameter(new_scale, requires_grad=False)
+                self.weight_block_size = [128, 128]
+            else:
+                # Keep the [32,32] Triton path for this layer.
+                self.requant_dense_128_layer_skipped = True
         if self.convert_mxfp8_to_block:
             from sglang.srt.layers.quantization.mxfp8_block_convert import (
                 convert_mxfp8_weight_to_block_fp8,
