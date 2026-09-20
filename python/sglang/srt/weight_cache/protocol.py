@@ -16,7 +16,7 @@ from typing import Any, Dict, Optional
 import msgspec
 
 from sglang.srt.environ import envs
-from sglang.srt.utils.common import safe_pickle_loads
+from sglang.srt.utils.common import get_bool_env_var, safe_pickle_loads
 
 logger = logging.getLogger(__name__)
 
@@ -154,6 +154,9 @@ def _fp8_round_trips_via_ipc(quant_config: Any) -> bool:
     `layer.weight` during post-processing, a shape change the meta-init client
     cannot reproduce, so it is not supported.
     """
+    if get_bool_env_var("SGLANG_REQUANT_DENSE_128"):
+        # requant changes runtime block grid; IPC zero-copy meta can't express it
+        return False
     return _get_quant_field(quant_config, "weight_block_size") is not None
 
 

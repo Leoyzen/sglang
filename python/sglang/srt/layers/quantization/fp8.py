@@ -144,8 +144,13 @@ _use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT") and _is_hip
 # requantize [32,32] -> [128,128] (exact dequant + one e4m3 re-round,
 # numerically equivalent to a native 128-block checkpoint), which unlocks the
 # DeepGEMM 128-block dense GEMM.
+# SM90-only: on Blackwell (SM100/120) the upstream native MXFP8 path for
+# 32-wide-K ue8m0 exists (1b200ffaaa); requanting would bypass it and feed
+# DeepGEMM an fp32 weight scale + ue8m0-packed activation scale.
 _requant_dense_128_env = (
-    _is_cuda and get_bool_env_var("SGLANG_REQUANT_DENSE_128")
+    _is_cuda
+    and get_platform().is_sm90
+    and get_bool_env_var("SGLANG_REQUANT_DENSE_128")
 )
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
@@ -769,8 +774,16 @@ class Fp8LinearMethod(LinearMethodBase):
                 qweight, new_scale = requant_block_fp8_32_to_128(
                     layer.weight.data, scale.to(torch.float32)
                 )
-                layer.weight = Parameter(qweight, requires_grad=False)
-                layer.weight_scale_inv = Parameter(new_scale, requires_grad=False)
+                # Swap .data in place rather than rebinding new Parameter
+                # objects: preserves Parameter identity and the weight_loader
+                # attrs (see the hot-reload precedent in _quantize_mxfp8_weights).
+                layer.weight.data = qweight
+                layer.weight_scale_inv.data = new_scale
+                # NOTE: weight updates via update_weights_from_tensor /
+                # _distributed remain unsupported while requant is enabled:
+                # those paths skip process_weights_after_loading and would
+                # write an original [32,32]-grid scale into this [128,128]-grid
+                # parameter. A follow-up could raise there; not done here.
                 # Per-layer state only. Never mutate method-level
                 # weight_block_size here: one Fp8LinearMethod instance serves
                 # many layers, and layers skipped by the guards above (or with
