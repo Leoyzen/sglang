@@ -18,7 +18,6 @@ from sglang.kernels.ops.quantization.fp8_kernel import (
     per_token_group_quant_fp8,
     scaled_fp8_quant,
 )
-from sglang.srt.distributed import get_tp_group
 from sglang.srt.distributed.device_communicators.pynccl_allocator import (
     use_symmetric_memory,
 )
@@ -148,9 +147,7 @@ _use_hip_int4 = get_bool_env_var("SGLANG_INT4_WEIGHT") and _is_hip
 # 32-wide-K ue8m0 exists (1b200ffaaa); requanting would bypass it and feed
 # DeepGEMM an fp32 weight scale + ue8m0-packed activation scale.
 _requant_dense_128_env = (
-    _is_cuda
-    and get_platform().is_sm90
-    and get_bool_env_var("SGLANG_REQUANT_DENSE_128")
+    _is_cuda and get_platform().is_sm90 and get_bool_env_var("SGLANG_REQUANT_DENSE_128")
 )
 _use_aiter = envs.SGLANG_USE_AITER.get() and _is_hip
 _is_shuffle_moe_mxfp4 = is_gfx95_supported()
@@ -766,11 +763,7 @@ class Fp8LinearMethod(LinearMethodBase):
             n, k = layer.weight.shape
             block_size = self.quant_config.weight_block_size
             scale = layer.weight_scale_inv.data
-            if (
-                n % 128 == 0
-                and k % 128 == 0
-                and scale.shape == (n // 32, k // 32)
-            ):
+            if n % 128 == 0 and k % 128 == 0 and scale.shape == (n // 32, k // 32):
                 qweight, new_scale = requant_block_fp8_32_to_128(
                     layer.weight.data, scale.to(torch.float32)
                 )
@@ -2983,7 +2976,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             from sglang.srt.layers.moe.cutlass_moe import cutlass_fused_experts_fp8
 
             with use_symmetric_memory(
-                get_tp_group(), disabled=not is_allocation_symmetric()
+                get_parallel().tp_group, disabled=not is_allocation_symmetric()
             ):
                 symm_output = torch.empty_like(x)
 
