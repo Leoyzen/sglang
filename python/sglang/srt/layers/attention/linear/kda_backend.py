@@ -33,7 +33,7 @@ elif is_cpu():
 
     causal_conv1d_update = causal_conv1d_update_cpu
 
-from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
+from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.model_runner import ModelRunner
 from sglang.srt.runtime_context import (
     get_disagg,
@@ -533,9 +533,10 @@ class KDAAttnBackend(MambaAttnBackendBase):
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         super().init_forward_metadata(forward_batch)
         if self.forward_metadata.has_mamba_track_mask:
-            self.forward_metadata.mamba_track_mask_indices = (
-                forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
-            )
+            if self.forward_metadata.mamba_track_mask_indices is None:
+                self.forward_metadata.mamba_track_mask_indices = (
+                    forward_batch.mamba_track_mask.nonzero(as_tuple=True)[0]
+                )
             self.forward_metadata.conv_states_mask_indices = (
                 forward_batch.mamba_track_indices[
                     self.forward_metadata.mamba_track_mask_indices
@@ -823,14 +824,9 @@ class KDAAttnBackend(MambaAttnBackendBase):
         has_initial_state = forward_batch.extend_prefix_lens > 0
 
         physical_num_tokens = mixed_qkv.shape[0]
-        logical_num_tokens = (
-            sum(forward_batch.extend_seq_lens_cpu)
-            if not self.is_draft_worker
-            and forward_batch.forward_mode == ForwardMode.EXTEND
-            and not self.forward_metadata.has_mamba_track_mask
-            and forward_batch.extend_seq_lens_cpu is not None
-            else int(query_start_loc[-1])
-        )
+        logical_num_tokens = self.forward_metadata.logical_num_tokens
+        if logical_num_tokens is None:
+            logical_num_tokens = int(query_start_loc[-1])
         if logical_num_tokens < physical_num_tokens:
             mixed_qkv = mixed_qkv[:logical_num_tokens]
             a = a[:, :logical_num_tokens]
