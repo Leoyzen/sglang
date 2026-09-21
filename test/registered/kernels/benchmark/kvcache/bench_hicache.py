@@ -27,9 +27,12 @@ from sgl_kernel import transfer_kv_all_layer, transfer_kv_per_layer
 
 from sglang.kernels.jit.benchmark.utils import DEFAULT_QUANTILES, get_benchmark_range
 from sglang.kernels.ops.kvcache.hicache import (
+    DEFAULT_BLOCK_QUOTA,
+    TMA_BLOCK_QUOTA,
+    _default_unroll,
+    _jit_hicache_module,
+    _jit_hicache_tma_module,
     can_use_hicache_jit_kernel,
-    transfer_hicache_all_layer,
-    transfer_hicache_one_layer,
 )
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
@@ -112,15 +115,19 @@ def sglang_jit_transfer_one(
     indices_src: torch.Tensor,
     element_dim: int,
 ) -> None:
-    """SGL JIT Kernel for single layer transfer."""
-    transfer_hicache_one_layer(
-        k_cache_dst,
-        v_cache_dst,
+    """SGL JIT register kernel for single layer transfer (bypasses TMA routing)."""
+    element_size = element_dim * k_cache_dst.element_size()
+    _jit_hicache_module(
+        element_size=element_size,
+        unroll=_default_unroll(element_size),
+        block_quota=DEFAULT_BLOCK_QUOTA,
+    ).launch_one(
+        k_cache_dst.view(-1, element_dim),
+        v_cache_dst.view(-1, element_dim),
         indices_dst,
-        k_cache_src,
-        v_cache_src,
+        k_cache_src.view(-1, element_dim),
+        v_cache_src.view(-1, element_dim),
         indices_src,
-        element_dim=element_dim,
     )
 
 
@@ -157,17 +164,58 @@ def sglang_jit_transfer_all(
     stride_bytes: int,
     element_size: int,
 ) -> None:
-    """SGL JIT Kernel for all layer transfer."""
-    transfer_hicache_all_layer(
+    """SGL JIT register kernel for all layer transfer (bypasses TMA routing)."""
+    _jit_hicache_module(
+        element_size=element_size,
+        unroll=_default_unroll(element_size),
+        block_quota=DEFAULT_BLOCK_QUOTA,
+    ).launch_all(
         k_ptrs_dst,
         v_ptrs_dst,
         indices_dst,
         k_ptrs_src,
         v_ptrs_src,
         indices_src,
-        kv_cache_src_stride_bytes=stride_bytes,
-        kv_cache_dst_stride_bytes=stride_bytes,
-        element_size=element_size,
+        stride_bytes,
+        stride_bytes,
+    )
+
+
+def sglang_tma_transfer_one(
+    k_cache_dst: torch.Tensor,
+    v_cache_dst: torch.Tensor,
+    indices_dst: torch.Tensor,
+    k_cache_src: torch.Tensor,
+    v_cache_src: torch.Tensor,
+    indices_src: torch.Tensor,
+) -> None:
+    """SGL TMA staging kernel for single layer transfer."""
+    _jit_hicache_tma_module(block_quota=TMA_BLOCK_QUOTA).launch_one(
+        k_cache_dst, v_cache_dst, indices_dst, k_cache_src, v_cache_src, indices_src
+    )
+
+
+def sglang_tma_transfer_all(
+    k_ptrs_dst: torch.Tensor,
+    v_ptrs_dst: torch.Tensor,
+    indices_dst: torch.Tensor,
+    k_ptrs_src: torch.Tensor,
+    v_ptrs_src: torch.Tensor,
+    indices_src: torch.Tensor,
+    stride_bytes: int,
+    element_size: int,
+) -> None:
+    """SGL TMA staging kernel for all layer transfer."""
+    _jit_hicache_tma_module(block_quota=TMA_BLOCK_QUOTA).launch_all(
+        k_ptrs_dst,
+        v_ptrs_dst,
+        indices_dst,
+        k_ptrs_src,
+        v_ptrs_src,
+        indices_src,
+        stride_bytes,
+        stride_bytes,
+        element_size,
     )
 
 
@@ -199,6 +247,16 @@ ELEMENT_SIZE_RANGE = get_benchmark_range(
 LINE_VALS = ["aot", "jit", "torch"]
 LINE_NAMES = ["SGL AOT Kernel", "SGL JIT Kernel", "PyTorch"]
 STYLES = [("orange", "-"), ("blue", "--"), ("red", ":")]
+
+# The TMA staging kernel needs sm_90+ (cp.async.bulk); skip the line elsewhere.
+if (
+    torch.cuda.is_available()
+    and torch.version.hip is None
+    and torch.cuda.get_device_capability()[0] >= 9
+):
+    LINE_VALS.insert(2, "tma")
+    LINE_NAMES.insert(2, "SGL TMA Kernel")
+    STYLES.insert(2, ("green", "-."))
 
 CONFIGS = list(itertools.product(ELEMENT_SIZE_RANGE, BS_RANGE))
 
@@ -265,6 +323,17 @@ def benchmark_one_layer_h2d(
                 v_cache_src[i],
                 indices_src_gpu,
                 element_size,
+            )
+            for i in range(NUM_LAYERS)
+        ],
+        "tma": lambda: [
+            sglang_tma_transfer_one(
+                k_cache_dst[i],
+                v_cache_dst[i],
+                indices_dst_gpu,
+                k_cache_src[i],
+                v_cache_src[i],
+                indices_src_gpu,
             )
             for i in range(NUM_LAYERS)
         ],
@@ -363,6 +432,16 @@ def benchmark_all_layer_d2h(
             NUM_LAYERS,
         ),
         "jit": lambda: sglang_jit_transfer_all(
+            k_ptrs_dst,
+            v_ptrs_dst,
+            indices_dst_gpu,
+            k_ptrs_src,
+            v_ptrs_src,
+            indices_src_gpu,
+            element_bytes,
+            element_bytes,
+        ),
+        "tma": lambda: sglang_tma_transfer_all(
             k_ptrs_dst,
             v_ptrs_dst,
             indices_dst_gpu,
