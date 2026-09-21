@@ -60,6 +60,15 @@ if TYPE_CHECKING:
     from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 
 
+def _should_fuse_kpool_topk(metadata: BaseIndexerMetadata) -> bool:
+    # The backend can force the unfused path per call (e.g. Hisparse decode),
+    # exactly as DSATopKBackend.topk_transform does. Both must agree or the
+    # indexer would hand the fused kernel a mapping the backend will not use.
+    return envs.SGLANG_DSA_FUSE_TOPK.get() and not getattr(
+        metadata, "force_unfused_topk", False
+    )
+
+
 class IndexerKPool(MultiPlatformOp):
     # One measured budget per device for the process lifetime (mirrors Indexer).
     _mqa_logits_budget_bytes: Dict[int, int] = {}
@@ -831,7 +840,7 @@ class IndexerKPool(MultiPlatformOp):
         paged_page_table: Optional[torch.Tensor] = None,
         paged_page_table_row_index: Optional[torch.Tensor] = None,
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
-        if not envs.SGLANG_DSA_FUSE_TOPK.get():
+        if not _should_fuse_kpool_topk(metadata):
             return None, None, None
 
         topk_method = metadata.topk_transform_method
@@ -1016,7 +1025,7 @@ class IndexerKPool(MultiPlatformOp):
         plan: KPoolExtendPlan, metadata: BaseIndexerMetadata
     ) -> Tuple[Optional[torch.Tensor], Optional[torch.Tensor], Optional[torch.Tensor]]:
         """(page_table, page_table_row_index, topk_offsets) for the ragged plan path."""
-        if not envs.SGLANG_DSA_FUSE_TOPK.get():
+        if not _should_fuse_kpool_topk(metadata):
             return None, None, None
         if metadata.topk_transform_method == TopkTransformMethod.PAGED:
             return (
@@ -1431,7 +1440,7 @@ class IndexerKPool(MultiPlatformOp):
             page_table_local = None
             topk_offsets_local = None
             if (
-                envs.SGLANG_DSA_FUSE_TOPK.get()
+                _should_fuse_kpool_topk(metadata)
                 and topk_method == TopkTransformMethod.PAGED
             ):
                 page_table_local = (
@@ -1441,7 +1450,7 @@ class IndexerKPool(MultiPlatformOp):
                 )
                 page_table_local = page_table_local.unsqueeze(0).expand(q_len, -1)
             elif (
-                envs.SGLANG_DSA_FUSE_TOPK.get()
+                _should_fuse_kpool_topk(metadata)
                 and topk_method == TopkTransformMethod.RAGGED
                 and topk_offsets is not None
             ):
