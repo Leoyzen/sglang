@@ -213,6 +213,9 @@ def transform_index_page_table_decode_fast(
     """
     assert page_size == 1
     assert page_table.shape[0] == topk_indices.shape[0]
+    # transform_index_page_table_decode_kernel hardcodes TOPK=2048: it addresses
+    # rows as req_id * TOPK instead of by stride, and tl.arange(0, TOPK) needs a
+    # power of two. Other widths must fail loudly rather than read wrong rows.
     assert topk_indices.shape[1] == 2048
     qo_len = topk_indices.shape[0]
     if result is None:
@@ -248,17 +251,14 @@ def transform_index_page_table_prefill_fast(
     cu_seqlens_q: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     assert page_size == 1
-    # DSA prefill topk width is index_topk (2048) plus, for kpool indexers
-    # (e.g. GLM-5.3-Flash, index_kpool > 1), up to index_kpool - 1 appended
-    # live tail-token columns in the same physical-slot index space (see
-    # append_kpool_tail_to_topk in kpool_fp8_index.py). The triton kernel is
-    # variable-width (TOPK constexpr from shape[1]; grid axis 2 spans the full
-    # width), and downstream prefill impls (tilelang pads to 64-col blocks,
-    # fa3 clamps) already accept the widened table. Keep the >= 2048 floor to
-    # catch layout regressions.
-    assert topk_indices.shape[1] >= 2048, (
-        f"expected prefill topk width >= 2048, got {topk_indices.shape[1]}"
-    )
+    # No topk-width constraint: the kernel below takes TOPK from
+    # topk_indices.shape[1], masks the trailing block and receives both strides
+    # as arguments. Widths other than 2048 are real -- a kpool indexer emits
+    # index_topk + index_kpool - 1 columns (e.g. GLM-5.3-Flash: index_topk=2048,
+    # index_kpool=4, index_kpool_always_select_tail -> 2051; see
+    # append_kpool_tail_to_topk in kpool_fp8_index.py), and downstream prefill
+    # impls (tilelang pads to 64-col blocks, fa3 clamps) accept any width.
+    # Decode is 2048-only by construction.
     real_num_tokens = sum(extend_lens_cpu)
     result = _allocate_prefill_result(topk_indices, real_num_tokens, output_num_tokens)
     if real_num_tokens == 0:
