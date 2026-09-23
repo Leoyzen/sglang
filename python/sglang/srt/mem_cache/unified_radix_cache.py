@@ -84,6 +84,7 @@ from sglang.srt.mem_cache.unified_cache.unified_tree_core import (  # noqa: F401
     UnifiedTreeCore,
     UnifiedTreeNode,
 )
+from sglang.srt.mem_cache.utils import get_hash_str
 from sglang.srt.observability.metrics_collector import (
     StorageMetrics,
     StorageMetricsCollector,
@@ -1989,6 +1990,23 @@ class UnifiedRadixCache(BasePrefixCache):
             # Paced: the limiter clears as transfers finish, not on the next pass.
             self.storage_prefetch_retries.poll_miss(req_id, storage_hit_end)
             return
+
+        # Recompute last_hash from the full matched prefix so the hash chain
+        # is correct regardless of which node was selected as anchor.  The
+        # anchor (last_host_node) may sit at a shallower position than
+        # matched_len when async host-backup has not yet caught up; using its
+        # hash_value directly would produce a broken chain and a guaranteed
+        # storage miss.  Rebuilding from root via matched_prefix_tokens gives
+        # the exact page-aligned hash at matched_len that L3 keys expect.
+        if matched_prefix_tokens and len(matched_prefix_tokens) >= self.page_size:
+            aligned_len = len(matched_prefix_tokens) - (
+                len(matched_prefix_tokens) % self.page_size
+            )
+            prefix_hashes = get_hash_str(
+                matched_prefix_tokens[:aligned_len], None, self.page_size
+            )
+            if prefix_hashes:
+                last_hash = prefix_hashes[-1]
 
         # Buffer mode holds no tree state during the fetch: buffers are
         # operation-owned, so the anchor needs no pin.
